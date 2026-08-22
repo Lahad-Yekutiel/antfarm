@@ -281,16 +281,26 @@ steps:
          isn't a git repo (run `git rev-parse --show-toplevel` and compare
          to {{repo}} before doing anything else; STOP and reply
          STATUS: blocked if it doesn't match, do not improvise a
-         different path).
-      2. `git fetch origin && git checkout staging && git pull` — branch
-         from `staging`, never `main`. If `staging` doesn't exist locally
-         or on origin, STOP and reply STATUS: blocked with a REASON — do
-         not create it yourself or fall back to main.
-      3. `git checkout -b {{branch}}`
-      4. Discover build/test commands (package.json scripts, CI config,
-         test config files).
-      5. Run the build command. Run the test command. Report real results.
-      6. Report what you found.
+         different path). This check is read-only — run it directly, do
+         not delegate it.
+      2. **Delegate branch setup to Cursor** (your shell cannot write the
+         repo worktree — it is read-only except `.git/`). Use the
+         delegation trigger from your AGENTS.md: POST to
+         `http://host.docker.internal:3336/delegate` with a prompt asking
+         Cursor to run, in order: `git fetch origin && git checkout
+         staging && git pull` (branch from `staging`, never `main` — if
+         `staging` doesn't exist locally or on origin, STOP and report the
+         error; do not create it or fall back to main), then
+         `git checkout -b {{branch}}`; identify build/test/typecheck/lint
+         scripts from `package.json`, CI config, etc.; create `.gitignore`
+         and `.env.example` hygiene files if needed. Poll delegate logs
+         until complete. Do not run `git pull` or `git checkout -b`
+         yourself — delegate first.
+      3. Independently verify: `git branch --show-current` must equal
+         `{{branch}}`. Confirm only hygiene files were touched.
+      4. Run the build command yourself. Run the test command yourself.
+         Report real results — don't take Cursor's word.
+      5. Report what you found.
 
       Reply with:
       STATUS: done | blocked
