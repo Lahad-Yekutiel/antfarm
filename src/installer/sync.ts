@@ -66,11 +66,25 @@ async function sleep(ms: number): Promise<void> {
 
 async function waitForContainerChange(agentId: string, previousId: string | null): Promise<string | null> {
   const deadline = Date.now() + RECREATE_TIMEOUT_MS;
+  let stableAbsentPolls = 0;
+
   while (Date.now() < deadline) {
     const current = getDockerContainerId(agentId);
-    if (current && current !== previousId) return current;
+
+    if (previousId === null) {
+      if (current !== null) return current;
+      stableAbsentPolls++;
+      if (stableAbsentPolls >= 3) return null;
+    } else if (current !== previousId) {
+      return current;
+    }
+
     await sleep(DOCKER_POLL_INTERVAL_MS);
   }
+
+  const finalId = getDockerContainerId(agentId);
+  if (previousId === null && finalId === null) return null;
+
   throw new SyncWorkflowError(
     `Timed out after ${RECREATE_TIMEOUT_MS / 1000}s waiting for docker container to change for agent "${agentId}"`,
   );
