@@ -50,11 +50,12 @@
 # Coordinator opens tasks itself AND merges to `staging` autonomously —
 # `main` stays developer-only. Branches now cut from `staging` (not
 # `main`); a new `merge` step runs after `review` and only ever executes
-# once review actually succeeds (approved) — a `changes_requested`
-# verdict routes back to `pr` via `on_fail.retry_step`, so the pipeline
-# never reaches `merge` on an unapproved PR. This is the only way to get
-# conditional-looking behavior given Antfarm's strictly linear
-# advancePipeline() (no real step branching exists).
+# once review actually succeeds (approved). `changes_requested` is listed
+# in review's `fail_when` so completeStep fails the review step rather
+# than advancing to merge. `on_fail.retry_step: pr` is declared as the
+# intended retry loop but is NOT implemented — with review's max_retries: 1
+# that yields one re-review attempt, then a clean run failure with
+# escalate_to: main. A real retry-to-earlier-step loop is future work.
 
 id: thecoach-dev
 name: TheCoach Custom Dev Workflow
@@ -209,9 +210,9 @@ agents:
     description: >
       Squash-merges an approved PR into staging and deletes the feature
       branch. Only ever runs once review has actually approved (a
-      changes_requested verdict routes back to pr instead, per Antfarm's
-      strictly linear pipeline — see the top-of-file note). Never touches
-      main.
+      changes_requested verdict fails the review step via fail_when and
+      does not advance here — retry_step: pr is declared but not yet
+      implemented). Never touches main.
     workspace:
       baseDir: agents/merge
       files:
@@ -428,8 +429,11 @@ steps:
       GATE_REASON: (only if fail — exact offending path(s))
       STATUS: pass | fail
       STATUS_REASON: (only if fail — what's wrong, specific enough to act on)
-    expects: "GATE:"
+    expects: "GATE: STATUS:"
     max_retries: 1
+    fail_when:
+      gate: [fail]
+      status: [fail]
     on_fail:
       on_exhausted:
         escalate_to: main
@@ -549,7 +553,11 @@ steps:
       NOTES: your real findings either way
     expects: "STATUS:"
     max_retries: 1
+    fail_when:
+      status: [changes_requested, blocked, failed, error, fail]
     on_fail:
+      # retry_step is not implemented — completeStep fails this step
+      # (then retries it per max_retries) rather than routing back to pr.
       retry_step: pr
       on_exhausted:
         escalate_to: main

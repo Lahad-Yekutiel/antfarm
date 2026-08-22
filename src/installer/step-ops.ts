@@ -10,7 +10,7 @@ import { emitEvent } from "./events.js";
 import { logger } from "../lib/logger.js";
 import { sendSessionMessage } from "./gateway-api.js";
 import { getMaxRoleTimeoutSeconds } from "./install.js";
-import { loadWorkflowSpec } from "./workflow-spec.js";
+import { getStepFailWhen, loadWorkflowSpec } from "./workflow-spec.js";
 import { resolveWorkflowDir } from "./paths.js";
 import { isFrontendChange } from "../lib/frontend-detect.js";
 import type { WorkflowStepFailure } from "./types.js";
@@ -53,24 +53,25 @@ export function parseOutputKeyValues(output: string): Record<string, string> {
   return result;
 }
 
-/** Status values that mean the agent completed successfully (from workflow step vocabularies). */
-const STEP_STATUS_SUCCESS = new Set([
-  "done",
-  "ok",
-  "success",
-  "approved",
-  "changes_requested",
-  "pass",
-  "retry",
-]);
-
-/** Status values that mean the agent reported a blocker or failure. */
+/**
+ * Default fail_when for the `status` key when a step does not declare
+ * `fail_when` in workflow.yml. Steps that opt in replace this list entirely
+ * with their declared key/value map (see matchOutputFailure).
+ */
 const STEP_STATUS_FAILURE = new Set([
   "blocked",
   "failed",
   "error",
   "fail",
 ]);
+
+/**
+ * fail_when (and this default status deny-list) fail the *current* step via
+ * failStepSync. That retries THIS step up to max_retries, then fails the run
+ * with on_fail.on_exhausted.escalate_to. A real retry-to-earlier-step loop
+ * (on_fail.retry_step) is future work — retry_step is declared on
+ * WorkflowStepFailure but never implemented.
+ */
 
 /**
  * Parse comma/whitespace-separated KEY: tokens from a step's expects field.
@@ -86,6 +87,41 @@ export function parseExpectsKeys(expects: string): string[] {
 
 function isFailureStatus(status: string): boolean {
   return STEP_STATUS_FAILURE.has(status.toLowerCase());
+}
+
+/**
+ * If `failWhen` is declared, fail when any listed key's parsed value matches
+ * one of its failure values. Otherwise apply the default status deny-list.
+ */
+export function matchOutputFailure(
+  parsed: Record<string, string>,
+  failWhen: Record<string, string[]> | undefined,
+): { key: string; value: string } | null {
+  if (failWhen) {
+    for (const [rawKey, values] of Object.entries(failWhen)) {
+      const key = rawKey.toLowerCase();
+      const parsedValue = parsed[key]?.toLowerCase();
+      if (!parsedValue) continue;
+      const failureValues = values.map((v) => v.toLowerCase());
+      if (failureValues.includes(parsedValue)) {
+        return { key, value: parsedValue };
+      }
+    }
+    return null;
+  }
+
+  const status = parsed.status?.toLowerCase();
+  if (status && isFailureStatus(status)) {
+    return { key: "status", value: status };
+  }
+  return null;
+}
+
+function failureReason(parsed: Record<string, string>, key: string): string {
+  return parsed.reason
+    ?? parsed[`${key}_reason`]
+    ?? parsed.status_reason
+    ?? "(none given)";
 }
 
 /**
@@ -808,17 +844,20 @@ export function completeStep(stepId: string, output: string): { advanced: boolea
   if (!step) throw new Error(`Step not found: ${stepId}`);
 
   // Guard: don't process completions for failed runs
-  const runCheck = db.prepare("SELECT status FROM runs WHERE id = ?").get(step.run_id) as { status: string } | undefined;
+  const runCheck = db.prepare("SELECT status, workflow_id FROM runs WHERE id = ?").get(step.run_id) as { status: string; workflow_id: string } | undefined;
   if (runCheck?.status === "failed") {
     return { advanced: false, runCompleted: false };
   }
 
   const parsed = parseOutputKeyValues(output);
 
-  const status = parsed.status?.toLowerCase();
-  if (status && isFailureStatus(status)) {
-    const reason = parsed.reason ?? "(none given)";
-    const message = `Agent reported STATUS: ${status}. REASON: ${reason}`;
+  const failWhen = runCheck?.workflow_id
+    ? getStepFailWhen(runCheck.workflow_id, step.step_id)
+    : undefined;
+  const failure = matchOutputFailure(parsed, failWhen);
+  if (failure) {
+    const reason = failureReason(parsed, failure.key);
+    const message = `Agent reported ${failure.key.toUpperCase()}: ${failure.value}. REASON: ${reason}`;
     const failResult = failStepSync(stepId, message, { stdoutTail: tailOutput(output) });
     if (failResult.runFailed) {
       notifyFailureExhausted(step.run_id, step.step_id, message).catch(() => {});

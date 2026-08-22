@@ -133,27 +133,84 @@ describe("completeStep status and contract gates", () => {
     assert.equal(implement.status, "pending");
   });
 
-  it("STATUS: changes_requested from review completes and advances (not blocked by gate)", () => {
+  it("STATUS: changes_requested from review fails the step and does not advance to merge", () => {
     const { stepDbIds } = insertRun([
-      { stepId: "review", agentId: "thecoach-dev_reviewer", stepIndex: 0, expects: "STATUS:", status: "running" },
+      { stepId: "review", agentId: "thecoach-dev_reviewer", stepIndex: 0, expects: "STATUS:", status: "running", maxRetries: 1 },
       { stepId: "merge", agentId: "thecoach-dev_merge", stepIndex: 1, expects: "STATUS:", status: "waiting" },
     ], { repo: "/tmp/repo", branch: "feat-x", pr_url: "https://github.com/o/r/pull/1" });
 
     const result = completeStep(stepDbIds.review, "STATUS: changes_requested\nNOTES: fix the tests");
 
-    assert.equal(result.advanced, true);
+    assert.equal(result.advanced, false);
     assert.equal(result.runCompleted, false);
 
     const db = getDb();
-    const review = db.prepare("SELECT status, retry_count FROM steps WHERE id = ?").get(stepDbIds.review) as {
+    const review = db.prepare("SELECT status, retry_count, output FROM steps WHERE id = ?").get(stepDbIds.review) as {
       status: string;
       retry_count: number;
+      output: string;
     };
-    assert.equal(review.status, "done");
-    assert.equal(review.retry_count, 0);
+    assert.notEqual(review.status, "done");
+    assert.equal(review.status, "pending");
+    assert.equal(review.retry_count, 1);
+    assert.ok(review.output.includes("STATUS: changes_requested"));
 
     const merge = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepDbIds.merge) as { status: string };
-    assert.equal(merge.status, "pending");
+    assert.equal(merge.status, "waiting");
+  });
+
+  it("verify GATE: fail + STATUS: pass fails the step and does not advance", () => {
+    const { stepDbIds } = insertRun([
+      { stepId: "verify", agentId: "thecoach-dev_verifier", stepIndex: 0, expects: "GATE: STATUS:", status: "running", maxRetries: 1 },
+      { stepId: "test", agentId: "thecoach-dev_tester", stepIndex: 1, expects: "STATUS:", status: "waiting" },
+    ], { repo: "/tmp/repo", branch: "feat-x", commit_sha: "abc123" });
+
+    const result = completeStep(
+      stepDbIds.verify,
+      "GATE: fail\nGATE_REASON: _SSoT/CORE.md\nSTATUS: pass",
+    );
+
+    assert.equal(result.advanced, false);
+    assert.equal(result.runCompleted, false);
+
+    const db = getDb();
+    const verify = db.prepare("SELECT status, retry_count, output FROM steps WHERE id = ?").get(stepDbIds.verify) as {
+      status: string;
+      retry_count: number;
+      output: string;
+    };
+    assert.notEqual(verify.status, "done");
+    assert.equal(verify.status, "pending");
+    assert.equal(verify.retry_count, 1);
+    assert.ok(verify.output.includes("GATE: fail"));
+
+    const test = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepDbIds.test) as { status: string };
+    assert.equal(test.status, "waiting");
+  });
+
+  it("without fail_when, default deny-list still fails STATUS: fail and does not advance", () => {
+    const { stepDbIds } = insertRun([
+      { stepId: "setup", agentId: "thecoach-dev_setup", stepIndex: 0, expects: "STATUS:", status: "running", maxRetries: 2 },
+      { stepId: "implement", agentId: "thecoach-dev_developer", stepIndex: 1, expects: "STATUS:", status: "waiting" },
+    ]);
+
+    const result = completeStep(stepDbIds.setup, "STATUS: fail\nREASON: baseline tests red");
+
+    assert.equal(result.advanced, false);
+    assert.equal(result.runCompleted, false);
+
+    const db = getDb();
+    const setup = db.prepare("SELECT status, retry_count, output FROM steps WHERE id = ?").get(stepDbIds.setup) as {
+      status: string;
+      retry_count: number;
+      output: string;
+    };
+    assert.equal(setup.status, "pending");
+    assert.equal(setup.retry_count, 1);
+    assert.ok(setup.output.includes("STATUS: fail"));
+
+    const implement = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepDbIds.implement) as { status: string };
+    assert.equal(implement.status, "waiting");
   });
 
   it("missing template key on claim routes through retry — pending, run stays running", () => {

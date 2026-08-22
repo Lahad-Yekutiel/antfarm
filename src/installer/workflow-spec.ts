@@ -1,11 +1,13 @@
-import fs from "node:fs/promises";
+import fs from "node:fs";
+import fsPromises from "node:fs/promises";
 import path from "node:path";
 import YAML from "yaml";
-import type { LoopConfig, PollingConfig, WorkflowAgent, WorkflowSpec, WorkflowStep } from "./types.js";
+import type { LoopConfig, PollingConfig, WorkflowAgent, WorkflowSpec, WorkflowStep, WorkflowStepFailWhen } from "./types.js";
+import { resolveBundledWorkflowDir, resolveWorkflowDir } from "./paths.js";
 
 export async function loadWorkflowSpec(workflowDir: string): Promise<WorkflowSpec> {
   const filePath = path.join(workflowDir, "workflow.yml");
-  const raw = await fs.readFile(filePath, "utf-8");
+  const raw = await fsPromises.readFile(filePath, "utf-8");
   const parsed = YAML.parse(raw) as WorkflowSpec;
   if (!parsed?.id) {
     throw new Error(`workflow.yml missing id in ${workflowDir}`);
@@ -71,6 +73,41 @@ function validateAgents(agents: WorkflowAgent[], workflowDir: string) {
   }
 }
 
+function validateFailWhen(failWhen: WorkflowStepFailWhen, stepId: string, workflowDir: string): void {
+  if (!failWhen || typeof failWhen !== "object" || Array.isArray(failWhen)) {
+    throw new Error(`workflow.yml step "${stepId}" fail_when must be a map of key -> [values] in ${workflowDir}`);
+  }
+  for (const [key, values] of Object.entries(failWhen)) {
+    if (!key.trim()) {
+      throw new Error(`workflow.yml step "${stepId}" fail_when has an empty key in ${workflowDir}`);
+    }
+    if (!Array.isArray(values) || values.length === 0 || values.some((v) => typeof v !== "string" || !v.trim())) {
+      throw new Error(`workflow.yml step "${stepId}" fail_when.${key} must be a non-empty list of strings in ${workflowDir}`);
+    }
+  }
+}
+
+/**
+ * Look up a step's fail_when from workflow.yml. Prefers the bundled (git)
+ * copy so host-side completeStep sees new declarations before `workflow sync`
+ * copies files into agent workspaces. Falls back to the installed copy.
+ */
+export function getStepFailWhen(workflowId: string, stepId: string): WorkflowStepFailWhen | undefined {
+  const dirs = [resolveBundledWorkflowDir(workflowId), resolveWorkflowDir(workflowId)];
+  for (const dir of dirs) {
+    try {
+      const raw = fs.readFileSync(path.join(dir, "workflow.yml"), "utf-8");
+      const parsed = YAML.parse(raw) as WorkflowSpec;
+      const step = parsed.steps?.find((s) => s.id === stepId);
+      if (!step) continue;
+      return step.fail_when;
+    } catch {
+      continue;
+    }
+  }
+  return undefined;
+}
+
 function parseLoopConfig(raw: any): LoopConfig {
   return {
     over: raw.over,
@@ -99,6 +136,9 @@ function validateSteps(steps: WorkflowStep[], workflowDir: string) {
     }
     if (!step.expects?.trim()) {
       throw new Error(`workflow.yml missing step.expects for step "${step.id}"`);
+    }
+    if (step.fail_when !== undefined) {
+      validateFailWhen(step.fail_when, step.id, workflowDir);
     }
   }
 

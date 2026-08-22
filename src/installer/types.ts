@@ -39,6 +39,13 @@ export type WorkflowStepFailure = {
   escalate_to?: string;
 };
 
+/**
+ * Optional per-step failure map. Keys are parsed output KEY: names
+ * (lowercased); values are the output values that should fail the step.
+ * Example: `{ gate: ["fail"], status: ["fail"] }`.
+ */
+export type WorkflowStepFailWhen = Record<string, string[]>;
+
 export type LoopConfig = {
   over: "stories";
   completion: "all_done";
@@ -55,6 +62,7 @@ export type WorkflowStep = {
   input: string;
   expects: string;
   max_retries?: number;
+  fail_when?: WorkflowStepFailWhen;
   on_fail?: WorkflowStepFailure;
 };
 
