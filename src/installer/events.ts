@@ -24,6 +24,13 @@ export interface AntfarmEvent {
   storyId?: string;
   storyTitle?: string;
   detail?: string;
+  containerId?: string;
+  containerCreatedAt?: string;
+  evidence?: {
+    command?: string;
+    exitCode?: number;
+    stdoutTail?: string;
+  };
 }
 
 export function emitEvent(evt: AntfarmEvent): void {

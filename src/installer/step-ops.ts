@@ -112,6 +112,63 @@ function getWorkflowId(runId: string): string | undefined {
   } catch { return undefined; }
 }
 
+/**
+ * Best-effort lookup of the running docker container for an agent.
+ * Never throws — claimStep must not be blocked by docker failures.
+ */
+function resolveRunningContainer(agentId: string): { containerId?: string; containerCreatedAt?: string } {
+  try {
+    const stdout = execFileSync(
+      "docker",
+      [
+        "ps",
+        "--filter",
+        `name=openclaw-sbx-agent-${agentId}-`,
+        "--format",
+        "{{.ID}}\t{{.CreatedAt}}",
+      ],
+      { encoding: "utf-8", timeout: 2000 },
+    ).trim();
+    const line = stdout.split("\n").find(Boolean);
+    if (!line) return {};
+    const tab = line.indexOf("\t");
+    if (tab === -1) return { containerId: line };
+    return {
+      containerId: line.slice(0, tab),
+      containerCreatedAt: line.slice(tab + 1) || undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+function emitStepRunning(evt: {
+  runId: string;
+  workflowId?: string;
+  stepId?: string;
+  agentId?: string;
+  storyId?: string;
+  storyTitle?: string;
+}): void {
+  const container = evt.agentId ? resolveRunningContainer(evt.agentId) : {};
+  emitEvent({
+    ts: new Date().toISOString(),
+    event: "step.running",
+    runId: evt.runId,
+    workflowId: evt.workflowId,
+    stepId: evt.stepId,
+    agentId: evt.agentId,
+    storyId: evt.storyId,
+    storyTitle: evt.storyTitle,
+    ...container,
+  });
+}
+
+function tailOutput(output: string, maxLen = 500): string {
+  if (output.length <= maxLen) return output;
+  return output.slice(-maxLen);
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 /**
@@ -648,7 +705,12 @@ export function claimStep(agentId: string): ClaimResult {
       ).run(nextStory.id, step.id);
 
       const wfId = getWorkflowId(step.run_id);
-      emitEvent({ ts: new Date().toISOString(), event: "step.running", runId: step.run_id, workflowId: wfId, stepId: step.step_id, agentId: agentId });
+      emitStepRunning({
+        runId: step.run_id,
+        workflowId: wfId,
+        stepId: step.step_id,
+        agentId: agentId,
+      });
       emitEvent({ ts: new Date().toISOString(), event: "story.started", runId: step.run_id, workflowId: wfId, stepId: step.step_id, agentId: agentId, storyId: nextStory.story_id, storyTitle: nextStory.title });
       logger.info(`Story started: ${nextStory.story_id} — ${nextStory.title}`, { runId: step.run_id, stepId: step.step_id });
 
@@ -699,7 +761,12 @@ export function claimStep(agentId: string): ClaimResult {
   db.prepare(
     "UPDATE steps SET status = 'running', updated_at = datetime('now') WHERE id = ? AND status = 'pending'"
   ).run(step.id);
-  emitEvent({ ts: new Date().toISOString(), event: "step.running", runId: step.run_id, workflowId: getWorkflowId(step.run_id), stepId: step.step_id, agentId: agentId });
+  emitStepRunning({
+    runId: step.run_id,
+    workflowId: getWorkflowId(step.run_id),
+    stepId: step.step_id,
+    agentId: agentId,
+  });
   logger.info(`Step claimed by ${agentId}`, { runId: step.run_id, stepId: step.step_id });
 
   // Inject progress for any step in a run that has stories
@@ -752,7 +819,7 @@ export function completeStep(stepId: string, output: string): { advanced: boolea
   if (status && isFailureStatus(status)) {
     const reason = parsed.reason ?? "(none given)";
     const message = `Agent reported STATUS: ${status}. REASON: ${reason}`;
-    const failResult = failStepSync(stepId, message);
+    const failResult = failStepSync(stepId, message, { stdoutTail: tailOutput(output) });
     if (failResult.runFailed) {
       notifyFailureExhausted(step.run_id, step.step_id, message).catch(() => {});
     }
@@ -763,7 +830,7 @@ export function completeStep(stepId: string, output: string): { advanced: boolea
   const missingExpectedKeys = requiredKeys.filter((key) => !(key in parsed));
   if (missingExpectedKeys.length > 0) {
     const message = `Step output missing required key(s): ${missingExpectedKeys.join(", ")}`;
-    const failResult = failStepSync(stepId, message);
+    const failResult = failStepSync(stepId, message, { stdoutTail: tailOutput(output) });
     if (failResult.runFailed) {
       notifyFailureExhausted(step.run_id, step.step_id, message).catch(() => {});
     }
@@ -1110,7 +1177,11 @@ export function archiveRunProgress(runId: string): void {
 /**
  * Fail a step synchronously, with retry logic. For loop steps, applies per-story retry.
  */
-export function failStepSync(stepId: string, error: string): { retrying: boolean; runFailed: boolean } {
+export function failStepSync(
+  stepId: string,
+  error: string,
+  evidence?: { command?: string; exitCode?: number; stdoutTail?: string },
+): { retrying: boolean; runFailed: boolean } {
   const db = getDb();
 
   const step = db.prepare(
@@ -1142,7 +1213,15 @@ export function failStepSync(stepId: string, error: string): { retrying: boolean
         db.prepare("UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?").run(step.run_id);
         const wfId = getWorkflowId(step.run_id);
         emitEvent({ ts: new Date().toISOString(), event: "story.failed", runId: step.run_id, workflowId: wfId, stepId: stepId, storyId: storyRow?.story_id, storyTitle: storyRow?.title, detail: error });
-        emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: error });
+        emitEvent({
+          ts: new Date().toISOString(),
+          event: "step.failed",
+          runId: step.run_id,
+          workflowId: wfId,
+          stepId: step.step_id,
+          detail: error,
+          evidence,
+        });
         emitEvent({ ts: new Date().toISOString(), event: "run.failed", runId: step.run_id, workflowId: wfId, detail: "Story retries exhausted" });
         scheduleRunCronTeardown(step.run_id);
         return { retrying: false, runFailed: true };
@@ -1166,7 +1245,15 @@ export function failStepSync(stepId: string, error: string): { retrying: boolean
       "UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?"
     ).run(step.run_id);
     const wfId2 = getWorkflowId(step.run_id);
-    emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: step.run_id, workflowId: wfId2, stepId: step.step_id, detail: error });
+    emitEvent({
+      ts: new Date().toISOString(),
+      event: "step.failed",
+      runId: step.run_id,
+      workflowId: wfId2,
+      stepId: step.step_id,
+      detail: error,
+      evidence,
+    });
     emitEvent({ ts: new Date().toISOString(), event: "run.failed", runId: step.run_id, workflowId: wfId2, detail: "Step retries exhausted" });
     scheduleRunCronTeardown(step.run_id);
     return { retrying: false, runFailed: true };
