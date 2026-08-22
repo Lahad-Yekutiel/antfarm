@@ -13,6 +13,14 @@ const execFileAsync = promisify(execFile);
 
 const RECREATE_TIMEOUT_MS = 3 * 60 * 1000;
 const DOCKER_POLL_INTERVAL_MS = 2000;
+const STABLE_ABSENT_POLLS = 3;
+
+export type WaitForContainerChangeOpts = {
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+  getContainerId?: (agentId: string) => string | null;
+  sleepFn?: (ms: number) => Promise<void>;
+};
 
 export class SyncWorkflowError extends Error {
   constructor(message: string) {
@@ -64,29 +72,39 @@ async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function waitForContainerChange(agentId: string, previousId: string | null): Promise<string | null> {
-  const deadline = Date.now() + RECREATE_TIMEOUT_MS;
+export async function waitForContainerChange(
+  agentId: string,
+  previousId: string | null,
+  opts: WaitForContainerChangeOpts = {},
+): Promise<string | null> {
+  const timeoutMs = opts.timeoutMs ?? RECREATE_TIMEOUT_MS;
+  const pollIntervalMs = opts.pollIntervalMs ?? DOCKER_POLL_INTERVAL_MS;
+  const getId = opts.getContainerId ?? getDockerContainerId;
+  const sleepFn = opts.sleepFn ?? sleep;
+  const deadline = Date.now() + timeoutMs;
   let stableAbsentPolls = 0;
 
   while (Date.now() < deadline) {
-    const current = getDockerContainerId(agentId);
+    const current = getId(agentId);
 
     if (previousId === null) {
       if (current !== null) return current;
       stableAbsentPolls++;
-      if (stableAbsentPolls >= 3) return null;
-    } else if (current !== previousId) {
+      if (stableAbsentPolls >= STABLE_ABSENT_POLLS) return null;
+    } else if (current && current !== previousId) {
+      // Require a real replacement id. A destroyed container (current === null)
+      // is not a successful change — keep polling until a new id appears or we timeout.
       return current;
     }
 
-    await sleep(DOCKER_POLL_INTERVAL_MS);
+    await sleepFn(pollIntervalMs);
   }
 
-  const finalId = getDockerContainerId(agentId);
+  const finalId = getId(agentId);
   if (previousId === null && finalId === null) return null;
 
   throw new SyncWorkflowError(
-    `Timed out after ${RECREATE_TIMEOUT_MS / 1000}s waiting for docker container to change for agent "${agentId}"`,
+    `Timed out after ${timeoutMs / 1000}s waiting for docker container to change for agent "${agentId}"`,
   );
 }
 
