@@ -456,31 +456,8 @@ function failStepWithMissingInputs(
   runId: string,
   missingKeys: string[],
 ): void {
-  const db = getDb();
-  const wfId = getWorkflowId(runId);
   const message = `Step input is not ready: missing required template key(s) ${missingKeys.join(", ")}`;
-
-  db.prepare(
-    "UPDATE steps SET status = 'failed', output = ?, updated_at = datetime('now') WHERE id = ?"
-  ).run(message, stepDbId);
-  db.prepare("UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?").run(runId);
-
-  emitEvent({
-    ts: new Date().toISOString(),
-    event: "step.failed",
-    runId,
-    workflowId: wfId,
-    stepId: stepPublicId,
-    detail: message,
-  });
-  emitEvent({
-    ts: new Date().toISOString(),
-    event: "run.failed",
-    runId,
-    workflowId: wfId,
-    detail: message,
-  });
-  scheduleRunCronTeardown(runId);
+  failStepSync(stepDbId, message);
 }
 
 function runHasStories(runId: string): boolean {

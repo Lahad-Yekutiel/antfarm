@@ -2,7 +2,7 @@ import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { getDb } from "../dist/db.js";
-import { completeStep } from "../dist/installer/step-ops.js";
+import { claimStep, completeStep } from "../dist/installer/step-ops.js";
 
 describe("completeStep status and contract gates", () => {
   const testRunIds: string[] = [];
@@ -154,5 +154,37 @@ describe("completeStep status and contract gates", () => {
 
     const merge = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepDbIds.merge) as { status: string };
     assert.equal(merge.status, "pending");
+  });
+
+  it("missing template key on claim routes through retry — pending, run stays running", () => {
+    const agentId = `thecoach-dev_developer-${randomUUID().slice(0, 8)}`;
+    const { runId, stepDbIds } = insertRun([
+      {
+        stepId: "implement",
+        agentId,
+        stepIndex: 0,
+        expects: "STATUS:",
+        status: "pending",
+        maxRetries: 2,
+        inputTemplate: "BUILD_CMD: {{build_cmd}}\nTEST_CMD: {{test_cmd}}",
+      },
+    ], { repo: "/tmp/repo", branch: "feat-x" });
+
+    const result = claimStep(agentId);
+
+    assert.equal(result.found, false);
+
+    const db = getDb();
+    const step = db.prepare("SELECT status, retry_count, output FROM steps WHERE id = ?").get(stepDbIds.implement) as {
+      status: string;
+      retry_count: number;
+      output: string;
+    };
+    assert.equal(step.status, "pending");
+    assert.equal(step.retry_count, 1);
+    assert.ok(step.output.includes("missing required template key(s) build_cmd, test_cmd"));
+
+    const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    assert.equal(run.status, "running");
   });
 });
