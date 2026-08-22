@@ -90,7 +90,7 @@ function printUsage() {
       "antfarm uninstall [--force]          Full uninstall (workflows, agents, crons, DB)",
       "",
       "antfarm workflow list                List available workflows",
-      "antfarm workflow install <name>      Install a workflow",
+      "antfarm workflow install <name> [--force-files]  Install a workflow",
       "antfarm workflow uninstall <name>    Uninstall a workflow (blocked if runs active)",
       "antfarm workflow uninstall --all     Uninstall all workflows (--force to override)",
       "antfarm workflow run <name> <task>   Start a workflow run",
@@ -505,7 +505,8 @@ async function main() {
   }
 
   if (action === "install") {
-    const result = await installWorkflow({ workflowId: target });
+    const forceFiles = args.includes("--force-files");
+    const result = await installWorkflow({ workflowId: target, overwriteFiles: forceFiles });
     process.stdout.write(`Installed workflow: ${result.workflowId}\nAgent crons will start when a run begins.\n`);
     process.stdout.write(`\nStart with: antfarm workflow run ${result.workflowId} "your task"\n`);
     return;

@@ -234,10 +234,18 @@ async function writeWorkflowMetadata(params: { workflowDir: string; workflowId: 
   await fs.writeFile(path.join(params.workflowDir, "metadata.json"), `${JSON.stringify(content, null, 2)}\n`, "utf-8");
 }
 
-export async function installWorkflow(params: { workflowId: string }): Promise<WorkflowInstallResult> {
+export async function installWorkflow(params: {
+  workflowId: string;
+  overwriteFiles?: boolean;
+}): Promise<WorkflowInstallResult> {
   const { workflowDir, bundledSourceDir } = await fetchWorkflow(params.workflowId);
   const workflow = await loadWorkflowSpec(workflowDir);
-  const provisioned = await provisionAgents({ workflow, workflowDir, bundledSourceDir });
+  const provisioned = await provisionAgents({
+    workflow,
+    workflowDir,
+    bundledSourceDir,
+    overwriteFiles: params.overwriteFiles ?? false,
+  });
 
   // Build a role lookup: workflow agent id → role (explicit or inferred)
   const roleMap = new Map<string, AgentRole>();
