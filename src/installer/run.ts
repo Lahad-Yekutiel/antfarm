@@ -6,11 +6,50 @@ import { logger } from "../lib/logger.js";
 import { ensureWorkflowCrons } from "./agent-cron.js";
 import { emitEvent } from "./events.js";
 
+function parseRepoFromTask(task: string): string | null {
+  const match = task.match(/^REPO:\s*(.+)$/m);
+  return match ? match[1].trim() : null;
+}
+
+function repoFromRunContext(contextJson: string, task: string): string | null {
+  try {
+    const context = JSON.parse(contextJson) as Record<string, string>;
+    if (context.repo?.trim()) return context.repo.trim();
+  } catch {
+    // fall through
+  }
+  return parseRepoFromTask(task);
+}
+
+function findConflictingRun(workflowId: string, repo: string): { id: string; task: string } | null {
+  const db = getDb();
+  const running = db.prepare(
+    "SELECT id, task, context FROM runs WHERE workflow_id = ? AND status = 'running'",
+  ).all(workflowId) as Array<{ id: string; task: string; context: string }>;
+
+  for (const run of running) {
+    const existingRepo = repoFromRunContext(run.context, run.task);
+    if (existingRepo && existingRepo === repo) return { id: run.id, task: run.task };
+  }
+  return null;
+}
+
 export async function runWorkflow(params: {
   workflowId: string;
   taskTitle: string;
   notifyUrl?: string;
 }): Promise<{ id: string; runNumber: number; workflowId: string; task: string; status: string }> {
+  const repo = parseRepoFromTask(params.taskTitle);
+  if (repo) {
+    const conflict = findConflictingRun(params.workflowId, repo);
+    if (conflict) {
+      throw new Error(
+        `Cannot start workflow run: another run (${conflict.id.slice(0, 8)}) is already ` +
+          `'running' against repo "${repo}". Wait for it to finish or stop it before starting a second run on the same checkout.`,
+      );
+    }
+  }
+
   const workflowDir = resolveWorkflowDir(params.workflowId);
   const workflow = await loadWorkflowSpec(workflowDir);
   const db = getDb();
