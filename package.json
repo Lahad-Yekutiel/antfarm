@@ -12,7 +12,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && cp src/server/index.html dist/server/index.html && chmod +x dist/cli/cli.js && node scripts/inject-version.js",
     "start": "node dist/cli/cli.js",
-    "test": "npm run build && node --test tests/*.ts"
+    "test": "npm run build && node --test tests/*.ts tests/*.mjs"
   },
   "dependencies": {
     "json5": "^2.2.3",

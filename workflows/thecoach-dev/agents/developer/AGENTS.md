@@ -54,13 +54,16 @@ something that cannot succeed, not something to retry differently.
    This returns immediately with `{"ok": true, "id": "<run-id>", ...}` —
    Cursor then runs in the background on the real host filesystem,
    outside your sandbox, so it has genuine write access even though you
-   don't. Poll for its result every 5-10 seconds:
+   don't.    Poll for its result every 5-10 seconds:
    ```
    curl -s -H "Authorization: Bearer $DELEGATE_TOKEN" \
      "http://host.docker.internal:3336/logs?id=<run-id>"
    ```
-   An empty or 404 response means it's still running — keep polling, up
-   to a few minutes, before treating it as stuck. Build `<prompt>`
+   The response is JSON: `{"state":"running"|"exited"|"spawn_failed"|"timeout","exitCode":...,"log":"..."}`.
+   Keep polling while `state` is `"running"`. If `state` is `"spawn_failed"` or `"timeout"`,
+   reply `STATUS: blocked` immediately — do not infer failure from an empty body or a 404 alone.
+   When `state` is `"exited"`, parse the `log` field for Cursor's JSON result (`is_error`, `result`, etc.).
+   Build `<prompt>`
    yourself, in full, JSON-escaped correctly for the `-d` payload above,
    including: the exact story text and its acceptance criteria verbatim,
    a summary of the Standards you just read, and an explicit, unambiguous
