@@ -11,6 +11,7 @@ import { listCronJobs } from "../installer/gateway-api.js";
 import {
   runSyncChecks,
   checkOrphanedCrons,
+  checkStaleCronPayloads,
   type MedicFinding,
 } from "./checks.js";
 import crypto from "node:crypto";
@@ -151,6 +152,7 @@ export async function runMedicCheck(): Promise<MedicCheckResult> {
     if (cronResult.ok && cronResult.jobs) {
       const antfarmCrons = cronResult.jobs.filter(j => j.name.startsWith("antfarm/"));
       findings.push(...checkOrphanedCrons(antfarmCrons));
+      findings.push(...await checkStaleCronPayloads(cronResult.jobs));
     }
   } catch {
     // Can't check crons — skip this check

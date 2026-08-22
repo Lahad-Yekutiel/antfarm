@@ -256,7 +256,13 @@ export async function checkCronToolAvailable(): Promise<{ ok: boolean; error?: s
   }
 }
 
-export async function listCronJobs(): Promise<{ ok: boolean; jobs?: Array<{ id: string; name: string }>; error?: string }> {
+export type CronJob = {
+  id: string;
+  name: string;
+  payload?: { message?: string; kind?: string; model?: string; timeoutSeconds?: number };
+};
+
+export async function listCronJobs(): Promise<{ ok: boolean; jobs?: CronJob[]; error?: string }> {
   // --- Try HTTP first ---
   const httpResult = await listCronJobsHTTP();
   if (httpResult !== null) return httpResult;
@@ -265,7 +271,7 @@ export async function listCronJobs(): Promise<{ ok: boolean; jobs?: Array<{ id: 
   try {
     const stdout = await runCli(["cron", "list", "--json", "--all"]);
     const parsed = JSON.parse(stdout);
-    const jobs: Array<{ id: string; name: string }> = parsed.jobs ?? parsed ?? [];
+    const jobs: CronJob[] = parsed.jobs ?? parsed ?? [];
     return { ok: true, jobs };
   } catch (err) {
     return { ok: false, error: `CLI fallback failed: ${err}. ${UPDATE_HINT}` };
@@ -273,7 +279,7 @@ export async function listCronJobs(): Promise<{ ok: boolean; jobs?: Array<{ id: 
 }
 
 /** HTTP-only list. Returns null on 404/network error. */
-async function listCronJobsHTTP(): Promise<{ ok: boolean; jobs?: Array<{ id: string; name: string }>; error?: string } | null> {
+async function listCronJobsHTTP(): Promise<{ ok: boolean; jobs?: CronJob[]; error?: string } | null> {
   const gateway = await getGatewayConfig();
   try {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -296,7 +302,7 @@ async function listCronJobsHTTP(): Promise<{ ok: boolean; jobs?: Array<{ id: str
       return { ok: false, error: result.error?.message ?? "Unknown error" };
     }
 
-    let jobs: Array<{ id: string; name: string }> = [];
+    let jobs: CronJob[] = [];
     const content = result.result?.content;
     if (Array.isArray(content) && content[0]?.text) {
       try {

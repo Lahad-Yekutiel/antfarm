@@ -1,0 +1,79 @@
+{
+  "$schema": "antfarm-known-failure-modes/v1",
+  "description": "Catalog of known Antfarm failure patterns for medic diagnostics.",
+  "diagnostic_predicate_schema": {
+    "type": "Mechanical check type: sql | json_path | cmd | substring",
+    "query": "Predicate body — SQL for sql, JSONPath-like dot path for json_path, shell command for cmd, literal substring for substring",
+    "expect": "Optional expected value (json_path/cmd exit semantics)",
+    "notes": "Human documentation when no mechanical check applies"
+  },
+  "modes": [
+    {
+      "id": "stuck-steps-abandoned",
+      "summary": "Step stuck in running after agent timeout or crash",
+      "diagnostic_check": "Steps in status running longer than max role timeout",
+      "diagnostic_predicate": {
+        "type": "sql",
+        "query": "SELECT COUNT(*) AS cnt FROM steps s JOIN runs r ON r.id = s.run_id WHERE s.status = 'running' AND r.status = 'running'"
+      },
+      "medic_check": "stuck_steps"
+    },
+    {
+      "id": "zombie-runs",
+      "summary": "Run marked running but all steps are terminal",
+      "diagnostic_check": "Runs with status running and no waiting/pending/running steps",
+      "diagnostic_predicate": {
+        "type": "sql",
+        "query": "SELECT COUNT(*) AS cnt FROM runs r WHERE r.status = 'running' AND NOT EXISTS (SELECT 1 FROM steps s WHERE s.run_id = r.id AND s.status IN ('waiting','pending','running'))"
+      },
+      "medic_check": "dead_runs"
+    },
+    {
+      "id": "orphaned-crons",
+      "summary": "Agent crons still running with no active workflow runs",
+      "diagnostic_check": "Antfarm cron jobs exist while workflow has zero running runs",
+      "diagnostic_predicate": {
+        "type": "cmd",
+        "query": "node dist/cli/cli.js workflow runs",
+        "notes": "Evaluated by medic via gateway cron list + DB cross-check (checkOrphanedCrons)"
+      },
+      "medic_check": "orphaned_crons"
+    },
+    {
+      "id": "stale-cron-payload-not-refreshed",
+      "summary": "Installed agent cron prompt is stale — missing current two-phase polling markers",
+      "diagnostic_check": "Cron payload message must contain sessions_spawn and must NOT instruct sessions_yield (removed in current buildPollingPrompt)",
+      "diagnostic_predicate": {
+        "type": "substring",
+        "query": "sessions_spawn",
+        "expect": "present"
+      },
+      "anti_markers": ["sessions_yield"],
+      "medic_check": "stale_cron_payload"
+    },
+    {
+      "id": "workflow-file-drift",
+      "summary": "Live agent workspace files differ from bundled workflow source",
+      "diagnostic_check": "Run antfarm workflow check-drift <id> — nonzero exit means drift",
+      "diagnostic_predicate": {
+        "type": "cmd",
+        "query": "node dist/cli/cli.js workflow check-drift thecoach-dev",
+        "expect": "exit 0",
+        "notes": "Workflow id parameterized at runtime by medic; documented-only default names thecoach-dev"
+      },
+      "medic_check": "workflow_drift",
+      "documentation_only": true
+    },
+    {
+      "id": "concurrent-runs-same-repo",
+      "summary": "Two runs operating on the same REPO checkout concurrently",
+      "diagnostic_check": "Multiple running runs whose context.repo or task REPO: line resolve to the same path",
+      "diagnostic_predicate": {
+        "type": "sql",
+        "query": "SELECT context FROM runs WHERE status = 'running'",
+        "notes": "Requires parsing JSON context in application code — not expressible as a single SQL predicate; guarded at runWorkflow startup instead"
+      },
+      "documentation_only": true
+    }
+  ]
+}

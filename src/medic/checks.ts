@@ -3,6 +3,11 @@
  */
 import { getDb } from "../db.js";
 import { getMaxRoleTimeoutSeconds } from "../installer/install.js";
+import { buildPollingPrompt } from "../installer/agent-cron.js";
+import { loadWorkflowSpec } from "../installer/workflow-spec.js";
+import { resolveWorkflowDir } from "../installer/paths.js";
+import type { CronJob } from "../installer/gateway-api.js";
+import { loadKnownFailureModes, checkKnownFailureSqlModes } from "./known-failures.js";
 
 export type MedicSeverity = "info" | "warning" | "critical";
 export type MedicActionType =
@@ -196,6 +201,81 @@ export function checkOrphanedCrons(
   return findings;
 }
 
+// ── Check: Stale cron payloads ──────────────────────────────────────
+
+const STALE_CRON_POSITIVE_MARKERS: string[] = [];
+
+function cronPayloadIsStale(message: string, expectedPrompt?: string): boolean {
+  if (!message.includes("sessions_spawn")) return true;
+  if (!message.includes("step peek")) return true;
+  if (message.includes("call sessions_yield") && !message.includes("do NOT call sessions_yield")) {
+    return true;
+  }
+  for (const marker of STALE_CRON_POSITIVE_MARKERS) {
+    if (message.includes(marker)) return true;
+  }
+  // Expected current source must include the anti-yield instruction
+  if (expectedPrompt?.includes("do NOT call sessions_yield") && !message.includes("do NOT call sessions_yield")) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Flag antfarm cron jobs whose stored payload doesn't match current installed polling prompts.
+ */
+export async function checkStaleCronPayloads(
+  cronJobs: CronJob[],
+): Promise<MedicFinding[]> {
+  const findings: MedicFinding[] = [];
+  const catalog = loadKnownFailureModes();
+  const mode = catalog.modes.find((m) => m.id === "stale-cron-payload-not-refreshed");
+  if (!mode) return findings;
+
+  const antfarmCrons = cronJobs.filter((j) => j.name.startsWith("antfarm/"));
+  const workflowIds = new Set<string>();
+  for (const job of antfarmCrons) {
+    const match = job.name.match(/^antfarm\/([^/]+)\//);
+    if (match) workflowIds.add(match[1]);
+  }
+
+  const expectedPrompts = new Map<string, string>();
+  for (const workflowId of workflowIds) {
+    try {
+      const workflow = await loadWorkflowSpec(resolveWorkflowDir(workflowId));
+      for (const agent of workflow.agents) {
+        const cronName = `antfarm/${workflowId}/${agent.id}`;
+        expectedPrompts.set(cronName, buildPollingPrompt(workflowId, agent.id));
+      }
+    } catch {
+      // workflow not installed — skip
+    }
+  }
+
+  for (const job of antfarmCrons) {
+    const message = job.payload?.message ?? "";
+    const expected = expectedPrompts.get(job.name);
+    if (cronPayloadIsStale(message, expected)) {
+      findings.push({
+        check: "stale_cron_payload",
+        severity: "warning",
+        message: `Cron "${job.name}" payload is stale — missing current polling markers (${mode.diagnostic_check})`,
+        action: "none",
+        remediated: false,
+      });
+    }
+  }
+
+  return findings;
+}
+
+// ── Check: Known failure catalog (SQL predicates) ───────────────────
+
+export function checkKnownFailureModes(): MedicFinding[] {
+  const db = getDb();
+  return checkKnownFailureSqlModes(db);
+}
+
 // ── Run All Checks ──────────────────────────────────────────────────
 
 /**
@@ -206,5 +286,6 @@ export function runSyncChecks(): MedicFinding[] {
     ...checkStuckSteps(),
     ...checkStalledRuns(),
     ...checkDeadRuns(),
+    ...checkKnownFailureModes(),
   ];
 }
