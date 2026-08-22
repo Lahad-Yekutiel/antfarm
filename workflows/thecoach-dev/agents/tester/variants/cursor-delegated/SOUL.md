@@ -1,0 +1,1 @@
+Per-story checks already happened; your job is the seams between stories, not re-litigating any single one. Cursor runs the real suite and the real build for you, once, against the branch as it actually stands — but you read the raw output yourself before you report anything. A confident summary is not a substitute for output you've actually looked at.

@@ -1,0 +1,465 @@
+# TheCoach custom dev workflow — replaces the stock Antfarm `feature-dev`
+# bundle, which proved too fragile in trial (see
+# local/cursor_loop/OPENCLAW_ANTFARM_LEARNINGS.md for the full postmortem).
+#
+# Design goals, each traceable to a specific finding or project rule:
+#   - Never let a step "discover" the target repo (root cause of the
+#     wrong-target-repo bug) — REPO is parsed from the task text and
+#     asserted, not explored-and-guessed.
+#   - Match TheCoach's own six-field-plus task format (_SSoT/tasks/TEMPLATE_TASK.md)
+#     and protected-path rules (_SSoT/cursor_loop/DESIGN.md).
+#   - Add a real live-browser QA step (Claude-in-Chrome) — neither Antfarm's
+#     stock verify/test steps nor Bernstein's Janitor do this, and this
+#     project's QA process (_SSoT/topics/TESTING_PROCESS.md) requires it.
+#   - Every reply-format label is unique across the whole workflow (no two
+#     steps share a KEY: name) to avoid the stock bundle's
+#     wrong-step-label-copied bug.
+#
+# Specialist-tier escalation — REMOVED after the 2026-08-13 smoke test.
+# The developer specified: retry-cap exhaustion -> one Specialist-tier
+# attempt with full failure history -> then human triage. This is NOT
+# achievable inside a single Antfarm run: advancePipeline() is strictly
+# linear by step_index (confirmed from src/installer/step-ops.ts) — there
+# is no conditional step branching. A `specialist-fix` step listed in the
+# array runs unconditionally every time, not just on failure (confirmed
+# empirically — see OPENCLAW_ANTFARM_LEARNINGS.md's session-2 entry). And
+# on_fail.on_exhausted.escalate_to is a NOTIFICATION-ONLY side channel
+# (sends a chat message to a human/main session or a named agent via
+# sendSessionMessage) — it cannot redirect execution to another step, and
+# only "main"/"human"/an "agent:..." reference resolve to anything; a bare
+# step id silently no-ops. What this workflow does instead: `implement`'s
+# own on_fail.on_exhausted.escalate_to is set to "main", which sends a
+# real chat notification when a story's retries are exhausted. Getting an
+# automated Specialist-tier retry would require either a genuinely
+# different model/prompt on the SAME developer step's own retry attempts
+# (not investigated this session), or a human/Architect manually
+# re-pointing a stronger model at the specific failed story and running
+# `antfarm workflow resume <run-id>` — semi-manual, not push-button.
+
+id: thecoach-dev
+name: TheCoach Custom Dev Workflow
+version: 1
+description: |
+  Story-based execution pipeline for TheCoach. Planner parses the task's
+  explicit REPO field and decomposes work into ordered stories. Setup
+  prepares the environment against the asserted repo. Developer implements
+  each story (with tests) in a fresh session, committing per story.
+  Verifier checks each story AND enforces the protected-path gate. Tester
+  runs integration/E2E checks. Browser QA does live Claude-in-Chrome
+  verification against the task's own QA checklist. PR opens the pull
+  request. Reviewer does independent code review, a live spot-check, and
+  approves or requests changes via gh. A coding step that exhausts its
+  retries sends a real chat notification (no automated Specialist-tier
+  retry — see the note at the top of this file) and the run is left for
+  human triage.
+
+polling:
+  # Never leave this as "default" — confirmed in trial it can silently
+  # resolve to an unconfigured OpenAI provider and fail every run.
+  model: anthropic/claude-sonnet-5
+  timeoutSeconds: 2100  # raised from 120s — must outlive the sessions_yield wait for a spawned child (default 30 min/1800s) per the reliability patch, see ANTFARM_RELIABILITY_ROADMAP.md Phase 4
+
+agents:
+  - id: planner
+    name: Planner
+    role: analysis
+    model: anthropic/claude-sonnet-5
+    description: >
+      Parses REPO/BRANCH/task fields from the task text and decomposes
+      into ordered stories. Never explores-and-guesses the repo.
+    workspace:
+      baseDir: agents/planner
+      files:
+        AGENTS.md: agents/planner/AGENTS.md
+        SOUL.md: agents/planner/SOUL.md
+        IDENTITY.md: agents/planner/IDENTITY.md
+
+  - id: setup
+    name: Setup
+    role: coding
+    model: anthropic/claude-sonnet-5
+    description: Asserts the repo, creates the branch, establishes baseline.
+    workspace:
+      baseDir: agents/setup
+      files:
+        AGENTS.md: agents/setup/AGENTS.md
+        SOUL.md: agents/setup/SOUL.md
+        IDENTITY.md: agents/setup/IDENTITY.md
+
+  - id: developer
+    name: Developer
+    role: coding
+    model: anthropic/claude-sonnet-5
+    description: Implements one story at a time, with tests, committing per story.
+    workspace:
+      baseDir: agents/developer
+      files:
+        AGENTS.md: agents/developer/AGENTS.md
+        SOUL.md: agents/developer/SOUL.md
+        IDENTITY.md: agents/developer/IDENTITY.md
+
+  - id: verifier
+    name: Verifier
+    role: verification
+    model: anthropic/claude-sonnet-5
+    description: >
+      Per-story sanity check AND the hard protected-path gate — blocks
+      regardless of what else passed if the diff touches _SSoT/**,
+      supabase/migrations/**, or anything outside the task's declared
+      Expected files.
+    workspace:
+      baseDir: agents/verifier
+      files:
+        AGENTS.md: agents/verifier/AGENTS.md
+        SOUL.md: agents/verifier/SOUL.md
+        IDENTITY.md: agents/verifier/IDENTITY.md
+
+  - id: tester
+    name: Tester
+    role: testing
+    model: anthropic/claude-sonnet-5
+    description: Integration and E2E testing after all stories are implemented.
+    workspace:
+      baseDir: agents/tester
+      files:
+        AGENTS.md: agents/tester/AGENTS.md
+        SOUL.md: agents/tester/SOUL.md
+        IDENTITY.md: agents/tester/IDENTITY.md
+
+  - id: browser-qa
+    name: Browser QA
+    role: testing
+    model: anthropic/claude-sonnet-5
+    description: >
+      Live-app verification via Claude-in-Chrome against the task's own
+      QA checklist and RTL/Hebrew coverage rows — not a lint/type/test
+      proxy.
+    workspace:
+      baseDir: agents/browser-qa
+      skills:
+        - agent-browser
+      files:
+        AGENTS.md: agents/browser-qa/AGENTS.md
+        SOUL.md: agents/browser-qa/SOUL.md
+        IDENTITY.md: agents/browser-qa/IDENTITY.md
+
+  - id: pr
+    name: PR
+    role: pr
+    model: anthropic/claude-sonnet-5
+    description: Opens the pull request once tester and browser-qa both pass.
+    workspace:
+      baseDir: agents/pr
+      files:
+        AGENTS.md: agents/pr/AGENTS.md
+        SOUL.md: agents/pr/SOUL.md
+        IDENTITY.md: agents/pr/IDENTITY.md
+
+  - id: reviewer
+    name: Reviewer
+    # NOT "analysis" — that role's policy explicitly denies group:ui
+    # (no browser/canvas), which would silently strip this agent's
+    # ability to do the live spot-check its own job requires. "testing"
+    # grants browser + web_search/web_fetch and still denies write/edit,
+    # which matches what a reviewer actually needs (read + browser +
+    # exec, never write). Confirmed from Antfarm's own ROLE_POLICIES in
+    # src/installer/install.ts, not assumed.
+    role: testing
+    model: anthropic/claude-sonnet-5
+    description: >
+      Independent code review + a live spot-check, approves or requests
+      changes via gh. On requested changes, the fix goes back through PR
+      again (re-push, re-review) — not straight to browser-qa.
+    workspace:
+      baseDir: agents/reviewer
+      skills:
+        - agent-browser
+      files:
+        AGENTS.md: agents/reviewer/AGENTS.md
+        SOUL.md: agents/reviewer/SOUL.md
+        IDENTITY.md: agents/reviewer/IDENTITY.md
+
+steps:
+  - id: plan
+    agent: planner
+    input: |
+      Decompose the following task into ordered user stories for autonomous
+      execution. This task text MUST begin with an explicit `REPO:` line
+      and a `BRANCH:` line — if either is missing or the REPO path does not
+      exist / is not a git repository when you check it, STOP immediately
+      and reply with STATUS: blocked and a REASON explaining exactly what's
+      wrong. Do not guess a repo. Do not explore for one. Do not proceed
+      without both fields present and REPO verified.
+
+      TASK:
+      {{task}}
+
+      Instructions:
+      1. Parse REPO and BRANCH from the task text above (they are the
+         first two lines).
+      2. Run `git -C <REPO> rev-parse --show-toplevel` and confirm the
+         result matches REPO exactly (resolve any symlinks/relative paths
+         first). If it doesn't match, or the command errors, STOP — reply
+         STATUS: blocked, not STATUS: done.
+      3. Explore the codebase AT THAT VERIFIED PATH ONLY to understand
+         stack, conventions, and patterns relevant to the task.
+      4. Break the task into small user stories (max 20).
+      5. Order by dependency: schema/DB first, backend, frontend, integration.
+      6. Each story must fit in one developer session (one context window).
+      7. Every acceptance criterion must be mechanically verifiable.
+      8. Always include "Typecheck passes" as the last criterion in every story.
+      9. Every story MUST include test criteria — "Tests for [feature] pass".
+      10. The developer is expected to write tests as part of each story.
+      11. Cross-check the task's own "Protected — do not modify" list (if
+          present in the task text) and make sure no story requires
+          touching a protected path. If the task's requirements seem to
+          require it, STOP and reply STATUS: blocked with a REASON — this
+          is an Open Question for the developer, not something to route
+          around.
+
+      Reply with EXACTLY these labels (STATUS is always required; the
+      others only on STATUS: done):
+      STATUS: done | blocked
+      REASON: (only if blocked — what's wrong, verbatim)
+      REPO: /absolute/path/to/repo (only if done — the VERIFIED path)
+      BRANCH: feature-branch-name (only if done)
+      STORIES_JSON: [ ... array of {id,title,description,acceptanceCriteria} ... ] (only if done)
+    expects: "STATUS:"
+    max_retries: 1
+
+  - id: setup
+    agent: setup
+    input: |
+      REPO: {{repo}}
+      BRANCH: {{branch}}
+
+      Instructions:
+      1. `cd {{repo}}` — do not proceed if this directory doesn't exist or
+         isn't a git repo (run `git rev-parse --show-toplevel` and compare
+         to {{repo}} before doing anything else; STOP and reply
+         STATUS: blocked if it doesn't match, do not improvise a
+         different path).
+      2. `git fetch origin && git checkout main && git pull`
+      3. `git checkout -b {{branch}}`
+      4. Discover build/test commands (package.json scripts, CI config,
+         test config files).
+      5. Run the build command. Run the test command. Report real results.
+      6. Report what you found.
+
+      Reply with:
+      STATUS: done | blocked
+      REASON: (only if blocked)
+      BUILD_CMD: (only if done)
+      TEST_CMD: (only if done)
+      BASELINE: build passes / tests pass, or describe what failed (only if done)
+    expects: "STATUS:"
+    max_retries: 2
+
+  - id: implement
+    agent: developer
+    type: loop
+    loop:
+      over: stories
+      completion: all_done
+      freshSession: true
+      verifyEach: true
+      verifyStep: verify
+    input: |
+      REPO: {{repo}}
+      BRANCH: {{branch}}
+      BUILD_CMD: {{build_cmd}}
+      TEST_CMD: {{test_cmd}}
+
+      STORY:
+      {{current_story}}
+
+      Read _SSoT/DEV.md's Standards section (RTL/Hebrew, TypeScript strict,
+      RLS on every trainer/trainee-scoped table, no magic values, shared
+      logic in the shared package) before writing any code. Implement
+      exactly this story, nothing more — no unrelated refactors, no scope
+      creep. Write tests as part of this story (per _SSoT/topics/TESTING_PROCESS.md
+      Layer 1 — run them, report the real result, "should work" is never
+      acceptable). Commit your work with
+      `git add -A && git commit -m "[thecoach-dev] <story id>: <short description>"`
+      before finishing — this gives the verifier and protected-path gate an
+      isolated diff for this story specifically, same reasoning as
+      _SSoT/cursor_loop/DESIGN.md's per-task checkpoint commits.
+
+      Reply with:
+      STATUS: done | blocked
+      REASON: (only if blocked)
+      CHANGES: what you did, file by file (only if done)
+      TEST_RESULT: the real output of running TEST_CMD just now (only if done)
+      COMMIT_SHA: the commit you just made (only if done)
+    expects: "STATUS:"
+    max_retries: 2
+    on_fail:
+      max_retries: 2
+      # NOT a pipeline branch — Antfarm has no support for conditional step
+      # branching (advancePipeline() is strictly linear by step_index,
+      # confirmed from src/installer/step-ops.ts). on_exhausted.escalate_to
+      # is a NOTIFICATION-ONLY mechanism (sends a chat message via
+      # sendSessionMessage to a human/main session or a named agent) — it
+      # cannot run a different workflow step. "main" is the only value that
+      # actually resolves to something real (per resolveEscalationTarget());
+      # a bare step id like the "specialist-fix" this used to say silently
+      # resolves to nothing and no-ops. Confirmed empirically in the
+      # 2026-08-13 smoke test: specialist-fix, when listed as a normal
+      # array step, ran unconditionally every time regardless of whether
+      # implement actually failed — see OPENCLAW_ANTFARM_LEARNINGS.md.
+      on_exhausted:
+        escalate_to: main
+
+  - id: verify
+    agent: verifier
+    type: loop
+    loop:
+      over: stories
+      completion: all_done
+    input: |
+      REPO: {{repo}}
+      BRANCH: {{branch}}
+
+      STORY:
+      {{current_story}}
+
+      CLAIMED CHANGES:
+      {{changes}}
+
+      COMMIT: {{commit_sha}}
+
+      Instructions — do BOTH checks below, in order. The protected-path
+      gate runs regardless of whether the sanity check passes, and a gate
+      failure overrides everything else.
+
+      1. PROTECTED-PATH GATE (unconditional, run first):
+         `git -C {{repo}} diff --stat main...{{commit_sha}}`
+         Compare the touched-file list against:
+           - `_SSoT/**` (never writable by a Dev agent)
+           - `supabase/migrations/**`
+           - anything outside this story's own claimed CHANGES
+         If ANY touched file matches a protected path, or falls outside
+         the claimed CHANGES, this is a GATE_FAIL regardless of whether
+         the story's actual work looks correct — do not let a clean
+         implementation excuse a protected-path violation.
+
+      2. SANITY CHECK: did the developer actually do the work? Read the
+         diff for this commit specifically
+         (`git -C {{repo}} show {{commit_sha}}`), confirm it matches the
+         claimed CHANGES, confirm tests were actually added (not just
+         claimed), and confirm TEST_RESULT looks like a real run (not a
+         paraphrase).
+
+      Reply with:
+      GATE: pass | fail
+      GATE_REASON: (only if fail — exact offending path(s))
+      STATUS: pass | fail
+      STATUS_REASON: (only if fail — what's wrong, specific enough to act on)
+    expects: "GATE:"
+    max_retries: 1
+
+  - id: test
+    agent: tester
+    input: |
+      REPO: {{repo}}
+      BRANCH: {{branch}}
+      BUILD_CMD: {{build_cmd}}
+      TEST_CMD: {{test_cmd}}
+
+      All stories are implemented and individually verified. Run
+      integration/E2E checks across the whole branch — not just the
+      per-story unit tests already run. Run the full test suite and the
+      build one more time against the final state of the branch. Report
+      real results.
+
+      Reply with:
+      STATUS: pass | fail
+      FAILURES: (only if fail — specifics)
+      INTEGRATION_RESULT: real output of the integration/E2E run (only if pass)
+      BUILD_RESULT: real output of the final build (only if pass)
+    expects: "STATUS:"
+    max_retries: 2
+
+  - id: browser-qa
+    agent: browser-qa
+    input: |
+      REPO: {{repo}}
+      BRANCH: {{branch}}
+
+      The branch has passed automated checks. Now do LIVE verification —
+      this is Layer 2 of _SSoT/topics/TESTING_PROCESS.md, and per
+      topics/TOOLING.md's live-verification standing rule, this is the
+      real gate, not the automated checks above. Start the local dev
+      server (and local Supabase stack if this task touches data) per
+      _SSoT/DEV.md's local-dev workflow, then use the browser to actually
+      exercise the task's own QA checklist end to end:
+
+      TASK (includes the QA checklist to run):
+      {{task}}
+
+      Cover, at minimum: the task's own QA checklist items exactly as
+      written (action -> observable result, no "verify the code"), and —
+      mandatory per _SSoT/DEV.md, not optional — that every touched
+      screen still renders correctly right-to-left with real Hebrew copy,
+      not just that it renders. If ANY checklist item fails, this is a
+      real fail, not a note for later — report it precisely enough that a
+      fix can be attempted without re-deriving what broke.
+
+      Reply with:
+      STATUS: pass | fail
+      QA_RESULTS: each checklist item and its real observed result (only if pass)
+      FAILURES: exactly which item(s) failed and what actually happened, not the expected result (only if fail)
+    expects: "STATUS:"
+    max_retries: 1
+
+  - id: pr
+    agent: pr
+    input: |
+      REPO: {{repo}}
+      BRANCH: {{branch}}
+
+      All checks passed (unit, integration, live browser QA). Push the
+      branch and open a PR via `gh`.
+
+      TASK SUMMARY:
+      {{task}}
+
+      Reply with:
+      STATUS: done | blocked
+      REASON: (only if blocked)
+      PR_URL: the real URL gh returned (only if done)
+    expects: "STATUS:"
+    max_retries: 2
+
+  - id: review
+    agent: reviewer
+    input: |
+      REPO: {{repo}}
+      BRANCH: {{branch}}
+      PR_URL: {{pr_url}}
+
+      Independently review this PR — you did not write this code, review
+      it as if you're seeing it for the first time. Read the full diff via
+      `gh pr diff {{pr_url}}`. Check it against the original task's
+      requirements and acceptance criteria, and against _SSoT/DEV.md's
+      Standards (no magic values, RLS on trainer/trainee-scoped tables,
+      RTL/Hebrew correctness, TypeScript strict). Do a live spot-check of
+      at least one non-trivial claim from the PR description yourself
+      rather than trusting it — same live-verification rule as browser-qa.
+
+      TASK:
+      {{task}}
+
+      If you find a real problem, use `gh pr review {{pr_url}} --request-changes`
+      with specific, actionable comments — this sends the work back through
+      `pr` again (re-push, re-review), not straight back to browser-qa,
+      per the developer's own instruction on this ("send it back to pr").
+      If it's genuinely good, `gh pr review {{pr_url}} --approve`.
+
+      Reply with:
+      STATUS: approved | changes_requested
+      NOTES: your real findings either way
+    expects: "STATUS:"
+    max_retries: 1
+    on_fail:
+      retry_step: pr

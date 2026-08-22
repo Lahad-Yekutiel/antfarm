@@ -195,6 +195,18 @@ export function getCurrentStory(stepId: string): Story | null {
   };
 }
 
+/**
+ * Get a single step's current status and output by its id.
+ * Used by the supervising cron turn (after sessions_yield resumes) to check
+ * whether a spawned sub-agent actually called step complete/step fail.
+ */
+export function getStepStatus(stepId: string): { status: string; output: string | null } | null {
+  const db = getDb();
+  const row = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(stepId) as
+    { status: string; output: string | null } | undefined;
+  return row ?? null;
+}
+
 function formatStoryForTemplate(story: Story): string {
   const ac = story.acceptanceCriteria.map((c, i) => `  ${i + 1}. ${c}`).join("\n");
   return `Story ${story.storyId}: ${story.title}\n\n${story.description}\n\nAcceptance Criteria:\n${ac}`;
@@ -491,25 +503,56 @@ export function claimStep(agentId: string): ClaimResult {
   }
   const db = getDb();
 
-  const step = db.prepare(
+  // Candidate pending steps for this agent, cheapest-first ordering preserved.
+  // The predecessor-ordering guard used to be a single NOT EXISTS clause in
+  // this query, but that treated a loop step mid verify-each cycle (left
+  // intentionally 'running' between a story completing and its verify step
+  // completing — see completeStep()'s verifyEach branch) as "incomplete" and
+  // permanently blocked that loop's own verify step from ever being claimed.
+  // Predecessor-satisfaction is now evaluated in JS below so we can exempt
+  // exactly that one case. (Bug: verify step stuck 'pending' forever behind
+  // a loop step in status='running' for the entire verify-each cycle.)
+  const candidates = db.prepare(
     `SELECT s.id, s.step_id, s.run_id, s.input_template, s.type, s.loop_config, s.step_index
      FROM steps s
      JOIN runs r ON r.id = s.run_id
      WHERE s.agent_id = ? AND s.status = 'pending'
        AND r.status NOT IN ('failed', 'cancelled')
-       AND NOT EXISTS (
-         SELECT 1 FROM steps prev
-         WHERE prev.run_id = s.run_id
-           AND prev.step_index < s.step_index
-           AND prev.status NOT IN ('done', 'skipped')
-       )
-    ORDER BY s.step_index ASC, s.step_id ASC
-     LIMIT 1`
-  ).get(agentId) as {
+    ORDER BY s.step_index ASC, s.step_id ASC`
+  ).all(agentId) as {
     id: string; step_id: string; run_id: string; input_template: string; type: string;
     loop_config: string | null;
     step_index: number;
-  } | undefined;
+  }[];
+
+  let step: (typeof candidates)[number] | undefined;
+  for (const candidate of candidates) {
+    const predecessors = db.prepare(
+      `SELECT step_id, type, status, loop_config FROM steps
+       WHERE run_id = ? AND step_index < ?`
+    ).all(candidate.run_id, candidate.step_index) as {
+      step_id: string; type: string; status: string; loop_config: string | null;
+    }[];
+
+    const blocked = predecessors.some((prev) => {
+      if (prev.status === "done" || prev.status === "skipped") return false;
+      // Exemption: a loop step currently mid verify-each cycle does not
+      // block its own designated verify step from being claimed — that
+      // 'running' status is its normal holding state while waiting on
+      // verify, not an incomplete predecessor.
+      if (prev.type === "loop" && prev.loop_config) {
+        try {
+          const lc: LoopConfig = JSON.parse(prev.loop_config);
+          if (lc.verifyEach && lc.verifyStep === candidate.step_id) return false;
+        } catch {
+          // Malformed loop_config — fall through and treat as blocking.
+        }
+      }
+      return true;
+    });
+
+    if (!blocked) { step = candidate; break; }
+  }
 
   if (!step) return { found: false };
 

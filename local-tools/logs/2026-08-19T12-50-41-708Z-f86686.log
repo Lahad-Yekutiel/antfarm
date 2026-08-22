@@ -1,0 +1,4 @@
+Run: #4 (878cba26-f21f-4884-9a2a-a0d9a8aca8b1)
+Workflow: thecoach-dev
+Task: coordinator-infra smoke test v2: no-op — just confirm the trigger path works end to end, do not make any real changes
+Status: running

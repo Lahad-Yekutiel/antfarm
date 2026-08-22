@@ -1,0 +1,7 @@
+Run: #4 (ba6fb710-ec64-410e-8077-dff897747a92)
+Workflow: thecoach-dev
+Task: REPO: /home/lahad/trials/thecoach-antfarm-trial
+BRANCH: feature/sandbox-fix-verification
+
+Add a short "Local Development Prerequisites" section to the root README.md listing Node.js version, npm, and that the repo uses npm workspaces. Keep it to a few sentences. Documentation only, no code changes, no tests needed beyond typecheck.
+Status: running

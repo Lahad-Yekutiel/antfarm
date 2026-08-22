@@ -1,0 +1,6 @@
+Run: #1 (51dee459-e4c7-449b-9a4c-4564b25f2d60)
+Workflow: thecoach-dev
+Task: REPO: /home/lahad/trials/thecoach-antfarm-trial
+BRANCH: feature/staging-merge-smoke-test
+Add a trivial GET /api/staging-merge-smoke-test endpoint that returns {"ok":true}, with a node:test covering it. This is a smoke test of the new staging-branch + auto-merge pipeline.
+Status: running

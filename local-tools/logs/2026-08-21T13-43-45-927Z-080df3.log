@@ -1,0 +1,7 @@
+Run: #3 (3edee39b-b057-4c5b-b5c8-c3f135c02030)
+Workflow: thecoach-dev
+Task: REPO: /home/lahad/trials/thecoach-antfarm-trial
+BRANCH: docs/web-contributing-notes
+
+Add a short apps/web/CONTRIBUTING.md file (4-6 sentences) explaining how to run the dev server and build locally, based on the actual scripts defined in apps/web/package.json. Note clearly that there is currently no test script or test framework configured in this workspace. No application source code changes.
+Status: running

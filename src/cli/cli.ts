@@ -23,7 +23,7 @@ import { listBundledWorkflows } from "../installer/workflow-fetch.js";
 import { readRecentLogs } from "../lib/logger.js";
 import { getRecentEvents, getRunEvents, type AntfarmEvent } from "../installer/events.js";
 import { startDaemon, stopDaemon, getDaemonStatus, isRunning } from "../server/daemonctl.js";
-import { claimStep, completeStep, failStep, getStories, peekStep } from "../installer/step-ops.js";
+import { claimStep, completeStep, failStep, getStories, getStepStatus, peekStep } from "../installer/step-ops.js";
 import { ensureCliSymlink } from "../installer/symlink.js";
 import { runMedicCheck, getMedicStatus, getRecentMedicChecks } from "../medic/medic.js";
 import { installMedicCron, uninstallMedicCron, isMedicCronInstalled } from "../medic/medic-cron.js";
@@ -109,6 +109,7 @@ function printUsage() {
       "antfarm step complete <step-id>      Complete step (reads output from stdin)",
       "antfarm step fail <step-id> <error>  Fail step with retry logic",
       "antfarm step stories <run-id>       List stories for a run",
+      "antfarm step status <step-id>       Check a step's current status by id",
       "",
       "antfarm medic install                Install medic watchdog cron",
       "antfarm medic uninstall              Remove medic cron",
@@ -412,6 +413,12 @@ async function main() {
       }
       return;
     }
+    if (action === "status") {
+      if (!target) { process.stderr.write("Missing step-id.\n"); process.exit(1); }
+      const result = getStepStatus(target);
+      process.stdout.write(JSON.stringify(result) + "\n");
+      return;
+    }
     process.stderr.write(`Unknown step action: ${action}\n`);
     printUsage();
     process.exit(1);
@@ -513,6 +520,21 @@ async function main() {
     if (result.status === "not_found") { process.stdout.write(`${result.message}\n`); return; }
     const { run, steps } = result;
     const runLabel = run.run_number != null ? `#${run.run_number} (${run.id})` : run.id;
+    const runEvents = getRunEvents(run.id, 500);
+    const stepLines: string[] = [];
+    for (const s of steps) {
+      stepLines.push(`  [${s.status}] ${s.step_id} (${s.agent_id})`);
+      const stepEvents = runEvents
+        .filter((e) => e.stepId === s.step_id && e.event.startsWith("step."))
+        .sort((a, b) => a.ts.localeCompare(b.ts));
+      if (stepEvents.length === 0) {
+        stepLines.push(`      (no timestamped events yet)`);
+        continue;
+      }
+      for (const e of stepEvents) {
+        stepLines.push(`      ${e.ts}  ${e.event}${e.detail ? ` — ${e.detail}` : ""}`);
+      }
+    }
     const lines = [
       `Run: ${runLabel}`,
       `Workflow: ${run.workflow_id}`,
@@ -522,7 +544,7 @@ async function main() {
       `Updated: ${run.updated_at}`,
       "",
       "Steps:",
-      ...steps.map((s) => `  [${s.status}] ${s.step_id} (${s.agent_id})`),
+      ...stepLines,
     ];
     const stories = getStories(run.id);
     if (stories.length > 0) {

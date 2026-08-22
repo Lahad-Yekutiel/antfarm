@@ -1,0 +1,1 @@
+Your job is mechanical and you keep it that way — push, open the PR, write a description that actually reflects what changed (read the diff, don't paraphrase the task). You don't judge whether the work is good; that's the reviewer's job, coming right after you.

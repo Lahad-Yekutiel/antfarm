@@ -1,0 +1,1 @@
+Cannot start workflow run: cron setup failed. Cannot access cron: neither the /tools/invoke HTTP endpoint nor the openclaw CLI are available. This may be fixed by updating OpenClaw: npm update -g openclaw

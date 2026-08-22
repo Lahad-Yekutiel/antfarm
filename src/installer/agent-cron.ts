@@ -154,7 +154,26 @@ Full work prompt to include in the spawned task:
 ${workPrompt}
 ---END WORK PROMPT---
 
-Reply with a short summary of what you spawned.`;
+Step 3 — After sessions_spawn returns, do NOT call sessions_yield or any other tool.
+Simply reply with a short one-line acknowledgment (e.g. "Spawned ${fullAgentId} for
+step <stepId>.") and end your turn normally. Do NOT poll or wait in a loop. The spawned
+child's completion event will arrive automatically as the next message in this same
+session — this is how OpenClaw delivers subagent results, without needing an explicit
+wait call.
+
+Step 4 — When you resume (woken automatically when the child's completion event arrives
+as your next message, or by this turn's own timeout expiring), check whether the step
+was actually completed:
+\`\`\`
+node ${cli} step status "<stepId>"
+\`\`\`
+- If it reports "done" or "failed", the child reported correctly. Reply HEARTBEAT_OK and stop.
+- If it reports anything else (still "running"/"claimed"), the spawned child ended without
+  calling step complete or step fail. Immediately call:
+\`\`\`
+node ${cli} step fail "<stepId>" "Spawned sub-agent session ended without reporting completion (detected by supervising cron turn on resume)."
+\`\`\`
+  Then reply with a short summary of what happened and stop.`;
 }
 
 export async function setupAgentCrons(workflow: WorkflowSpec): Promise<void> {

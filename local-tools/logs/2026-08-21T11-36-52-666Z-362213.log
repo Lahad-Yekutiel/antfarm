@@ -1,0 +1,6 @@
+Run: #2 (733d3244-ab41-4ec0-96b6-dec4c793c7c1)
+Workflow: thecoach-dev
+Task: REPO: /home/lahad/trials/thecoach-antfarm-trial
+BRANCH: fix/dedupe-react-versions
+Fix a real build-blocking bug: the repo has duplicate React installs (root package.json pins react@18.3.1, apps/web pins react@19.2.8), which breaks `npm run build --workspace=apps/web` during static prerender of /404 with TypeError: Cannot read properties of null (reading 'useContext'). Align both to a single compatible React version (prefer matching apps/web's existing framework requirements - check what version Next.js in apps/web actually requires/supports), regenerate the lockfile, and confirm `npm run build --workspace=apps/web` passes cleanly. Do not change any application logic beyond dependency versions/lockfile.
+Status: running
