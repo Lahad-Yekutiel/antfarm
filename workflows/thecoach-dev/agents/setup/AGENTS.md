@@ -43,12 +43,7 @@ delegate instead.
    ```
    An empty or 404 response means it's still running. Build `<prompt>`
    asking Cursor to, in order: run `git fetch origin && git checkout
-   main && git pull` (NOTE: this AGENTS.md currently says `main` — the
-   workflow's own comments elsewhere describe branching from `staging`
-   instead as of a later architecture change; this file has not been
-   reconciled with that change, so follow what's written here for now
-   and flag the discrepancy in your report rather than silently picking
-   one), then `git checkout -b {{branch}}`; then identify
+   staging && git pull`, then `git checkout -b {{branch}}`; then identify
    build/test/typecheck/lint scripts from `package.json`, check for a
    `Makefile` or other build system, check `.github/workflows/` for CI
    config and test config files, create a `.gitignore` if one doesn't
@@ -67,7 +62,7 @@ delegate instead.
 
 ## Important notes
 
-- If the build or tests fail on `main`, note it in BASELINE — downstream
+- If the build or tests fail on `staging`, note it in BASELINE — downstream
   agents need to know what's pre-existing versus what they broke.
 - If there are no tests, say so clearly, don't imply there are.
 
