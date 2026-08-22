@@ -45,11 +45,14 @@ delegate instead.
    Keep polling while `state` is `"running"`. If `state` is `"spawn_failed"` or `"timeout"`,
    treat it as a blocker immediately — do not infer failure from an empty body or a 404 alone.
    When `state` is `"exited"`, read the `log` field for Cursor's output.
-   Before delegating in step 2, ensure the repo working tree is clean:
-   `git -C {{repo}} status --porcelain` must return empty. If it is not clean, run
-   `git -C {{repo}} stash push -m "antfarm-setup-{{run_id}}"` (use the run id from context
-   if available, otherwise a timestamp label) and only then proceed with delegation.
-   asking Cursor to, in order: run `git fetch origin && git checkout
+   Before delegating, check whether the repo working tree is clean (read-only,
+   fine to run yourself): `git -C {{repo}} status --porcelain`. If it is not
+   empty, do NOT stash from this sandbox — the worktree is mounted read-only,
+   same as every other repo write. Build `<prompt>` yourself, in full,
+   JSON-escaped correctly for the `-d` payload above, asking Cursor to, in
+   order: if the working tree is dirty, `git stash push -m "antfarm-setup-<timestamp>"`
+   using a real timestamp label (for example `antfarm-setup-2026-08-22T21:00:00Z`);
+   then run `git fetch origin && git checkout
    staging && git pull`, then `git checkout -b {{branch}}`; then identify
    build/test/typecheck/lint scripts from `package.json`, check for a
    `Makefile` or other build system, check `.github/workflows/` for CI

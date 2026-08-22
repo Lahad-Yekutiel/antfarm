@@ -41,7 +41,11 @@ delegate instead.
    curl -s -H "Authorization: Bearer $DELEGATE_TOKEN" \
      "http://host.docker.internal:3336/logs?id=<run-id>"
    ```
-   An empty or 404 response means it's still running. Build `<prompt>`
+   The response is JSON: `{"state":"running"|"exited"|"spawn_failed"|"timeout","exitCode":...,"log":"..."}`.
+   Keep polling while `state` is `"running"`. If `state` is `"spawn_failed"` or `"timeout"`,
+   treat it as a blocker immediately — do not infer failure from an empty body or a 404 alone.
+   When `state` is `"exited"`, read the `log` field for Cursor's output.
+   Build `<prompt>`
    asking Cursor to, in order: run `git fetch origin && git checkout
    main && git pull` (NOTE: this AGENTS.md currently says `main` — the
    workflow's own comments elsewhere describe branching from `staging`

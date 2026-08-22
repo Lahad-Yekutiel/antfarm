@@ -54,7 +54,7 @@ something that cannot succeed, not something to retry differently.
    This returns immediately with `{"ok": true, "id": "<run-id>", ...}` —
    Cursor then runs in the background on the real host filesystem,
    outside your sandbox, so it has genuine write access even though you
-   don't.    Poll for its result every 5-10 seconds:
+   don't. Poll for its result every 5-10 seconds:
    ```
    curl -s -H "Authorization: Bearer $DELEGATE_TOKEN" \
      "http://host.docker.internal:3336/logs?id=<run-id>"
