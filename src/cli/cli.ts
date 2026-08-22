@@ -99,6 +99,7 @@ function printUsage() {
       "antfarm workflow resume <run-id>     Resume a failed run from where it left off",
       "antfarm workflow stop <run-id>        Stop/cancel a running workflow",
       "antfarm workflow ensure-crons <name>  Recreate agent crons for a workflow",
+      "antfarm workflow check-drift <name>   Compare bundled/installed/workspace file hashes",
       "",
       "antfarm dashboard [start] [--port N]   Start dashboard daemon (default: 3333)",
       "antfarm dashboard stop                  Stop dashboard daemon",
@@ -489,6 +490,19 @@ async function main() {
   }
 
   if (!target) { printUsage(); process.exit(1); }
+
+  if (action === "check-drift") {
+    const wantsJson = args.includes("--json");
+    const { checkWorkflowDrift, formatDriftTable } = await import("../installer/drift.js");
+    const result = await checkWorkflowDrift(target);
+    if (wantsJson) {
+      console.log(JSON.stringify(result, null, 2));
+    } else {
+      console.log(formatDriftTable(result));
+    }
+    if (result.hasDrift) process.exit(1);
+    return;
+  }
 
   if (action === "install") {
     const result = await installWorkflow({ workflowId: target });
