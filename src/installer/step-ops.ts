@@ -53,6 +53,41 @@ export function parseOutputKeyValues(output: string): Record<string, string> {
   return result;
 }
 
+/** Status values that mean the agent completed successfully (from workflow step vocabularies). */
+const STEP_STATUS_SUCCESS = new Set([
+  "done",
+  "ok",
+  "success",
+  "approved",
+  "changes_requested",
+  "pass",
+  "retry",
+]);
+
+/** Status values that mean the agent reported a blocker or failure. */
+const STEP_STATUS_FAILURE = new Set([
+  "blocked",
+  "failed",
+  "error",
+  "fail",
+]);
+
+/**
+ * Parse comma/whitespace-separated KEY: tokens from a step's expects field.
+ */
+export function parseExpectsKeys(expects: string): string[] {
+  const keys: string[] = [];
+  for (const token of expects.split(/[,\s]+/)) {
+    const match = token.match(/^([A-Z_]+):$/);
+    if (match) keys.push(match[1].toLowerCase());
+  }
+  return keys;
+}
+
+function isFailureStatus(status: string): boolean {
+  return STEP_STATUS_FAILURE.has(status.toLowerCase());
+}
+
 /**
  * Fire-and-forget cron teardown when a run ends.
  * Looks up the workflow_id for the run and tears down crons if no other active runs.
@@ -723,8 +758,8 @@ export function completeStep(stepId: string, output: string): { advanced: boolea
   const db = getDb();
 
   const step = db.prepare(
-    "SELECT id, run_id, step_id, step_index, type, loop_config, current_story_id FROM steps WHERE id = ?"
-  ).get(stepId) as { id: string; run_id: string; step_id: string; step_index: number; type: string; loop_config: string | null; current_story_id: string | null } | undefined;
+    "SELECT id, run_id, step_id, step_index, type, loop_config, current_story_id, expects FROM steps WHERE id = ?"
+  ).get(stepId) as { id: string; run_id: string; step_id: string; step_index: number; type: string; loop_config: string | null; current_story_id: string | null; expects: string } | undefined;
 
   if (!step) throw new Error(`Step not found: ${stepId}`);
 
@@ -734,12 +769,35 @@ export function completeStep(stepId: string, output: string): { advanced: boolea
     return { advanced: false, runCompleted: false };
   }
 
+  const parsed = parseOutputKeyValues(output);
+
+  const status = parsed.status?.toLowerCase();
+  if (status && isFailureStatus(status)) {
+    const reason = parsed.reason ?? "(none given)";
+    const message = `Agent reported STATUS: ${status}. REASON: ${reason}`;
+    const failResult = failStepSync(stepId, message);
+    if (failResult.runFailed) {
+      notifyFailureExhausted(step.run_id, step.step_id, message).catch(() => {});
+    }
+    return { advanced: false, runCompleted: false };
+  }
+
+  const requiredKeys = parseExpectsKeys(step.expects);
+  const missingExpectedKeys = requiredKeys.filter((key) => !(key in parsed));
+  if (missingExpectedKeys.length > 0) {
+    const message = `Step output missing required key(s): ${missingExpectedKeys.join(", ")}`;
+    const failResult = failStepSync(stepId, message);
+    if (failResult.runFailed) {
+      notifyFailureExhausted(step.run_id, step.step_id, message).catch(() => {});
+    }
+    return { advanced: false, runCompleted: false };
+  }
+
   // Merge KEY: value lines into run context
   const run = db.prepare("SELECT context FROM runs WHERE id = ?").get(step.run_id) as { context: string };
   const context: Record<string, string> = JSON.parse(run.context);
 
-  // Parse KEY: value lines and merge into context
-  const parsed = parseOutputKeyValues(output);
+  // Merge parsed output into context
   for (const [key, value] of Object.entries(parsed)) {
     context[key] = value;
   }
@@ -1073,9 +1131,9 @@ export function archiveRunProgress(runId: string): void {
 }
 
 /**
- * Fail a step, with retry logic. For loop steps, applies per-story retry.
+ * Fail a step synchronously, with retry logic. For loop steps, applies per-story retry.
  */
-export async function failStep(stepId: string, error: string): Promise<{ retrying: boolean; runFailed: boolean }> {
+export function failStepSync(stepId: string, error: string): { retrying: boolean; runFailed: boolean } {
   const db = getDb();
 
   const step = db.prepare(
@@ -1107,10 +1165,9 @@ export async function failStep(stepId: string, error: string): Promise<{ retryin
         db.prepare("UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?").run(step.run_id);
         const wfId = getWorkflowId(step.run_id);
         emitEvent({ ts: new Date().toISOString(), event: "story.failed", runId: step.run_id, workflowId: wfId, stepId: stepId, storyId: storyRow?.story_id, storyTitle: storyRow?.title, detail: error });
-        emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: step.run_id, workflowId: wfId, stepId: stepId, detail: error });
+        emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: error });
         emitEvent({ ts: new Date().toISOString(), event: "run.failed", runId: step.run_id, workflowId: wfId, detail: "Story retries exhausted" });
         scheduleRunCronTeardown(step.run_id);
-        await notifyFailureExhausted(step.run_id, step.step_id, error);
         return { retrying: false, runFailed: true };
       }
 
@@ -1132,15 +1189,29 @@ export async function failStep(stepId: string, error: string): Promise<{ retryin
       "UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?"
     ).run(step.run_id);
     const wfId2 = getWorkflowId(step.run_id);
-    emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: step.run_id, workflowId: wfId2, stepId: stepId, detail: error });
+    emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: step.run_id, workflowId: wfId2, stepId: step.step_id, detail: error });
     emitEvent({ ts: new Date().toISOString(), event: "run.failed", runId: step.run_id, workflowId: wfId2, detail: "Step retries exhausted" });
     scheduleRunCronTeardown(step.run_id);
-    await notifyFailureExhausted(step.run_id, step.step_id, error);
     return { retrying: false, runFailed: true };
-  } else {
-    db.prepare(
-      "UPDATE steps SET status = 'pending', retry_count = ?, updated_at = datetime('now') WHERE id = ?"
-    ).run(newRetryCount, stepId);
-    return { retrying: true, runFailed: false };
   }
+
+  db.prepare(
+    "UPDATE steps SET status = 'pending', output = ?, retry_count = ?, updated_at = datetime('now') WHERE id = ?"
+  ).run(error, newRetryCount, stepId);
+  return { retrying: true, runFailed: false };
+}
+
+/**
+ * Fail a step, with retry logic. For loop steps, applies per-story retry.
+ */
+export async function failStep(stepId: string, error: string): Promise<{ retrying: boolean; runFailed: boolean }> {
+  const result = failStepSync(stepId, error);
+  if (result.runFailed) {
+    const db = getDb();
+    const step = db.prepare("SELECT run_id, step_id FROM steps WHERE id = ?").get(stepId) as { run_id: string; step_id: string } | undefined;
+    if (step) {
+      await notifyFailureExhausted(step.run_id, step.step_id, error);
+    }
+  }
+  return result;
 }
