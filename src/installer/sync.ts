@@ -87,21 +87,25 @@ export async function waitForContainerChange(
   while (Date.now() < deadline) {
     const current = getId(agentId);
 
-    if (previousId === null) {
-      if (current !== null) return current;
+    // A different, present id means a backend actually created a replacement.
+    if (current && current !== previousId) {
+      return current;
+    }
+
+    if (current === null) {
+      // `openclaw sandbox recreate` is destroy-only: runtimes come back lazily
+      // on next agent use. Stable absence is success, not a timeout. A short
+      // window still catches backends that do create synchronously.
       stableAbsentPolls++;
       if (stableAbsentPolls >= STABLE_ABSENT_POLLS) return null;
-    } else if (current && current !== previousId) {
-      // Require a real replacement id. A destroyed container (current === null)
-      // is not a successful change — keep polling until a new id appears or we timeout.
-      return current;
     }
 
     await sleepFn(pollIntervalMs);
   }
 
   const finalId = getId(agentId);
-  if (previousId === null && finalId === null) return null;
+  if (finalId && finalId !== previousId) return finalId;
+  if (finalId === null) return null;
 
   throw new SyncWorkflowError(
     `Timed out after ${timeoutMs / 1000}s waiting for docker container to change for agent "${agentId}"`,
@@ -134,6 +138,8 @@ async function recreateAgentSandbox(agentId: string): Promise<{ previousId: stri
   const openclawBin = await findOpenclawBinary();
 
   try {
+    // Destroy-only: OpenClaw removes the runtime; it is recreated lazily
+    // the next time the agent runs. There is no `sandbox create`.
     await execFileAsync(openclawBin, ["sandbox", "recreate", "--agent", agentId, "--force"], {
       timeout: RECREATE_TIMEOUT_MS,
     });
@@ -146,16 +152,48 @@ async function recreateAgentSandbox(agentId: string): Promise<{ previousId: stri
   return { previousId, newId };
 }
 
+export type SandboxAgentSyncResult = {
+  agentId: string;
+  previousContainerId: string | null;
+  newContainerId: string | null;
+};
+
 export type SyncWorkflowResult = {
   workflowId: string;
   removedScratchDirs: string[];
-  recreatedAgents: Array<{ agentId: string; previousContainerId: string | null; newContainerId: string | null }>;
+  sandboxAgents: SandboxAgentSyncResult[];
   driftClean: boolean;
 };
 
 /**
+ * Honest CLI lines for sandbox sync. `openclaw sandbox recreate` is destroy-only,
+ * so a null newContainerId means "removed / never present; lazy recreate", not
+ * "we created a container".
+ */
+export function formatSyncSandboxReport(
+  workflowId: string,
+  agents: SandboxAgentSyncResult[],
+): string[] {
+  const confirmed = agents.filter((a) => Boolean(a.newContainerId));
+  const pending = agents.filter((a) => !a.newContainerId);
+  const lines: string[] = [];
+  if (pending.length > 0) {
+    lines.push(
+      `Removed ${pending.length} sandbox runtime(s) for ${workflowId} agent(s); OpenClaw recreates them automatically the next time each agent runs.`,
+    );
+  }
+  if (confirmed.length > 0) {
+    lines.push(
+      `Confirmed ${confirmed.length} agent sandbox container(s) present after sync.`,
+    );
+  }
+  return lines;
+}
+
+/**
  * Sync a workflow's files from bundled source to installed + live workspace copies,
- * reset agent scratch sandboxes, and recreate docker sandboxes.
+ * reset agent scratch sandboxes, and destroy docker sandbox runtimes so OpenClaw
+ * recreates them lazily on next agent use.
  */
 export async function syncWorkflow(workflowId: string): Promise<SyncWorkflowResult> {
   const activeRuns = countRunningRuns(workflowId);
@@ -177,11 +215,11 @@ export async function syncWorkflow(workflowId: string): Promise<SyncWorkflowResu
 
   const removedScratchDirs = await deleteAgentScratchDirs(workflowId);
 
-  const recreatedAgents: SyncWorkflowResult["recreatedAgents"] = [];
+  const sandboxAgents: SyncWorkflowResult["sandboxAgents"] = [];
   for (const agent of workflow.agents) {
     const fullAgentId = `${workflow.id}_${agent.id}`;
     const result = await recreateAgentSandbox(fullAgentId);
-    recreatedAgents.push({
+    sandboxAgents.push({
       agentId: fullAgentId,
       previousContainerId: result.previousId,
       newContainerId: result.newId,
@@ -198,7 +236,7 @@ export async function syncWorkflow(workflowId: string): Promise<SyncWorkflowResu
   return {
     workflowId,
     removedScratchDirs,
-    recreatedAgents,
+    sandboxAgents,
     driftClean: true,
   };
 }

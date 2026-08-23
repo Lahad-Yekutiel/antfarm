@@ -100,7 +100,7 @@ function printUsage() {
       "antfarm workflow stop <run-id>        Stop/cancel a running workflow",
       "antfarm workflow ensure-crons <name>  Recreate agent crons for a workflow",
       "antfarm workflow check-drift <name>   Compare bundled/installed/workspace file hashes",
-      "antfarm workflow sync <name>          Sync workflow files and recreate agent sandboxes",
+      "antfarm workflow sync <name>          Sync workflow files and reset agent sandbox runtimes",
       "",
       "antfarm dashboard [start] [--port N]   Start dashboard daemon (default: 3333)",
       "antfarm dashboard stop                  Stop dashboard daemon",
@@ -506,7 +506,7 @@ async function main() {
   }
 
   if (action === "sync") {
-    const { syncWorkflow, SyncWorkflowError } = await import("../installer/sync.js");
+    const { syncWorkflow, SyncWorkflowError, formatSyncSandboxReport } = await import("../installer/sync.js");
     try {
       const result = await syncWorkflow(target);
       console.log(`Synced workflow: ${result.workflowId}`);
@@ -514,7 +514,9 @@ async function main() {
         console.log(`Removed ${result.removedScratchDirs.length} scratch dir(s):`);
         for (const dir of result.removedScratchDirs) console.log(`  ${dir}`);
       }
-      console.log(`Recreated ${result.recreatedAgents.length} agent sandbox(es).`);
+      for (const line of formatSyncSandboxReport(result.workflowId, result.sandboxAgents)) {
+        console.log(line);
+      }
       console.log("check-drift: clean");
     } catch (err) {
       if (err instanceof SyncWorkflowError) {
