@@ -6,3 +6,8 @@ dist/
 *.sqlite3
 progress.txt
 progress*.txt
+
+# Secret / local env files
+local-tools/.delegate-trigger.env
+*.env
+.env*
