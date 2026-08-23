@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { getDb } from "../dist/db.js";
 import { claimStep, completeStep, matchOutputFailure } from "../dist/installer/step-ops.js";
+import { getStepFailWhen } from "../dist/installer/workflow-spec.js";
 
 describe("completeStep status and contract gates", () => {
   const testRunIds: string[] = [];
@@ -186,6 +187,23 @@ describe("completeStep status and contract gates", () => {
 
     const test = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepDbIds.test) as { status: string };
     assert.equal(test.status, "waiting");
+  });
+
+  it("verify step fail_when from workflow.yml fails on STATUS: blocked and fail, passes on STATUS: pass", () => {
+    const failWhen = getStepFailWhen("thecoach-dev", "verify");
+    assert.deepEqual(failWhen, { gate: ["fail"], status: ["fail", "blocked", "failed", "error"] });
+
+    const blockedWithPassingGate = matchOutputFailure({ status: "blocked", gate: "pass" }, failWhen);
+    assert.deepEqual(blockedWithPassingGate, { key: "status", value: "blocked" });
+
+    const blockedWithoutGate = matchOutputFailure({ status: "blocked" }, failWhen);
+    assert.deepEqual(blockedWithoutGate, { key: "status", value: "blocked" });
+
+    const failHit = matchOutputFailure({ status: "fail", gate: "pass" }, failWhen);
+    assert.deepEqual(failHit, { key: "status", value: "fail" });
+
+    const ok = matchOutputFailure({ status: "pass", gate: "pass" }, failWhen);
+    assert.equal(ok, null);
   });
 
   it("fail_when with only a non-status key still applies the default status deny-list", () => {
