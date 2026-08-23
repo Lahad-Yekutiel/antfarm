@@ -11,3 +11,6 @@ progress*.txt
 local-tools/.delegate-trigger.env
 *.env
 .env*
+
+# Local fix-session artifacts (may contain secrets in config backups)
+_fix_backups/**/*.bak
