@@ -21,6 +21,7 @@ import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
+import { fileURLToPath } from "node:url";
 
 const PORT = process.env.DELEGATE_PORT ? Number(process.env.DELEGATE_PORT) : 3336;
 const TOKEN = process.env.DELEGATE_TOKEN;
@@ -31,15 +32,65 @@ const DELEGATE_TIMEOUT_MS = process.env.DELEGATE_TIMEOUT_MS
   : 25 * 60 * 1000;
 const AGENT_BIN = process.env.DELEGATE_AGENT_BIN?.trim() || "agent";
 
-/** @type {Map<string, { id: string; repo: string; startedAt: string }>} */
-const activeByRepo = new Map();
+/**
+ * Resolve DELEGATE_AGENT_BIN to an executable path using the current process env.
+ * @param {string | undefined} configured
+ * @returns {{ ok: true, resolved: string } | { ok: false, configured: string, reason: string }}
+ */
+export function resolveAgentBin(configured) {
+  const bin = configured?.trim() || "agent";
 
-if (!TOKEN) {
-  console.error("DELEGATE_TOKEN is not set — refusing to start (would be an open door).");
-  process.exit(1);
+  if (bin.includes("/")) {
+    if (!fs.existsSync(bin)) {
+      return { ok: false, configured: bin, reason: "path does not exist" };
+    }
+    try {
+      fs.accessSync(bin, fs.constants.X_OK);
+      return { ok: true, resolved: bin };
+    } catch {
+      return { ok: false, configured: bin, reason: "path exists but is not executable" };
+    }
+  }
+
+  const pathEnv = process.env.PATH || "";
+  for (const dir of pathEnv.split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, bin);
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return { ok: true, resolved: candidate };
+    } catch {
+      // keep searching PATH
+    }
+  }
+
+  return { ok: false, configured: bin, reason: "not found in PATH" };
 }
 
-fs.mkdirSync(LOG_DIR, { recursive: true });
+/**
+ * @param {{ ok: false, configured: string, reason: string }} result
+ */
+export function logAgentBinPreflightFailure(result) {
+  const banner = "=".repeat(72);
+  console.error(banner);
+  console.error("ERROR: DELEGATE_AGENT_BIN preflight failed");
+  console.error(`  Configured value: ${JSON.stringify(result.configured)}`);
+  console.error(`  Could not resolve to an executable binary (${result.reason}).`);
+  console.error("  Check DELEGATE_AGENT_BIN and the service's PATH environment.");
+  console.error("  Delegation will fail until fixed; other endpoints remain available.");
+  console.error(banner);
+}
+
+function runAgentBinPreflight() {
+  const result = resolveAgentBin(AGENT_BIN);
+  if (!result.ok) {
+    logAgentBinPreflightFailure(result);
+  }
+  return result;
+}
+
+/** @type {Map<string, { id: string; repo: string; startedAt: string }>} */
+const activeByRepo = new Map();
 
 function json(res, data, status = 200) {
   res.writeHead(status, { "Content-Type": "application/json" });
@@ -243,8 +294,24 @@ const server = http.createServer(async (req, res) => {
   json(res, { ok: false, error: "not found" }, 404);
 });
 
-server.listen(PORT, "127.0.0.1", () => {
-  console.log(`Cursor delegate trigger: http://127.0.0.1:${PORT}`);
-  console.log(`Logs: ${LOG_DIR}`);
-  console.log("This is a standalone smoke-test server — not wired into any agent role yet.");
-});
+function main() {
+  if (!TOKEN) {
+    console.error("DELEGATE_TOKEN is not set — refusing to start (would be an open door).");
+    process.exit(1);
+  }
+
+  fs.mkdirSync(LOG_DIR, { recursive: true });
+  runAgentBinPreflight();
+
+  server.listen(PORT, "127.0.0.1", () => {
+    console.log(`Cursor delegate trigger: http://127.0.0.1:${PORT}`);
+    console.log(`Logs: ${LOG_DIR}`);
+    console.log("Cursor delegation trigger server — used by thecoach-dev workflow agents for branch/git setup.");
+  });
+}
+
+const isMain = process.argv[1]
+  && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+if (isMain) {
+  main();
+}

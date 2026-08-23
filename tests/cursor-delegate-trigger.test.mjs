@@ -6,6 +6,10 @@ import path from "node:path";
 import os from "node:os";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import {
+  resolveAgentBin,
+  logAgentBinPreflightFailure,
+} from "../local-tools/cursor-delegate-trigger.mjs";
 
 const triggerPath = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -41,6 +45,70 @@ function request(port, method, pathname, body, token) {
     req.end();
   });
 }
+
+describe("resolveAgentBin", () => {
+  it("resolves a valid absolute path to an executable binary", () => {
+    const result = resolveAgentBin(process.execPath);
+    assert.equal(result.ok, true);
+    assert.equal(result.resolved, process.execPath);
+  });
+
+  it("reports an invalid absolute path", () => {
+    const missing = "/nonexistent/agent-binary-for-test";
+    const result = resolveAgentBin(missing);
+    assert.equal(result.ok, false);
+    assert.equal(result.configured, missing);
+    assert.equal(result.reason, "path does not exist");
+  });
+
+  it("resolves a bare command name from PATH", () => {
+    const savedPath = process.env.PATH;
+    process.env.PATH = path.dirname(process.execPath);
+    try {
+      const binName = path.basename(process.execPath);
+      const result = resolveAgentBin(binName);
+      assert.equal(result.ok, true);
+      assert.equal(result.resolved, process.execPath);
+    } finally {
+      process.env.PATH = savedPath;
+    }
+  });
+
+  it("reports an unresolvable bare command name", () => {
+    const savedPath = process.env.PATH;
+    process.env.PATH = "";
+    try {
+      const result = resolveAgentBin("definitely-not-a-real-binary-xyz123");
+      assert.equal(result.ok, false);
+      assert.equal(result.configured, "definitely-not-a-real-binary-xyz123");
+      assert.equal(result.reason, "not found in PATH");
+    } finally {
+      process.env.PATH = savedPath;
+    }
+  });
+
+  it("logs a hard-to-miss preflight failure banner", () => {
+    const lines = [];
+    const originalError = console.error;
+    console.error = (...args) => lines.push(args.join(" "));
+    try {
+      logAgentBinPreflightFailure({
+        ok: false,
+        configured: "/missing/agent",
+        reason: "path does not exist",
+      });
+    } finally {
+      console.error = originalError;
+    }
+
+    const output = lines.join("\n");
+    assert.match(output, /^={72}$/m);
+    assert.match(output, /ERROR: DELEGATE_AGENT_BIN preflight failed/);
+    assert.match(output, /"\/missing\/agent"/);
+    assert.match(output, /path does not exist/);
+    assert.match(output, /DELEGATE_AGENT_BIN and the service's PATH/);
+  });
+});
 
 describe("cursor-delegate-trigger", () => {
   let port;
