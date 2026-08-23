@@ -54,16 +54,14 @@ export function parseOutputKeyValues(output: string): Record<string, string> {
 }
 
 /**
- * Default fail_when for the `status` key when a step does not declare
- * `fail_when` in workflow.yml. Steps that opt in replace this list entirely
- * with their declared key/value map (see matchOutputFailure).
+ * Default fail_when map. Declared fail_when EXTENDS this per key: a step
+ * that lists `status` replaces the default status values; a step that only
+ * lists another key (e.g. `gate`) keeps this status deny-list. A step with
+ * no fail_when block uses exactly this map.
  */
-const STEP_STATUS_FAILURE = new Set([
-  "blocked",
-  "failed",
-  "error",
-  "fail",
-]);
+const DEFAULT_FAIL_WHEN: Record<string, string[]> = {
+  status: ["blocked", "failed", "error", "fail"],
+};
 
 /**
  * fail_when (and this default status deny-list) fail the *current* step via
@@ -85,34 +83,41 @@ export function parseExpectsKeys(expects: string): string[] {
   return keys;
 }
 
-function isFailureStatus(status: string): boolean {
-  return STEP_STATUS_FAILURE.has(status.toLowerCase());
+/**
+ * Per-key merge: start from DEFAULT_FAIL_WHEN, then overlay any keys the
+ * step declared. Declared values for a key replace the default for that
+ * key only — other default keys remain.
+ */
+export function resolveFailWhen(
+  declared: Record<string, string[]> | undefined,
+): Record<string, string[]> {
+  const effective: Record<string, string[]> = {};
+  for (const [key, values] of Object.entries(DEFAULT_FAIL_WHEN)) {
+    effective[key] = values.map((v) => v.toLowerCase());
+  }
+  if (declared) {
+    for (const [rawKey, values] of Object.entries(declared)) {
+      effective[rawKey.toLowerCase()] = values.map((v) => v.toLowerCase());
+    }
+  }
+  return effective;
 }
 
 /**
- * If `failWhen` is declared, fail when any listed key's parsed value matches
- * one of its failure values. Otherwise apply the default status deny-list.
+ * Fail when any key in the effective fail_when map (defaults ∪ declared)
+ * has a parsed value in that key's failure list.
  */
 export function matchOutputFailure(
   parsed: Record<string, string>,
   failWhen: Record<string, string[]> | undefined,
 ): { key: string; value: string } | null {
-  if (failWhen) {
-    for (const [rawKey, values] of Object.entries(failWhen)) {
-      const key = rawKey.toLowerCase();
-      const parsedValue = parsed[key]?.toLowerCase();
-      if (!parsedValue) continue;
-      const failureValues = values.map((v) => v.toLowerCase());
-      if (failureValues.includes(parsedValue)) {
-        return { key, value: parsedValue };
-      }
+  const effective = resolveFailWhen(failWhen);
+  for (const [key, failureValues] of Object.entries(effective)) {
+    const parsedValue = parsed[key]?.toLowerCase();
+    if (!parsedValue) continue;
+    if (failureValues.includes(parsedValue)) {
+      return { key, value: parsedValue };
     }
-    return null;
-  }
-
-  const status = parsed.status?.toLowerCase();
-  if (status && isFailureStatus(status)) {
-    return { key: "status", value: status };
   }
   return null;
 }

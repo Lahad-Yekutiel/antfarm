@@ -2,7 +2,7 @@ import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { getDb } from "../dist/db.js";
-import { claimStep, completeStep } from "../dist/installer/step-ops.js";
+import { claimStep, completeStep, matchOutputFailure } from "../dist/installer/step-ops.js";
 
 describe("completeStep status and contract gates", () => {
   const testRunIds: string[] = [];
@@ -186,6 +186,23 @@ describe("completeStep status and contract gates", () => {
 
     const test = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepDbIds.test) as { status: string };
     assert.equal(test.status, "waiting");
+  });
+
+  it("fail_when with only a non-status key still applies the default status deny-list", () => {
+    // Declaring fail_when: { gate: [fail] } must ADD a gate check, not opt
+    // the step out of STATUS: blocked/failed/error/fail.
+    const gateOnly = { gate: ["fail"] };
+
+    for (const status of ["blocked", "failed", "error", "fail"]) {
+      const hit = matchOutputFailure({ status, gate: "pass" }, gateOnly);
+      assert.deepEqual(hit, { key: "status", value: status }, `STATUS: ${status} should still fail`);
+    }
+
+    const gateHit = matchOutputFailure({ status: "pass", gate: "fail" }, gateOnly);
+    assert.deepEqual(gateHit, { key: "gate", value: "fail" });
+
+    const ok = matchOutputFailure({ status: "pass", gate: "pass" }, gateOnly);
+    assert.equal(ok, null);
   });
 
   it("without fail_when, default deny-list still fails STATUS: fail and does not advance", () => {
