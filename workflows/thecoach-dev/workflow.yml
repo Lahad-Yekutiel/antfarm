@@ -433,7 +433,7 @@ steps:
     max_retries: 1
     fail_when:
       gate: [fail]
-      status: [fail]
+      status: [fail, blocked, failed, error]
     on_fail:
       on_exhausted:
         escalate_to: main
