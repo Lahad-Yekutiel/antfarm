@@ -129,8 +129,8 @@ agents:
     description: >
       Per-story sanity check AND the hard protected-path gate — blocks
       regardless of what else passed if the diff touches _SSoT/**,
-      supabase/migrations/**, or anything outside the task's declared
-      Expected files.
+      supabase/**, .github/workflows/**, .gitignore, or anything outside
+      the task's declared Expected files.
     workspace:
       baseDir: agents/verifier
       files:
@@ -410,7 +410,9 @@ steps:
          `git -C {{repo}} diff --stat staging...{{commit_sha}}`
          Compare the touched-file list against:
            - `_SSoT/**` (never writable by a Dev agent)
-           - `supabase/migrations/**`
+           - `supabase/**` (config.toml, seed.sql, migrations — the whole tree)
+           - `.github/workflows/**`
+           - `.gitignore`
            - anything outside this story's own claimed CHANGES
          If ANY touched file matches a protected path, or falls outside
          the claimed CHANGES, this is a GATE_FAIL regardless of whether

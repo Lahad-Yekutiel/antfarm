@@ -189,6 +189,29 @@ describe("completeStep status and contract gates", () => {
     assert.equal(test.status, "waiting");
   });
 
+  it("verify GATE: fail for newly protected paths (supabase config, workflows, gitignore) does not advance", () => {
+    for (const offending of ["supabase/config.toml", ".github/workflows/anything.yml", ".gitignore"]) {
+      const { stepDbIds } = insertRun([
+        { stepId: "verify", agentId: "thecoach-dev_verifier", stepIndex: 0, expects: "GATE: STATUS:", status: "running", maxRetries: 1 },
+        { stepId: "test", agentId: "thecoach-dev_tester", stepIndex: 1, expects: "STATUS:", status: "waiting" },
+      ], { repo: "/tmp/repo", branch: "feat-x", commit_sha: "abc123" });
+
+      const result = completeStep(
+        stepDbIds.verify,
+        `GATE: fail\nGATE_REASON: ${offending}\nSTATUS: pass`,
+      );
+      assert.equal(result.advanced, false, offending);
+
+      const db = getDb();
+      const verify = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(stepDbIds.verify) as {
+        status: string;
+        output: string;
+      };
+      assert.notEqual(verify.status, "done", offending);
+      assert.ok(verify.output.includes("GATE: fail"), offending);
+    }
+  });
+
   it("verify step fail_when from workflow.yml fails on STATUS: blocked and fail, passes on STATUS: pass", () => {
     const failWhen = getStepFailWhen("thecoach-dev", "verify");
     assert.deepEqual(failWhen, { gate: ["fail"], status: ["fail", "blocked", "failed", "error"] });

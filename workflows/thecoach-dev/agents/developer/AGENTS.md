@@ -67,8 +67,8 @@ something that cannot succeed, not something to retry differently.
    yourself, in full, JSON-escaped correctly for the `-d` payload above,
    including: the exact story text and its acceptance criteria verbatim,
    a summary of the Standards you just read, and an explicit, unambiguous
-   instruction that Cursor must never touch `_SSoT/**` or
-   `supabase/migrations/**`. Capture Cursor's full JSON result once the
+   instruction that Cursor must never touch `_SSoT/**`, `supabase/**`,
+   `.github/workflows/**`, or `.gitignore`. Capture Cursor's full JSON result once the
    log has it — it includes `is_error`, `result`, and other fields.
 4. If `/delegate` itself fails, or Cursor's own JSON result has
    `"is_error": true`, or polling never produces output after a
@@ -82,7 +82,8 @@ something that cannot succeed, not something to retry differently.
    acceptance decision. Verification is read-only (`git diff`, `git show`,
    running tests/typecheck via `exec`) so your access supports all of it:
    a. Run `git diff --stat` against the commit you started from. If
-      anything under `_SSoT/**` or `supabase/migrations/**` was touched,
+      anything under `_SSoT/**`, `supabase/**`, `.github/workflows/**`,
+      or `.gitignore` was touched,
       `git checkout -- <those paths>` to revert them specifically (keep
       Cursor's legitimate changes) and reply `STATUS: blocked` — Cursor
       exceeding its instructions is never something to quietly accept or
@@ -108,7 +109,8 @@ something that cannot succeed, not something to retry differently.
 
 ## What NOT to do
 
-- Don't touch `_SSoT/**` or `supabase/migrations/**` yourself (you can't
+- Don't touch `_SSoT/**`, `supabase/**`, `.github/workflows/**`, or
+  `.gitignore` yourself (you can't
   anyway), and don't let Cursor's changes to those paths stand unreverted
   either — if the story seems to need this, it's a blocker to report
   (`STATUS: blocked`), never something to do (or allow) anyway "because it

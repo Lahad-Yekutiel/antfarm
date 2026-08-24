@@ -13,6 +13,7 @@ import { getMaxRoleTimeoutSeconds } from "./install.js";
 import { getStepFailWhen, loadWorkflowSpec } from "./workflow-spec.js";
 import { resolveWorkflowDir } from "./paths.js";
 import { isFrontendChange } from "../lib/frontend-detect.js";
+import { findProtectedPaths } from "../lib/protected-paths.js";
 import type { WorkflowStepFailure } from "./types.js";
 
 /**
@@ -548,6 +549,29 @@ export function computeHasFrontendChanges(repo: string, branch: string): string 
   }
 }
 
+/**
+ * Host-side protected-path gate for verify: list files in staging...commit
+ * (falls back to main...commit) and return those matching PROTECTED_PATH_PATTERNS.
+ * Returns [] if git is unavailable or the repo/sha is missing — never throws.
+ */
+export function listProtectedDiffFiles(repo: string | undefined, commitSha: string | undefined): string[] {
+  if (!repo?.trim() || !commitSha?.trim()) return [];
+  for (const base of ["staging", "main"]) {
+    try {
+      const output = execFileSync("git", ["diff", "--name-only", `${base}...${commitSha}`], {
+        cwd: repo,
+        encoding: "utf-8",
+        timeout: 10_000,
+      });
+      const files = output.trim().split("\n").filter((f) => f.length > 0);
+      return findProtectedPaths(files);
+    } catch {
+      continue;
+    }
+  }
+  return [];
+}
+
 function failStepWithMissingInputs(
   stepDbId: string,
   stepPublicId: string,
@@ -868,6 +892,20 @@ export function completeStep(stepId: string, output: string): { advanced: boolea
       notifyFailureExhausted(step.run_id, step.step_id, message).catch(() => {});
     }
     return { advanced: false, runCompleted: false };
+  }
+
+  if (step.step_id === "verify") {
+    const runCtxRow = db.prepare("SELECT context FROM runs WHERE id = ?").get(step.run_id) as { context: string } | undefined;
+    const runCtx: Record<string, string> = runCtxRow ? JSON.parse(runCtxRow.context) : {};
+    const protectedHits = listProtectedDiffFiles(runCtx.repo, runCtx.commit_sha);
+    if (protectedHits.length > 0) {
+      const message = `Protected-path gate: diff touches ${protectedHits.join(", ")}`;
+      const failResult = failStepSync(stepId, message, { stdoutTail: tailOutput(output) });
+      if (failResult.runFailed) {
+        notifyFailureExhausted(step.run_id, step.step_id, message).catch(() => {});
+      }
+      return { advanced: false, runCompleted: false };
+    }
   }
 
   const requiredKeys = parseExpectsKeys(step.expects);
