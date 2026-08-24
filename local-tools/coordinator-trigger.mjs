@@ -55,6 +55,12 @@ const EXPECTED_OWNERSHIP = {
 
 const TERMINAL_RUN_STATUSES = new Set(["completed", "failed", "cancelled", "canceled"]);
 
+/** Mechanical PR base gate — only "staging" is allowed (not prompt prose). */
+const EXPECTED_PR_BASE = "staging";
+
+/** Real GitHub PR URLs as they appear in step `output` text. */
+const PR_URL_RE = /https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+/g;
+
 if (!TOKEN) {
   console.error("COORDINATOR_TOKEN is not set — refusing to start (would be an open door).");
   process.exit(1);
@@ -378,6 +384,111 @@ function verifyRunOwnership(stepsResult) {
   return mismatches;
 }
 
+/** Collect unique GitHub PR URLs from every step's output text. */
+function extractPrUrlsFromSteps(stepsResult) {
+  const found = [];
+  const seen = new Set();
+  for (const step of stepsResult.steps || []) {
+    const text = typeof step.output === "string" ? step.output : "";
+    if (!text) continue;
+    PR_URL_RE.lastIndex = 0;
+    let m;
+    while ((m = PR_URL_RE.exec(text)) !== null) {
+      const url = m[0];
+      if (seen.has(url)) continue;
+      seen.add(url);
+      found.push(url);
+    }
+  }
+  return found;
+}
+
+/** Reject anything that is not a canonical https GitHub pull URL before execFile. */
+function isSafeGhPrViewArg(value) {
+  return (
+    typeof value === "string" &&
+    /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+$/.test(value)
+  );
+}
+
+/**
+ * Pure mechanical gate: baseRefName must be exactly EXPECTED_PR_BASE.
+ * Used by /queue/check and by --self-test-pr-base-gate (no network).
+ */
+function evaluatePrBaseRef(baseRefName) {
+  if (baseRefName === EXPECTED_PR_BASE) {
+    return { ok: true, baseRefName };
+  }
+  return {
+    ok: false,
+    baseRefName,
+    reason: `PR base is "${baseRefName}", expected "${EXPECTED_PR_BASE}"`,
+  };
+}
+
+function fetchPrBaseRefName(prUrl) {
+  return new Promise((resolve, reject) => {
+    if (!isSafeGhPrViewArg(prUrl)) {
+      return reject(new Error("PR URL failed validation"));
+    }
+    execFile(
+      "gh",
+      ["pr", "view", prUrl, "--json", "baseRefName"],
+      { timeout: 30_000 },
+      (err, stdout, stderr) => {
+        if (err) {
+          return reject(
+            new Error(`${err.message}${stderr ? ` — ${String(stderr).trim()}` : ""}`),
+          );
+        }
+        try {
+          const parsed = JSON.parse(stdout);
+          const baseRefName = typeof parsed.baseRefName === "string" ? parsed.baseRefName : null;
+          if (!baseRefName) {
+            return reject(new Error("gh pr view returned no baseRefName"));
+          }
+          resolve(baseRefName);
+        } catch (parseErr) {
+          reject(new Error(`gh pr view JSON parse failed: ${parseErr.message}`));
+        }
+      },
+    );
+  });
+}
+
+/**
+ * Derive PR base(s) from step output URLs. No PR → not a failure.
+ * Non-staging base → mismatch entries for the same flag path as ownership.
+ */
+async function verifyPrBaseBranch(stepsResult) {
+  const urls = extractPrUrlsFromSteps(stepsResult);
+  if (urls.length === 0) {
+    return { noPr: true, mismatches: [], bases: [] };
+  }
+  const mismatches = [];
+  const bases = [];
+  for (const url of urls) {
+    if (!isSafeGhPrViewArg(url)) {
+      mismatches.push({ pr: url, reason: "PR URL failed validation" });
+      continue;
+    }
+    try {
+      const baseRefName = await fetchPrBaseRefName(url);
+      bases.push({ pr: url, baseRefName });
+      const ev = evaluatePrBaseRef(baseRefName);
+      if (!ev.ok) {
+        mismatches.push({ pr: url, baseRefName, reason: ev.reason });
+      }
+    } catch (err) {
+      mismatches.push({
+        pr: url,
+        reason: `could not determine PR base: ${err?.message || String(err)}`,
+      });
+    }
+  }
+  return { noPr: false, mismatches, bases };
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://localhost:${PORT}`);
   const p = url.pathname;
@@ -614,28 +725,48 @@ const server = http.createServer(async (req, res) => {
         continue;
       }
 
-      const mismatches = verifyRunOwnership(stepsResult);
+      const ownershipMismatches = verifyRunOwnership(stepsResult);
+      const baseCheck = await verifyPrBaseBranch(stepsResult);
       item.resolvedAt = new Date().toISOString();
-      if (mismatches.length === 0) {
+
+      const noteParts = [];
+      if (ownershipMismatches.length > 0) {
+        noteParts.push(
+          `ownership mismatch: ${ownershipMismatches
+            .map((m) => `${m.stepId}: ${m.reason}`)
+            .join("; ")}`,
+        );
+      }
+      if (baseCheck.mismatches.length > 0) {
+        noteParts.push(
+          `PR base gate: ${baseCheck.mismatches.map((m) => m.reason).join("; ")}`,
+        );
+      }
+
+      if (noteParts.length === 0) {
         item.status = "done";
-        item.note = "verified: all steps match expected ownership";
+        item.note = baseCheck.noPr
+          ? "verified: all steps match expected ownership; no PR found in step output"
+          : "verified: all steps match expected ownership";
         changed.push({
           id: item.id,
           runId: item.runId,
           change: "done",
           runStatus: run.status,
+          prBases: baseCheck.bases,
+          noPr: baseCheck.noPr,
         });
       } else {
         item.status = "flagged";
-        item.note = `ownership mismatch: ${mismatches
-          .map((m) => `${m.stepId}: ${m.reason}`)
-          .join("; ")}`;
+        item.note = noteParts.join("; ");
         changed.push({
           id: item.id,
           runId: item.runId,
           change: "flagged",
           runStatus: run.status,
-          mismatches,
+          mismatches: ownershipMismatches,
+          prBaseMismatches: baseCheck.mismatches,
+          prBases: baseCheck.bases,
         });
       }
     }
@@ -656,6 +787,16 @@ const server = http.createServer(async (req, res) => {
 
   json(res, { ok: false, error: "not found" }, 404);
 });
+
+// Mechanical self-check of evaluatePrBaseRef — does not bind the port or
+// touch the queue file. Invoke:
+//   COORDINATOR_TOKEN=x node local-tools/coordinator-trigger.mjs --self-test-pr-base-gate
+if (process.argv.includes("--self-test-pr-base-gate")) {
+  const cases = ["staging", "main", "master", "develop"];
+  const out = cases.map((input) => ({ input, result: evaluatePrBaseRef(input) }));
+  console.log(JSON.stringify(out, null, 2));
+  process.exit(0);
+}
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`Coordinator trigger server: http://127.0.0.1:${PORT}`);
