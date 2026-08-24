@@ -35,6 +35,25 @@ const ANTFARM_DB =
   process.env.COORDINATOR_ANTFARM_DB ||
   path.join(process.env.OPENCLAW_STATE_DIR || path.join(os.homedir(), ".openclaw"), "antfarm", "antfarm.db");
 const WORKFLOWS_DIR = path.join(ANTFARM_ROOT, "workflows");
+const QUEUE_PATH =
+  process.env.COORDINATOR_QUEUE_PATH ||
+  path.join(ANTFARM_ROOT, "local-tools", "coordinator-queue.json");
+const DEFAULT_WORKFLOW = "thecoach-dev";
+
+/** Expected ownership by workflow step_id — the delegation-authenticity map. */
+const EXPECTED_OWNERSHIP = {
+  plan: "Claude Code",
+  setup: "Cursor",
+  implement: "Cursor",
+  verify: "Claude Code",
+  test: "Cursor",
+  "browser-qa": "Claude Code",
+  pr: "Cursor",
+  review: "Claude Code",
+  merge: "Cursor",
+};
+
+const TERMINAL_RUN_STATUSES = new Set(["completed", "failed", "cancelled", "canceled"]);
 
 if (!TOKEN) {
   console.error("COORDINATOR_TOKEN is not set — refusing to start (would be an open door).");
@@ -215,6 +234,150 @@ function queryStepsForRun(runIdParam) {
   }
 }
 
+// ─── Task queue (service state file — the only write path this feature uses) ───
+
+function loadQueue() {
+  if (!fs.existsSync(QUEUE_PATH)) return [];
+  try {
+    const raw = fs.readFileSync(QUEUE_PATH, "utf-8");
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveQueue(queue) {
+  const dir = path.dirname(QUEUE_PATH);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = `${QUEUE_PATH}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(queue, null, 2) + "\n", "utf-8");
+  fs.renameSync(tmp, QUEUE_PATH);
+}
+
+function newQueueItemId() {
+  return crypto.randomBytes(6).toString("hex");
+}
+
+/** Read-only: any thecoach-dev run still in non-terminal status. */
+function findActiveThecoachRun() {
+  if (!fs.existsSync(ANTFARM_DB)) return null;
+  const db = new DatabaseSync(ANTFARM_DB, { readOnly: true });
+  try {
+    const row = db
+      .prepare(
+        `SELECT id, status, run_number, created_at
+         FROM runs
+         WHERE workflow_id = ?
+           AND status NOT IN ('completed', 'failed', 'cancelled', 'canceled')
+         ORDER BY created_at DESC
+         LIMIT 1`,
+      )
+      .get(DEFAULT_WORKFLOW);
+    return row || null;
+  } finally {
+    try {
+      db.close();
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/** Read-only: look up a run's status by id. */
+function getRunStatus(runIdParam) {
+  if (!fs.existsSync(ANTFARM_DB)) return null;
+  const db = new DatabaseSync(ANTFARM_DB, { readOnly: true });
+  try {
+    return (
+      db
+        .prepare("SELECT id, workflow_id, status, run_number, task, created_at, updated_at FROM runs WHERE id = ?")
+        .get(runIdParam) || null
+    );
+  } finally {
+    try {
+      db.close();
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/**
+ * After spawning workflow run (fire-and-forget like /trigger), poll the DB
+ * read-only until the real antfarm run UUID appears for this exact task text.
+ */
+async function waitForAntfarmRunId(taskText, { timeoutMs = 20_000, intervalMs = 250 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(ANTFARM_DB)) {
+      const db = new DatabaseSync(ANTFARM_DB, { readOnly: true });
+      try {
+        const row = db
+          .prepare(
+            `SELECT id, status, run_number FROM runs
+             WHERE workflow_id = ? AND task = ?
+             ORDER BY created_at DESC LIMIT 1`,
+          )
+          .get(DEFAULT_WORKFLOW, taskText);
+        if (row) return row;
+      } finally {
+        try {
+          db.close();
+        } catch {
+          // ignore
+        }
+      }
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  return null;
+}
+
+function fetchOriginStagingTip(repoPath) {
+  return new Promise((resolve, reject) => {
+    execFile("git", ["-C", repoPath, "fetch", "origin"], { timeout: 120_000 }, (fetchErr, _o, fetchStderr) => {
+      if (fetchErr) {
+        return reject(new Error(`git fetch origin failed: ${fetchErr.message}${fetchStderr ? ` — ${fetchStderr}` : ""}`));
+      }
+      execFile("git", ["-C", repoPath, "rev-parse", "origin/staging"], { timeout: 15_000 }, (rpErr, stdout, rpStderr) => {
+        if (rpErr) {
+          return reject(new Error(`git rev-parse origin/staging failed: ${rpErr.message}${rpStderr ? ` — ${rpStderr}` : ""}`));
+        }
+        resolve(stdout.trim());
+      });
+    });
+  });
+}
+
+function buildQueuedTaskText({ repoPath, branch, task }) {
+  return `REPO: ${repoPath}\nBRANCH: ${branch}\n\n${task}`;
+}
+
+function verifyRunOwnership(stepsResult) {
+  const mismatches = [];
+  const expectedSteps = Object.keys(EXPECTED_OWNERSHIP);
+  const byStepId = new Map((stepsResult.steps || []).map((s) => [s.stepId, s]));
+
+  for (const stepId of expectedSteps) {
+    const expected = EXPECTED_OWNERSHIP[stepId];
+    const step = byStepId.get(stepId);
+    if (!step) {
+      mismatches.push({ stepId, expected, actual: null, reason: "step missing from run" });
+      continue;
+    }
+    if (step.assignedAgent !== expected) {
+      mismatches.push({
+        stepId,
+        expected,
+        actual: step.assignedAgent,
+        reason: `assignedAgent is "${step.assignedAgent}", expected "${expected}"`,
+      });
+    }
+  }
+  return mismatches;
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://localhost:${PORT}`);
   const p = url.pathname;
@@ -291,6 +454,206 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // ─── Task queue ───────────────────────────────────────────────────────────
+
+  if (p === "/queue" && req.method === "GET") {
+    if (!checkAuth(req)) return json(res, { ok: false, error: "unauthorized" }, 401);
+    return json(res, { ok: true, queue: loadQueue() });
+  }
+
+  if (p === "/queue" && req.method === "POST") {
+    if (!checkAuth(req)) return json(res, { ok: false, error: "unauthorized" }, 401);
+    const body = await readBody(req).catch(() => null);
+    if (!body) return json(res, { ok: false, error: "invalid JSON body" }, 400);
+    const task = typeof body.task === "string" ? body.task.trim() : "";
+    const repoPath = typeof body.repoPath === "string" ? body.repoPath.trim() : "";
+    const branchHint = typeof body.branchHint === "string" ? body.branchHint.trim() : "";
+    if (!task) return json(res, { ok: false, error: "'task' (string) is required" }, 400);
+    if (!repoPath) return json(res, { ok: false, error: "'repoPath' (string) is required" }, 400);
+
+    const item = {
+      id: newQueueItemId(),
+      task,
+      repoPath,
+      branchHint: branchHint || null,
+      status: "pending",
+      runId: null,
+      createdAt: new Date().toISOString(),
+      dispatchedAt: null,
+      resolvedAt: null,
+      note: null,
+    };
+    const queue = loadQueue();
+    queue.push(item);
+    saveQueue(queue);
+    return json(res, { ok: true, item }, 201);
+  }
+
+  if (p === "/queue/dispatch-next" && req.method === "POST") {
+    if (!checkAuth(req)) return json(res, { ok: false, error: "unauthorized" }, 401);
+
+    const active = findActiveThecoachRun();
+    if (active) {
+      return json(res, {
+        ok: true,
+        dispatched: false,
+        reason: "run in progress",
+        activeRunId: active.id,
+        activeStatus: active.status,
+        activeRunNumber: active.run_number ?? null,
+      });
+    }
+
+    const queue = loadQueue();
+    const idx = queue.findIndex((it) => it.status === "pending");
+    if (idx < 0) {
+      return json(res, { ok: true, dispatched: false, reason: "queue empty" });
+    }
+    const item = queue[idx];
+
+    if (!fs.existsSync(item.repoPath)) {
+      return json(res, { ok: false, error: `repoPath does not exist: ${item.repoPath}` }, 400);
+    }
+
+    let stagingTip;
+    try {
+      stagingTip = await fetchOriginStagingTip(item.repoPath);
+    } catch (err) {
+      return json(res, { ok: false, error: err?.message || String(err) }, 500);
+    }
+
+    const branch = `feature/thecoach-dev-coordinator-${item.id}`;
+    const taskText = buildQueuedTaskText({
+      repoPath: item.repoPath,
+      branch,
+      task: item.task,
+    });
+
+    let spawnResult;
+    try {
+      spawnResult = startWorkflowRun({ workflow: DEFAULT_WORKFLOW, task: taskText });
+    } catch (err) {
+      return json(res, { ok: false, error: err?.message || String(err) }, 500);
+    }
+
+    const antfarmRun = await waitForAntfarmRunId(taskText);
+    if (!antfarmRun) {
+      return json(
+        res,
+        {
+          ok: false,
+          error: "workflow spawn started but antfarm run id not observed in DB within timeout",
+          spawnLogId: spawnResult.id,
+          logPath: spawnResult.logPath,
+          stagingTip,
+          branch,
+        },
+        504,
+      );
+    }
+
+    item.status = "dispatched";
+    item.runId = antfarmRun.id;
+    item.dispatchedAt = new Date().toISOString();
+    item.note = `dispatched; staging tip ${stagingTip}; branch ${branch}; antfarm run #${antfarmRun.run_number}`;
+    item.branch = branch;
+    item.stagingTip = stagingTip;
+    saveQueue(queue);
+
+    return json(res, {
+      ok: true,
+      dispatched: true,
+      runId: antfarmRun.id,
+      runNumber: antfarmRun.run_number,
+      branch,
+      stagingTip,
+      spawnLogId: spawnResult.id,
+      item,
+    });
+  }
+
+  if (p === "/queue/check" && req.method === "GET") {
+    if (!checkAuth(req)) return json(res, { ok: false, error: "unauthorized" }, 401);
+
+    const queue = loadQueue();
+    const changed = [];
+
+    for (const item of queue) {
+      if (item.status !== "dispatched" || !item.runId) continue;
+
+      const run = getRunStatus(item.runId);
+      if (!run) {
+        changed.push({
+          id: item.id,
+          runId: item.runId,
+          change: "skipped",
+          reason: "run not found in DB",
+        });
+        continue;
+      }
+      if (!TERMINAL_RUN_STATUSES.has(run.status)) {
+        changed.push({
+          id: item.id,
+          runId: item.runId,
+          change: "still-running",
+          runStatus: run.status,
+        });
+        continue;
+      }
+
+      let stepsResult;
+      try {
+        stepsResult = queryStepsForRun(item.runId);
+      } catch (err) {
+        changed.push({
+          id: item.id,
+          runId: item.runId,
+          change: "error",
+          reason: err?.message || String(err),
+        });
+        continue;
+      }
+
+      const mismatches = verifyRunOwnership(stepsResult);
+      item.resolvedAt = new Date().toISOString();
+      if (mismatches.length === 0) {
+        item.status = "done";
+        item.note = "verified: all steps match expected ownership";
+        changed.push({
+          id: item.id,
+          runId: item.runId,
+          change: "done",
+          runStatus: run.status,
+        });
+      } else {
+        item.status = "flagged";
+        item.note = `ownership mismatch: ${mismatches
+          .map((m) => `${m.stepId}: ${m.reason}`)
+          .join("; ")}`;
+        changed.push({
+          id: item.id,
+          runId: item.runId,
+          change: "flagged",
+          runStatus: run.status,
+          mismatches,
+        });
+      }
+    }
+
+    saveQueue(queue);
+    return json(res, {
+      ok: true,
+      summary: {
+        checked: changed.length,
+        done: changed.filter((c) => c.change === "done").length,
+        flagged: changed.filter((c) => c.change === "flagged").length,
+        stillRunning: changed.filter((c) => c.change === "still-running").length,
+      },
+      changed,
+      queue,
+    });
+  }
+
   json(res, { ok: false, error: "not found" }, 404);
 });
 
@@ -299,5 +662,6 @@ server.listen(PORT, "127.0.0.1", () => {
   console.log(`Antfarm root: ${ANTFARM_ROOT}`);
   console.log(`Antfarm CLI: ${ANTFARM_CLI}`);
   console.log(`Antfarm DB (read-only): ${ANTFARM_DB}`);
+  console.log(`Queue file: ${QUEUE_PATH}`);
   console.log(`Logs: ${LOG_DIR}`);
 });
