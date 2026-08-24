@@ -9,8 +9,11 @@
 //   cd ~/.openclaw/workspace/antfarm && node local-tools/coordinator-trigger.mjs
 //
 // Required env:
-//   COORDINATOR_TOKEN   bearer secret the caller must present
+//   COORDINATOR_TOKEN   bearer secret — full access to every endpoint
 // Optional env:
+//   COORDINATOR_LOOP_TOKEN  weaker bearer for the unattended 2-hourly loop;
+//     allowlisted read/dispatch endpoints only (never POST /trigger or POST /queue).
+//     Unset/empty means the loop token does not exist (never matches).
 //   COORDINATOR_PORT       default 3335
 //   COORDINATOR_ANTFARM_CLI   default "<ANTFARM_ROOT>/dist/cli/cli.js" — this
 //     repo's `antfarm` isn't installed as a global command (only declared as
@@ -27,6 +30,8 @@ import { DatabaseSync } from "node:sqlite";
 
 const PORT = process.env.COORDINATOR_PORT ? Number(process.env.COORDINATOR_PORT) : 3335;
 const TOKEN = process.env.COORDINATOR_TOKEN;
+/** Weaker token for scheduled loop — may be undefined or "" (treated as absent). */
+const LOOP_TOKEN = process.env.COORDINATOR_LOOP_TOKEN;
 const ANTFARM_ROOT = process.cwd();
 const ANTFARM_CLI = process.env.COORDINATOR_ANTFARM_CLI || path.join(ANTFARM_ROOT, "dist", "cli", "cli.js");
 const LOG_DIR = path.join(ANTFARM_ROOT, "local-tools", "logs");
@@ -93,15 +98,80 @@ function readBody(req) {
   });
 }
 
-function checkAuth(req) {
-  const header = req.headers["authorization"] || "";
-  const [scheme, value] = header.split(" ");
-  if (scheme !== "Bearer" || !value) return false;
-  // constant-time compare
-  const a = Buffer.from(value);
-  const b = Buffer.from(TOKEN);
+/**
+ * Constant-time compare. Unset/empty `expected` NEVER matches — including
+ * against a missing/empty presented value. Getting this wrong would open
+ * the service when COORDINATOR_LOOP_TOKEN is unset.
+ */
+function timingSafeTokenEqual(presented, expected) {
+  if (typeof expected !== "string" || expected.length === 0) return false;
+  if (typeof presented !== "string" || presented.length === 0) return false;
+  const a = Buffer.from(presented);
+  const b = Buffer.from(expected);
   if (a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
+}
+
+function extractBearerToken(req) {
+  const header = req.headers?.authorization || "";
+  const [scheme, value] = header.split(" ");
+  if (scheme !== "Bearer" || !value) return null;
+  return value;
+}
+
+/** @returns {"full"|"loop"|null} */
+function identifyAuthRole(req) {
+  const value = extractBearerToken(req);
+  if (!value) return null;
+  if (timingSafeTokenEqual(value, TOKEN)) return "full";
+  // LOOP_TOKEN unset/empty → timingSafeTokenEqual is always false (never a match).
+  if (timingSafeTokenEqual(value, LOOP_TOKEN)) return "loop";
+  return null;
+}
+
+/**
+ * Explicit allowlist for the loop token. Future endpoints default to
+ * forbidden for loop — never add a denylist.
+ */
+const LOOP_TOKEN_ALLOWLIST = new Set([
+  "GET /queue/check",
+  "GET /queue",
+  "GET /status",
+  "GET /steps",
+  "POST /queue/dispatch-next",
+]);
+
+/**
+ * Identify which token was presented, then authorize by endpoint.
+ * @returns {{ ok: true, role: "full"|"loop" } | { ok: false, status: number, error: string }}
+ */
+function authorizeEndpoint(req, method, pathname) {
+  const role = identifyAuthRole(req);
+  if (!role) {
+    return { ok: false, status: 401, error: "unauthorized" };
+  }
+  if (role === "full") {
+    return { ok: true, role };
+  }
+  const key = `${method} ${pathname}`;
+  if (LOOP_TOKEN_ALLOWLIST.has(key)) {
+    return { ok: true, role };
+  }
+  return {
+    ok: false,
+    status: 403,
+    error: "forbidden: loop token is not permitted on this endpoint",
+  };
+}
+
+/** Returns true if the request may proceed; otherwise writes 401/403 JSON and returns false. */
+function requireAuth(req, res, method, pathname) {
+  const auth = authorizeEndpoint(req, method, pathname);
+  if (!auth.ok) {
+    json(res, { ok: false, error: auth.error }, auth.status);
+    return false;
+  }
+  return true;
 }
 
 function runId() {
@@ -499,7 +569,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (p === "/trigger" && req.method === "POST") {
-    if (!checkAuth(req)) return json(res, { ok: false, error: "unauthorized" }, 401);
+    if (!requireAuth(req, res, "POST", "/trigger")) return;
     const body = await readBody(req).catch(() => null);
     if (!body) return json(res, { ok: false, error: "invalid JSON body" }, 400);
     const workflow = typeof body.workflow === "string" && body.workflow.trim() ? body.workflow.trim() : "thecoach-dev";
@@ -515,7 +585,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (p === "/logs" && req.method === "GET") {
-    if (!checkAuth(req)) return json(res, { ok: false, error: "unauthorized" }, 401);
+    if (!requireAuth(req, res, "GET", "/logs")) return;
     const id = url.searchParams.get("id") || "";
     if (!/^[a-zA-Z0-9_-]+$/.test(id)) return json(res, { ok: false, error: "invalid id" }, 400);
     const logPath = path.join(LOG_DIR, `${id}.log`);
@@ -530,7 +600,7 @@ const server = http.createServer(async (req, res) => {
   // returns quickly for a status check (unlike `workflow run`, which is
   // fire-and-forget via /trigger above).
   if (p === "/status" && req.method === "GET") {
-    if (!checkAuth(req)) return json(res, { ok: false, error: "unauthorized" }, 401);
+    if (!requireAuth(req, res, "GET", "/status")) return;
     const query = url.searchParams.get("query") || "";
     const args = ["workflow", "status"];
     if (query) args.push(query);
@@ -546,7 +616,7 @@ const server = http.createServer(async (req, res) => {
   // `steps.output` column so a coordinator can verify Cursor-delegated
   // steps actually reported Cursor work (vs Claude Code doing it inline).
   if (p === "/steps" && req.method === "GET") {
-    if (!checkAuth(req)) return json(res, { ok: false, error: "unauthorized" }, 401);
+    if (!requireAuth(req, res, "GET", "/steps")) return;
     const runIdParam = (url.searchParams.get("run_id") || "").trim();
     if (!runIdParam) return json(res, { ok: false, error: "'run_id' query param is required" }, 400);
     if (!/^[a-zA-Z0-9_-]+$/.test(runIdParam)) {
@@ -568,12 +638,12 @@ const server = http.createServer(async (req, res) => {
   // ─── Task queue ───────────────────────────────────────────────────────────
 
   if (p === "/queue" && req.method === "GET") {
-    if (!checkAuth(req)) return json(res, { ok: false, error: "unauthorized" }, 401);
+    if (!requireAuth(req, res, "GET", "/queue")) return;
     return json(res, { ok: true, queue: loadQueue() });
   }
 
   if (p === "/queue" && req.method === "POST") {
-    if (!checkAuth(req)) return json(res, { ok: false, error: "unauthorized" }, 401);
+    if (!requireAuth(req, res, "POST", "/queue")) return;
     const body = await readBody(req).catch(() => null);
     if (!body) return json(res, { ok: false, error: "invalid JSON body" }, 400);
     const task = typeof body.task === "string" ? body.task.trim() : "";
@@ -601,7 +671,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (p === "/queue/dispatch-next" && req.method === "POST") {
-    if (!checkAuth(req)) return json(res, { ok: false, error: "unauthorized" }, 401);
+    if (!requireAuth(req, res, "POST", "/queue/dispatch-next")) return;
 
     const active = findActiveThecoachRun();
     if (active) {
@@ -684,7 +754,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (p === "/queue/check" && req.method === "GET") {
-    if (!checkAuth(req)) return json(res, { ok: false, error: "unauthorized" }, 401);
+    if (!requireAuth(req, res, "GET", "/queue/check")) return;
 
     const queue = loadQueue();
     const changed = [];
@@ -795,6 +865,77 @@ if (process.argv.includes("--self-test-pr-base-gate")) {
   const cases = ["staging", "main", "master", "develop"];
   const out = cases.map((input) => ({ input, result: evaluatePrBaseRef(input) }));
   console.log(JSON.stringify(out, null, 2));
+  process.exit(0);
+}
+
+// Authorization matrix — calls the REAL authorizeEndpoint / timingSafeTokenEqual.
+// Does not bind the port or touch the queue. Invoke with known test secrets:
+//   COORDINATOR_TOKEN=full-test COORDINATOR_LOOP_TOKEN=loop-test \
+//     node local-tools/coordinator-trigger.mjs --self-test-auth-matrix
+// And again without COORDINATOR_LOOP_TOKEN to prove unset loop never opens the door.
+if (process.argv.includes("--self-test-auth-matrix")) {
+  const endpoints = [
+    ["POST", "/trigger"],
+    ["POST", "/queue"],
+    ["GET", "/queue/check"],
+    ["POST", "/queue/dispatch-next"],
+    ["GET", "/no-such-endpoint"],
+  ];
+  const loopConfigured = typeof LOOP_TOKEN === "string" && LOOP_TOKEN.length > 0;
+  const tokenCases = [
+    { label: "full", value: TOKEN },
+    { label: "loop", value: loopConfigured ? LOOP_TOKEN : null },
+    { label: "wrong", value: "definitely-wrong-token-value" },
+    { label: "absent", value: null },
+  ];
+
+  function fakeReq(tokenValue) {
+    if (tokenValue == null) return { headers: {} };
+    return { headers: { authorization: `Bearer ${tokenValue}` } };
+  }
+
+  function statusOf(auth) {
+    return auth.ok ? 200 : auth.status;
+  }
+
+  const matrix = [];
+  for (const tok of tokenCases) {
+    for (const [method, pathname] of endpoints) {
+      const auth = authorizeEndpoint(fakeReq(tok.value), method, pathname);
+      matrix.push({
+        token: tok.label,
+        loopTokenPresented: tok.label === "loop" ? (loopConfigured ? "yes" : "n/a-unset") : undefined,
+        method,
+        path: pathname,
+        status: statusOf(auth),
+        error: auth.ok ? null : auth.error,
+      });
+    }
+  }
+
+  const unsetSafety = {
+    loopTokenConfigured: loopConfigured,
+    loopTokenEnvType: LOOP_TOKEN === undefined ? "undefined" : typeof LOOP_TOKEN,
+    loopTokenEnvLength: typeof LOOP_TOKEN === "string" ? LOOP_TOKEN.length : null,
+    // Critical: empty/empty must never match
+    timingSafeEmptyVsEmpty: timingSafeTokenEqual("", ""),
+    timingSafeEmptyVsUndefined: timingSafeTokenEqual("", undefined),
+    timingSafeEmptyVsLoopToken: timingSafeTokenEqual("", LOOP_TOKEN),
+    absentHeaderOnQueueCheck: (() => {
+      const auth = authorizeEndpoint({ headers: {} }, "GET", "/queue/check");
+      return { status: statusOf(auth), error: auth.error };
+    })(),
+    emptyBearerOnQueueCheck: (() => {
+      const auth = authorizeEndpoint({ headers: { authorization: "Bearer " } }, "GET", "/queue/check");
+      return { status: statusOf(auth), error: auth.error };
+    })(),
+    malformedHeaderOnTrigger: (() => {
+      const auth = authorizeEndpoint({ headers: { authorization: "Basic nope" } }, "POST", "/trigger");
+      return { status: statusOf(auth), error: auth.error };
+    })(),
+  };
+
+  console.log(JSON.stringify({ matrix, unsetSafety }, null, 2));
   process.exit(0);
 }
 
