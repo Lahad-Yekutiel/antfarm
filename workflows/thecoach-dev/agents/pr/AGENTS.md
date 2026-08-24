@@ -9,8 +9,8 @@ independently confirm the PR really exists and targets staging.
 
 Your tool policy does not include `write`, `edit`, or `apply_patch`. Do
 not modify application code in this step. The PR create itself is
-delegated to Cursor via the host delegation trigger (see step 3), same
-mechanism as setup/developer.
+delegated to Cursor via the local Cursor CLI (see step 3):
+`cd {{repo}} && agent -p --force --output-format json "<prompt>"`.
 
 ## Your process
 
@@ -22,26 +22,12 @@ mechanism as setup/developer.
    delegate the push. If the push fails, reply `STATUS: blocked` with the
    real error.
 3. **Delegate the PR description and creation to Cursor now, as your
-   very next tool call after a successful push.** Call the delegation
-   trigger via your shell tool:
+   very next tool call after a successful push.** Run, via your shell
+   tool:
    ```
-   curl -s -X POST http://host.docker.internal:3336/delegate \
-     -H "Authorization: Bearer $DELEGATE_TOKEN" \
-     -H "Content-Type: application/json" \
-     -d '{"repo": "{{repo}}", "prompt": "<prompt>", "force": true}'
+   cd {{repo}} && agent -p --force --output-format json "<prompt>"
    ```
-   This returns immediately with `{"ok": true, "id": "<run-id>", ...}`.
-   Poll for the result every 5-10 seconds:
-   ```
-   curl -s -H "Authorization: Bearer $DELEGATE_TOKEN" \
-     "http://host.docker.internal:3336/logs?id=<run-id>"
-   ```
-   The response is JSON: `{"state":"running"|"exited"|"spawn_failed"|"timeout","exitCode":...,"log":"..."}`.
-   Keep polling while `state` is `"running"`. If `state` is `"spawn_failed"` or `"timeout"`,
-   reply `STATUS: blocked` immediately — do not infer failure from an empty body or a 404 alone.
-   When `state` is `"exited"`, parse the `log` field for Cursor's JSON result (`is_error`, `result`, etc.).
-   Build `<prompt>` yourself, in full, JSON-escaped correctly for the `-d`
-   payload above, asking Cursor to: read `git log staging..{{branch}}`
+   Build `<prompt>` yourself, in full, asking Cursor to: read `git log staging..{{branch}}`
    and the real diff (not the task text alone) and write an accurate PR
    description reflecting what actually changed; then run
    `gh pr create --base staging --title "<short, real title>" --body "<real description>"`
@@ -49,9 +35,8 @@ mechanism as setup/developer.
    optional — a PR opened without it defaults to `main`, which this
    workflow must never target automatically. Explicitly tell Cursor not
    to write or modify application source files.
-4. If `/delegate` itself fails, or Cursor's own JSON result has
-   `"is_error": true`, or polling never produces output after a
-   reasonable wait, treat this as your own blocker. Do not retry Cursor
+4. If the `agent -p` call itself fails, or Cursor's own JSON result has
+   `"is_error": true`, treat this as your own blocker. Do not retry Cursor
    yourself and do not attempt `gh pr create` by hand instead — reply
    `STATUS: blocked` with Cursor's error output attached.
 5. Independently confirm the PR actually exists AND targets staging:
@@ -71,7 +56,7 @@ mechanism as setup/developer.
   `STATUS: blocked` with the real error instead.
 - Don't let a PR land against `main` — that's a hard failure, not a
   detail to fix later.
-- Don't retry Cursor yourself after a failed `/delegate` or
+- Don't retry Cursor yourself after a failed `agent -p` call or
   `"is_error": true`, and don't fall back to running `gh pr create`
   yourself — that is `STATUS: blocked`.
 

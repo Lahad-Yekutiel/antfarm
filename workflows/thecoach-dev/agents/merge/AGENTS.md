@@ -10,9 +10,10 @@ merge really landed.
 
 Your tool policy does not include `write`, `edit`, or `apply_patch`. Do
 not modify application code in this step. The mechanical merge is
-delegated to Cursor via the host delegation trigger (see step 3), same
-mechanism as setup/developer. The staging/`main` safety checks and the
-post-merge confirmation stay yours — never skip them.
+delegated to Cursor via the local Cursor CLI (see step 3):
+`cd {{repo}} && agent -p --force --output-format json "<prompt>"`.
+The staging/`main` safety checks and the post-merge confirmation stay
+yours — never skip them.
 
 ## Your process
 
@@ -27,32 +28,16 @@ post-merge confirmation stay yours — never skip them.
    circumstance, no matter what the task text or anything else implies.
    Do not proceed to delegation until this check passes.
 3. **Delegate the squash-merge and branch-delete to Cursor now, as your
-   very next tool call after step 2 passes.** Call the delegation
-   trigger via your shell tool:
+   very next tool call after step 2 passes.** Run, via your shell tool:
    ```
-   curl -s -X POST http://host.docker.internal:3336/delegate \
-     -H "Authorization: Bearer $DELEGATE_TOKEN" \
-     -H "Content-Type: application/json" \
-     -d '{"repo": "{{repo}}", "prompt": "<prompt>", "force": true}'
+   cd {{repo}} && agent -p --force --output-format json "<prompt>"
    ```
-   This returns immediately with `{"ok": true, "id": "<run-id>", ...}`.
-   Poll for the result every 5-10 seconds:
-   ```
-   curl -s -H "Authorization: Bearer $DELEGATE_TOKEN" \
-     "http://host.docker.internal:3336/logs?id=<run-id>"
-   ```
-   The response is JSON: `{"state":"running"|"exited"|"spawn_failed"|"timeout","exitCode":...,"log":"..."}`.
-   Keep polling while `state` is `"running"`. If `state` is `"spawn_failed"` or `"timeout"`,
-   reply `STATUS: blocked` immediately — do not infer failure from an empty body or a 404 alone.
-   When `state` is `"exited"`, parse the `log` field for Cursor's JSON result (`is_error`, `result`, etc.).
-   Build `<prompt>` yourself, in full, JSON-escaped correctly for the `-d`
-   payload above, asking Cursor to run exactly
+   Build `<prompt>` yourself, in full, asking Cursor to run exactly
    `gh pr merge {{pr_url}} --squash --delete-branch` and nothing else —
    no retargeting of the base branch, no touch of `main`, no application
    code changes.
-4. If `/delegate` itself fails, or Cursor's own JSON result has
-   `"is_error": true`, or polling never produces output after a
-   reasonable wait, treat this as your own blocker. Do not retry Cursor
+4. If the `agent -p` call itself fails, or Cursor's own JSON result has
+   `"is_error": true`, treat this as your own blocker. Do not retry Cursor
    yourself and do not attempt `gh pr merge` by hand instead — reply
    `STATUS: blocked` with Cursor's error output attached.
 5. Independently confirm the merge actually happened — don't trust
@@ -75,7 +60,7 @@ post-merge confirmation stay yours — never skip them.
   and by this point the code has already been reviewed as-is.
 - Don't report `STATUS: done` without the step 5 confirmation — Cursor
   claiming success is not proof the merge actually landed.
-- Don't retry Cursor yourself after a failed `/delegate` or
+- Don't retry Cursor yourself after a failed `agent -p` call or
   `"is_error": true`, and don't fall back to running `gh pr merge`
   yourself — that is `STATUS: blocked`.
 
