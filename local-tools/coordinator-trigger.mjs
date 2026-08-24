@@ -454,23 +454,33 @@ function verifyRunOwnership(stepsResult) {
   return mismatches;
 }
 
-/** Collect unique GitHub PR URLs from every step's output text. */
-function extractPrUrlsFromSteps(stepsResult) {
+/** Collect unique GitHub PR URLs from a single text blob (typically pr-step output). */
+function extractPrUrlsFromText(text) {
   const found = [];
   const seen = new Set();
-  for (const step of stepsResult.steps || []) {
-    const text = typeof step.output === "string" ? step.output : "";
-    if (!text) continue;
-    PR_URL_RE.lastIndex = 0;
-    let m;
-    while ((m = PR_URL_RE.exec(text)) !== null) {
-      const url = m[0];
-      if (seen.has(url)) continue;
-      seen.add(url);
-      found.push(url);
-    }
+  const raw = typeof text === "string" ? text : "";
+  if (!raw) return found;
+  PR_URL_RE.lastIndex = 0;
+  let m;
+  while ((m = PR_URL_RE.exec(raw)) !== null) {
+    const url = m[0];
+    if (seen.has(url)) continue;
+    seen.add(url);
+    found.push(url);
   }
   return found;
+}
+
+function getPrStep(stepsResult) {
+  return (stepsResult.steps || []).find((s) => s.stepId === "pr") || null;
+}
+
+function truncateForNote(text, maxLen = 400) {
+  const raw = typeof text === "string" ? text : "";
+  if (!raw) return "(empty)";
+  const oneLine = raw.replace(/\s+/g, " ").trim();
+  if (oneLine.length <= maxLen) return oneLine;
+  return `${oneLine.slice(0, maxLen)}…`;
 }
 
 /** Reject anything that is not a canonical https GitHub pull URL before execFile. */
@@ -527,14 +537,47 @@ function fetchPrBaseRefName(prUrl) {
 }
 
 /**
- * Derive PR base(s) from step output URLs. No PR → not a failure.
- * Non-staging base → mismatch entries for the same flag path as ownership.
+ * PR base gate using the workflow's named `pr` step as discriminator.
+ * - pr step not successfully completed → no PR expected (not a failure).
+ * - pr step completed but no URL in its output → PARSE FAILURE → flag.
+ * - URL found → gh base must be staging; gh errors → flag (never done).
+ * `done` only when checked-and-correct, or positively no-PR-expected.
+ *
+ * @param {object} stepsResult
+ * @param {{ resolveBaseRef?: (url: string) => Promise<string> }} [opts]
+ *   Optional injector for self-tests (avoids calling gh).
  */
-async function verifyPrBaseBranch(stepsResult) {
-  const urls = extractPrUrlsFromSteps(stepsResult);
-  if (urls.length === 0) {
-    return { noPr: true, mismatches: [], bases: [] };
+async function verifyPrBaseBranch(stepsResult, opts = {}) {
+  const resolveBaseRef = opts.resolveBaseRef || fetchPrBaseRefName;
+  const prStep = getPrStep(stepsResult);
+  const prSucceeded = Boolean(prStep && prStep.status === "completed");
+
+  if (!prSucceeded) {
+    const why = !prStep
+      ? "pr step absent from run"
+      : `pr step status is "${prStep.status}" (not completed) — no PR expected`;
+    return {
+      noPr: true,
+      noPrReason: why,
+      mismatches: [],
+      bases: [],
+    };
   }
+
+  const urls = extractPrUrlsFromText(prStep.output);
+  if (urls.length === 0) {
+    return {
+      noPr: false,
+      noPrReason: null,
+      mismatches: [
+        {
+          reason: `unparseable PR URL: pr step completed but no GitHub PR URL matched in its output; output snippet: ${truncateForNote(prStep.output)}`,
+        },
+      ],
+      bases: [],
+    };
+  }
+
   const mismatches = [];
   const bases = [];
   for (const url of urls) {
@@ -543,20 +586,63 @@ async function verifyPrBaseBranch(stepsResult) {
       continue;
     }
     try {
-      const baseRefName = await fetchPrBaseRefName(url);
+      const baseRefName = await resolveBaseRef(url);
       bases.push({ pr: url, baseRefName });
       const ev = evaluatePrBaseRef(baseRefName);
       if (!ev.ok) {
         mismatches.push({ pr: url, baseRefName, reason: ev.reason });
       }
     } catch (err) {
+      // gh / network / parse errors MUST flag — never resolve to done.
       mismatches.push({
         pr: url,
         reason: `could not determine PR base: ${err?.message || String(err)}`,
       });
     }
   }
-  return { noPr: false, mismatches, bases };
+  return { noPr: false, noPrReason: null, mismatches, bases };
+}
+
+/**
+ * Shared resolution used by /queue/check and --self-test-pr-base-gate.
+ * `done` only when ownership ok AND (base verified staging OR positively no PR expected).
+ */
+function resolveQueueVerification(ownershipMismatches, baseCheck) {
+  const noteParts = [];
+  if (ownershipMismatches.length > 0) {
+    noteParts.push(
+      `ownership mismatch: ${ownershipMismatches
+        .map((m) => `${m.stepId}: ${m.reason}`)
+        .join("; ")}`,
+    );
+  }
+  if (baseCheck.mismatches.length > 0) {
+    noteParts.push(`PR base gate: ${baseCheck.mismatches.map((m) => m.reason).join("; ")}`);
+  }
+
+  if (noteParts.length === 0) {
+    const note = baseCheck.noPr
+      ? `verified: all steps match expected ownership; ${baseCheck.noPrReason}`
+      : "verified: all steps match expected ownership";
+    return {
+      status: "done",
+      note,
+      prBases: baseCheck.bases,
+      noPr: baseCheck.noPr,
+      noPrReason: baseCheck.noPrReason || null,
+      mismatches: ownershipMismatches,
+      prBaseMismatches: baseCheck.mismatches,
+    };
+  }
+  return {
+    status: "flagged",
+    note: noteParts.join("; "),
+    prBases: baseCheck.bases,
+    noPr: baseCheck.noPr,
+    noPrReason: baseCheck.noPrReason || null,
+    mismatches: ownershipMismatches,
+    prBaseMismatches: baseCheck.mismatches,
+  };
 }
 
 const server = http.createServer(async (req, res) => {
@@ -799,46 +885,20 @@ const server = http.createServer(async (req, res) => {
       const baseCheck = await verifyPrBaseBranch(stepsResult);
       item.resolvedAt = new Date().toISOString();
 
-      const noteParts = [];
-      if (ownershipMismatches.length > 0) {
-        noteParts.push(
-          `ownership mismatch: ${ownershipMismatches
-            .map((m) => `${m.stepId}: ${m.reason}`)
-            .join("; ")}`,
-        );
-      }
-      if (baseCheck.mismatches.length > 0) {
-        noteParts.push(
-          `PR base gate: ${baseCheck.mismatches.map((m) => m.reason).join("; ")}`,
-        );
-      }
-
-      if (noteParts.length === 0) {
-        item.status = "done";
-        item.note = baseCheck.noPr
-          ? "verified: all steps match expected ownership; no PR found in step output"
-          : "verified: all steps match expected ownership";
-        changed.push({
-          id: item.id,
-          runId: item.runId,
-          change: "done",
-          runStatus: run.status,
-          prBases: baseCheck.bases,
-          noPr: baseCheck.noPr,
-        });
-      } else {
-        item.status = "flagged";
-        item.note = noteParts.join("; ");
-        changed.push({
-          id: item.id,
-          runId: item.runId,
-          change: "flagged",
-          runStatus: run.status,
-          mismatches: ownershipMismatches,
-          prBaseMismatches: baseCheck.mismatches,
-          prBases: baseCheck.bases,
-        });
-      }
+      const outcome = resolveQueueVerification(ownershipMismatches, baseCheck);
+      item.status = outcome.status;
+      item.note = outcome.note;
+      changed.push({
+        id: item.id,
+        runId: item.runId,
+        change: outcome.status,
+        runStatus: run.status,
+        prBases: outcome.prBases,
+        noPr: outcome.noPr,
+        noPrReason: outcome.noPrReason,
+        mismatches: outcome.mismatches,
+        prBaseMismatches: outcome.prBaseMismatches,
+      });
     }
 
     saveQueue(queue);
@@ -858,13 +918,70 @@ const server = http.createServer(async (req, res) => {
   json(res, { ok: false, error: "not found" }, 404);
 });
 
-// Mechanical self-check of evaluatePrBaseRef — does not bind the port or
-// touch the queue file. Invoke:
+// Mechanical self-check of evaluatePrBaseRef + PR-step discriminator gate.
+// Does not bind the port or touch the queue file. Invoke:
 //   COORDINATOR_TOKEN=x node local-tools/coordinator-trigger.mjs --self-test-pr-base-gate
 if (process.argv.includes("--self-test-pr-base-gate")) {
-  const cases = ["staging", "main", "master", "develop"];
-  const out = cases.map((input) => ({ input, result: evaluatePrBaseRef(input) }));
-  console.log(JSON.stringify(out, null, 2));
+  const evaluateCases = ["staging", "main", "master", "develop"].map((input) => ({
+    input,
+    result: evaluatePrBaseRef(input),
+  }));
+
+  // Fabricated stepsResult fixtures — ownership map satisfied via stub titles skipped;
+  // we only exercise verifyPrBaseBranch + resolveQueueVerification here.
+  const ownershipOk = [];
+
+  async function caseOutcome(label, steps, resolveBaseRef) {
+    const baseCheck = await verifyPrBaseBranch({ steps }, { resolveBaseRef });
+    const outcome = resolveQueueVerification(ownershipOk, baseCheck);
+    return {
+      case: label,
+      status: outcome.status,
+      note: outcome.note,
+      noPr: outcome.noPr,
+      noPrReason: outcome.noPrReason,
+      prBaseMismatches: outcome.prBaseMismatches,
+    };
+  }
+
+  const sampleUrl = "https://github.com/example/repo/pull/42";
+
+  const gateCases = await Promise.all([
+    caseOutcome("pr-step-absent", [
+      { stepId: "implement", status: "completed", output: "done" },
+    ]),
+    caseOutcome("pr-step-succeeded-but-unparseable", [
+      {
+        stepId: "pr",
+        status: "completed",
+        output: "Opened a pull request but forgot the URL — see PR #42 against main.",
+      },
+    ]),
+    caseOutcome(
+      "parsed-base-staging",
+      [
+        {
+          stepId: "pr",
+          status: "completed",
+          output: `PR ready: ${sampleUrl}`,
+        },
+      ],
+      async () => "staging",
+    ),
+    caseOutcome(
+      "parsed-base-main",
+      [
+        {
+          stepId: "pr",
+          status: "completed",
+          output: `PR ready: ${sampleUrl}`,
+        },
+      ],
+      async () => "main",
+    ),
+  ]);
+
+  console.log(JSON.stringify({ evaluatePrBaseRef: evaluateCases, gateCases }, null, 2));
   process.exit(0);
 }
 
