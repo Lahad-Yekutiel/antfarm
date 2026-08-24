@@ -19,15 +19,22 @@
 
 import http from "node:http";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { spawn, execFile } from "node:child_process";
 import crypto from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
 
 const PORT = process.env.COORDINATOR_PORT ? Number(process.env.COORDINATOR_PORT) : 3335;
 const TOKEN = process.env.COORDINATOR_TOKEN;
 const ANTFARM_ROOT = process.cwd();
 const ANTFARM_CLI = process.env.COORDINATOR_ANTFARM_CLI || path.join(ANTFARM_ROOT, "dist", "cli", "cli.js");
 const LOG_DIR = path.join(ANTFARM_ROOT, "local-tools", "logs");
+// Same location antfarm's getDb() uses (see src/db.ts / resolveOpenClawStateDir).
+const ANTFARM_DB =
+  process.env.COORDINATOR_ANTFARM_DB ||
+  path.join(process.env.OPENCLAW_STATE_DIR || path.join(os.homedir(), ".openclaw"), "antfarm", "antfarm.db");
+const WORKFLOWS_DIR = path.join(ANTFARM_ROOT, "workflows");
 
 if (!TOKEN) {
   console.error("COORDINATOR_TOKEN is not set — refusing to start (would be an open door).");
@@ -92,6 +99,122 @@ function startWorkflowRun({ workflow, task }) {
   return { id, pid: child.pid, logPath };
 }
 
+/**
+ * Classify a role's live AGENTS.md title into ownership, matching
+ * local-tools/config-dashboard.mjs's classifyDelegation().
+ * Returns a human label for the coordinator: "Cursor" | "Claude Code".
+ */
+function classifyAssignedAgent(title) {
+  const t = (title || "").toLowerCase();
+  if (t.includes("cursor-delegated")) return "Cursor";
+  // cursor-assisted = Claude decides (may use Cursor as a tool); claude-only / bare = Claude Code
+  return "Claude Code";
+}
+
+function readAgentOwnership(workflowId, agentRole) {
+  // steps.agent_id is like "thecoach-dev_setup" — role is the suffix after the last "_",
+  // but workflow agent dirs use short ids ("setup"). Prefer the short role from step_id's
+  // agent column in workflow.yml; fall back to stripping the workflow prefix.
+  const candidates = [];
+  if (agentRole) candidates.push(agentRole);
+  const underscore = agentRole.lastIndexOf("_");
+  if (underscore >= 0) candidates.push(agentRole.slice(underscore + 1));
+  // Also try stripping "<workflowId>_"
+  if (workflowId && agentRole.startsWith(workflowId + "_")) {
+    candidates.push(agentRole.slice(workflowId.length + 1));
+  }
+
+  for (const role of candidates) {
+    const agentsMd = path.join(WORKFLOWS_DIR, workflowId, "agents", role, "AGENTS.md");
+    if (!fs.existsSync(agentsMd)) continue;
+    try {
+      const first = fs.readFileSync(agentsMd, "utf-8").split("\n").find((l) => l.trim().length > 0) ?? "";
+      const title = first.replace(/^#\s*/, "").trim();
+      return {
+        assignedAgent: classifyAssignedAgent(title),
+        ownershipTitle: title,
+        agentRole: role,
+      };
+    } catch {
+      // fall through
+    }
+  }
+  return {
+    assignedAgent: "Claude Code",
+    ownershipTitle: null,
+    agentRole: agentRole,
+  };
+}
+
+/**
+ * Read-only query of antfarm.db steps for a run. Opens the DB with
+ * { readOnly: true } — no writes, no migrate(), no WAL pragma changes.
+ */
+function queryStepsForRun(runIdParam) {
+  if (!fs.existsSync(ANTFARM_DB)) {
+    const err = new Error(`antfarm.db not found at ${ANTFARM_DB}`);
+    err.code = "DB_MISSING";
+    throw err;
+  }
+  const db = new DatabaseSync(ANTFARM_DB, { readOnly: true });
+  try {
+    const run = db.prepare("SELECT id, workflow_id, status, run_number FROM runs WHERE id = ?").get(runIdParam);
+    if (!run) return { found: false, steps: [] };
+
+    const rows = db
+      .prepare(
+        `SELECT id, run_id, step_id, agent_id, step_index, status, output,
+                type, retry_count, max_retries, created_at, updated_at
+         FROM steps
+         WHERE run_id = ?
+         ORDER BY step_index ASC`,
+      )
+      .all(runIdParam);
+
+    const workflowId = run.workflow_id;
+    const steps = rows.map((row) => {
+      const ownership = readAgentOwnership(workflowId, row.agent_id);
+      return {
+        id: row.id,
+        runId: row.run_id,
+        stepId: row.step_id,
+        stepIndex: row.step_index,
+        agentId: row.agent_id,
+        agentRole: ownership.agentRole,
+        assignedAgent: ownership.assignedAgent,
+        ownershipTitle: ownership.ownershipTitle,
+        status: row.status,
+        type: row.type,
+        retryCount: row.retry_count,
+        maxRetries: row.max_retries,
+        // Full output text — not truncated. This is the DB `output` column
+        // (completed + failed steps). The `evidence` object on step.failed
+        // events is event-only and is NOT a DB column.
+        output: row.output ?? null,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      };
+    });
+
+    return {
+      found: true,
+      run: {
+        id: run.id,
+        workflowId: run.workflow_id,
+        status: run.status,
+        runNumber: run.run_number,
+      },
+      steps,
+    };
+  } finally {
+    try {
+      db.close();
+    } catch {
+      // ignore
+    }
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://localhost:${PORT}`);
   const p = url.pathname;
@@ -144,6 +267,30 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Per-step output for a run — read-only SELECT against antfarm.db.
+  // /status above only surfaces CLI status text; this returns the full
+  // `steps.output` column so a coordinator can verify Cursor-delegated
+  // steps actually reported Cursor work (vs Claude Code doing it inline).
+  if (p === "/steps" && req.method === "GET") {
+    if (!checkAuth(req)) return json(res, { ok: false, error: "unauthorized" }, 401);
+    const runIdParam = (url.searchParams.get("run_id") || "").trim();
+    if (!runIdParam) return json(res, { ok: false, error: "'run_id' query param is required" }, 400);
+    if (!/^[a-zA-Z0-9_-]+$/.test(runIdParam)) {
+      return json(res, { ok: false, error: "invalid run_id" }, 400);
+    }
+    try {
+      const result = queryStepsForRun(runIdParam);
+      if (!result.found) {
+        return json(res, { ok: false, error: "run not found", run_id: runIdParam, steps: [] }, 404);
+      }
+      // Primary payload is the steps array; wrap with ok/run metadata.
+      return json(res, { ok: true, run: result.run, steps: result.steps });
+    } catch (err) {
+      const status = err?.code === "DB_MISSING" ? 503 : 500;
+      return json(res, { ok: false, error: err?.message || String(err) }, status);
+    }
+  }
+
   json(res, { ok: false, error: "not found" }, 404);
 });
 
@@ -151,5 +298,6 @@ server.listen(PORT, "127.0.0.1", () => {
   console.log(`Coordinator trigger server: http://127.0.0.1:${PORT}`);
   console.log(`Antfarm root: ${ANTFARM_ROOT}`);
   console.log(`Antfarm CLI: ${ANTFARM_CLI}`);
+  console.log(`Antfarm DB (read-only): ${ANTFARM_DB}`);
   console.log(`Logs: ${LOG_DIR}`);
 });
