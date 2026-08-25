@@ -19,6 +19,10 @@
 //     repo's `antfarm` isn't installed as a global command (only declared as
 //     a `bin` in package.json, never `npm link`ed), so it's invoked as
 //     `node dist/cli/cli.js ...` directly, same as config-dashboard.mjs does.
+//   COORDINATOR_THECOACH_REPO  Windows TheCoach checkout (WSL path). Used ONLY
+//     to read local/cursor_loop/developer_todo.json when the queue is empty.
+//     Never a default repoPath; never used to read ROADMAP.md. Unset → the
+//     empty-queue scan fails open (same as "queue empty").
 
 import http from "node:http";
 import fs from "node:fs";
@@ -44,6 +48,16 @@ const QUEUE_PATH =
   process.env.COORDINATOR_QUEUE_PATH ||
   path.join(ANTFARM_ROOT, "local-tools", "coordinator-queue.json");
 const DEFAULT_WORKFLOW = "thecoach-dev";
+/** Trial clone dispatched work actually runs against. Not COORDINATOR_THECOACH_REPO. */
+const DEFAULT_QUEUE_REPO_PATH = "/home/lahad/trials/thecoach-antfarm-trial";
+const ROADMAP_GIT_PATH = "_SSoT/ROADMAP.md";
+const ROADMAP_AUTO_SOURCE = "coordinator:roadmap-auto";
+/** Windows checkout — developer_todo.json only. Loaded from EnvironmentFile, never a unit Environment= line. */
+const THECOACH_REPO = (process.env.COORDINATOR_THECOACH_REPO || "").trim();
+const PLANNER_AGENT_ID = "thecoach-dev_planner";
+const PLANNER_MODEL = "anthropic/claude-sonnet-5";
+const PLANNER_CLI_TIMEOUT_SEC = 75;
+const PLANNER_EXEC_TIMEOUT_MS = 75_000;
 
 /** Expected ownership by workflow step_id — the delegation-authenticity map. */
 const EXPECTED_OWNERSHIP = {
@@ -335,6 +349,44 @@ function newQueueItemId() {
   return crypto.randomBytes(6).toString("hex");
 }
 
+function logDispatchNext(message) {
+  console.log(`[queue/dispatch-next] ${message}`);
+}
+
+function logDispatchNextError(message) {
+  console.error(`[queue/dispatch-next] ${message}`);
+}
+
+/**
+ * Same shape POST /queue builds for a human-submitted item, plus optional
+ * source / roadmap_ref for coordinator auto-queue.
+ */
+function buildQueueItem({ task, repoPath, branchHint = null, source, roadmap_ref }) {
+  const item = {
+    id: newQueueItemId(),
+    task,
+    repoPath,
+    branchHint: branchHint || null,
+    status: "pending",
+    runId: null,
+    createdAt: new Date().toISOString(),
+    dispatchedAt: null,
+    resolvedAt: null,
+    note: null,
+  };
+  if (source !== undefined) item.source = source;
+  if (roadmap_ref !== undefined) item.roadmap_ref = roadmap_ref;
+  return item;
+}
+
+function enqueueQueueItem(fields) {
+  const item = buildQueueItem(fields);
+  const queue = loadQueue();
+  queue.push(item);
+  saveQueue(queue);
+  return item;
+}
+
 /** Read-only: any thecoach-dev run still in non-terminal status. */
 function findActiveThecoachRun() {
   if (!fs.existsSync(ANTFARM_DB)) return null;
@@ -426,8 +478,384 @@ function fetchOriginStagingTip(repoPath) {
   });
 }
 
+function gitShowOriginStagingFile(repoPath, gitPath) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "git",
+      ["-C", repoPath, "show", `origin/staging:${gitPath}`],
+      { timeout: 15_000, maxBuffer: 10 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (err) {
+          return reject(
+            new Error(
+              `git show origin/staging:${gitPath} failed: ${err.message}${stderr ? ` — ${String(stderr).trim()}` : ""}`,
+            ),
+          );
+        }
+        resolve(stdout);
+      },
+    );
+  });
+}
+
+function readDeveloperTodoFile(thecoachRepo) {
+  const todoPath = path.join(thecoachRepo, "local", "cursor_loop", "developer_todo.json");
+  try {
+    return fs.readFileSync(todoPath, "utf-8");
+  } catch (err) {
+    if (err && err.code === "ENOENT") return "[]";
+    throw err;
+  }
+}
+
+function buildRoadmapScanPrompt(roadmapContent, todoContent) {
+  return `You are deciding whether the coordinator should queue the next piece of TheCoach work.
+
+You are given two read-only inputs:
+1) ROADMAP.md at origin/staging:_SSoT/ROADMAP.md (the commit dispatched work will run against — not a working-tree file)
+2) developer_todo.json (open developer decisions / blockers)
+
+Reply with ONLY one JSON object, nothing else — no prose before or after, no markdown fences, no trailing commentary. Exactly one of these three shapes:
+
+{"decision":"dispatch","title":"<short task title>","description":"<what to build, specific enough for a dev agent to act on without more context>","roadmap_ref":"<which phase/line this came from, quoted or closely paraphrased>"}
+
+{"decision":"needs-developer-decision","todo_id":"<matching developer_todo.json id if there is one, else null>","summary":"<one line: what's blocking, and on whom>"}
+
+{"decision":"nothing-to-do"}
+
+Rules:
+- "dispatch" is only correct for work that is well-defined AND already decided — no open product/design choice, no explicit "deferred"/"blocked on"/"needs sign-off" language in the roadmap text itself, and not matching an open entry in developer_todo.json.
+- When genuinely uncertain whether something needs a developer decision, choose "needs-developer-decision", not "dispatch". A missed dispatch costs one idle cycle; a wrong dispatch costs a whole run plus review time.
+- Reason across the roadmap top-to-bottom. You MAY skip a blocked/deferred item and continue looking for the next phase's actionable work rather than stopping at the first incomplete phase.
+- Dispatch only the first thing you find that is genuinely ready. Do not queue multiple items in one scan.
+
+--- ROADMAP.md (origin/staging:_SSoT/ROADMAP.md) ---
+${roadmapContent}
+
+--- developer_todo.json ---
+${todoContent}
+`;
+}
+
+function isNonEmptyString(value) {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+/**
+ * Strict parse of the agent's final text reply. Rejects extra keys, missing
+ * fields, non-objects, and anything that isn't exactly one of the three shapes.
+ */
+function parseAgentDecision(text) {
+  let parsed;
+  try {
+    parsed = JSON.parse(String(text).trim());
+  } catch (err) {
+    return { ok: false, error: `agent reply is not JSON: ${err.message}` };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, error: "agent reply is not a JSON object" };
+  }
+  const keys = Object.keys(parsed).sort();
+  const decision = parsed.decision;
+  if (decision === "dispatch") {
+    if (keys.join(",") !== "decision,description,roadmap_ref,title") {
+      return { ok: false, error: `dispatch object has unexpected keys: ${keys.join(",")}` };
+    }
+    if (!isNonEmptyString(parsed.title) || !isNonEmptyString(parsed.description) || !isNonEmptyString(parsed.roadmap_ref)) {
+      return { ok: false, error: "dispatch is missing a required non-empty string field" };
+    }
+    return { ok: true, decision: parsed };
+  }
+  if (decision === "needs-developer-decision") {
+    if (keys.join(",") !== "decision,summary,todo_id") {
+      return { ok: false, error: `needs-developer-decision object has unexpected keys: ${keys.join(",")}` };
+    }
+    if (parsed.todo_id !== null && !isNonEmptyString(parsed.todo_id)) {
+      return { ok: false, error: "todo_id must be a non-empty string or null" };
+    }
+    if (!isNonEmptyString(parsed.summary)) {
+      return { ok: false, error: "summary must be a non-empty string" };
+    }
+    return { ok: true, decision: parsed };
+  }
+  if (decision === "nothing-to-do") {
+    if (keys.join(",") !== "decision") {
+      return { ok: false, error: `nothing-to-do object has unexpected keys: ${keys.join(",")}` };
+    }
+    return { ok: true, decision: parsed };
+  }
+  return { ok: false, error: `unknown decision: ${JSON.stringify(decision)}` };
+}
+
+/**
+ * Pull the agent's final text out of `openclaw agent --json` stdout.
+ * Gateway-backed shape uses payloads[].text; exec-style uses `final`.
+ */
+function extractAgentReplyText(stdout) {
+  const raw = String(stdout || "").trim();
+  if (!raw) throw new Error("openclaw agent produced empty stdout");
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`openclaw agent stdout is not JSON: ${err.message}`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("openclaw agent JSON is not an object");
+  }
+  if (parsed.ok === false || parsed.status === "error" || parsed.status === "timeout") {
+    const msg = parsed.error?.message || parsed.status || "not ok";
+    throw new Error(`openclaw agent status is ${msg}`);
+  }
+  if (typeof parsed.final === "string" && parsed.final.trim()) return parsed.final.trim();
+  if (Array.isArray(parsed.payloads)) {
+    const text = parsed.payloads
+      .map((p) => (p && typeof p.text === "string" ? p.text : ""))
+      .join("")
+      .trim();
+    if (text) return text;
+  }
+  if (parsed.result && typeof parsed.result === "object") {
+    const nested = parsed.result;
+    if (typeof nested.final === "string" && nested.final.trim()) return nested.final.trim();
+    if (Array.isArray(nested.payloads)) {
+      const text = nested.payloads
+        .map((p) => (p && typeof p.text === "string" ? p.text : ""))
+        .join("")
+        .trim();
+      if (text) return text;
+    }
+  }
+  throw new Error("openclaw agent JSON has no agent text reply");
+}
+
+function runPlannerAgentTurn(prompt) {
+  const tmpFile = path.join(
+    os.tmpdir(),
+    `coordinator-roadmap-scan-${process.pid}-${crypto.randomBytes(4).toString("hex")}.txt`,
+  );
+  const sessionKey = `roadmap-scan-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+  fs.writeFileSync(tmpFile, prompt, "utf-8");
+  return new Promise((resolve, reject) => {
+    execFile(
+      "openclaw",
+      [
+        "agent",
+        "--agent",
+        PLANNER_AGENT_ID,
+        "--session-key",
+        sessionKey,
+        "--model",
+        PLANNER_MODEL,
+        "--message-file",
+        tmpFile,
+        "--timeout",
+        String(PLANNER_CLI_TIMEOUT_SEC),
+        "--json",
+      ],
+      { timeout: PLANNER_EXEC_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        try {
+          fs.unlinkSync(tmpFile);
+        } catch {
+          // ignore cleanup failure
+        }
+        if (err) {
+          const detail = stderr ? ` — ${String(stderr).trim()}` : "";
+          return reject(new Error(`openclaw agent failed: ${err.message}${detail}`));
+        }
+        resolve(stdout);
+      },
+    );
+  }).catch((err) => {
+    try {
+      fs.unlinkSync(tmpFile);
+    } catch {
+      // already cleaned up, or never created
+    }
+    throw err;
+  });
+}
+
+/**
+ * Empty-queue scan. Fail-open: any error becomes { outcome: "queue-empty", failReason }.
+ * ROADMAP.md is read via git show origin/staging:... on DEFAULT_QUEUE_REPO_PATH
+ * after the same fetchOriginStagingTip dispatch-next already uses — never from
+ * COORDINATOR_THECOACH_REPO or a working-tree file.
+ */
+async function scanRoadmapForWork(deps = {}) {
+  const fetchStaging = deps.fetchStaging || fetchOriginStagingTip;
+  const showRoadmap = deps.showRoadmap || ((repoPath) => gitShowOriginStagingFile(repoPath, ROADMAP_GIT_PATH));
+  const readTodo = deps.readTodo || readDeveloperTodoFile;
+  const runAgent = deps.runAgent || runPlannerAgentTurn;
+  const thecoachRepo = deps.thecoachRepo !== undefined ? deps.thecoachRepo : THECOACH_REPO;
+  const repoPath = deps.repoPath || DEFAULT_QUEUE_REPO_PATH;
+
+  try {
+    if (!thecoachRepo) {
+      return { outcome: "queue-empty", failReason: "COORDINATOR_THECOACH_REPO is unset" };
+    }
+    await fetchStaging(repoPath);
+    const roadmap = await showRoadmap(repoPath);
+    const todo = readTodo(thecoachRepo);
+    const prompt = buildRoadmapScanPrompt(roadmap, todo);
+    const cliStdout = await runAgent(prompt);
+    const replyText = extractAgentReplyText(cliStdout);
+    const parsed = parseAgentDecision(replyText);
+    if (!parsed.ok) {
+      return { outcome: "queue-empty", failReason: parsed.error };
+    }
+    if (parsed.decision.decision === "dispatch") {
+      return { outcome: "dispatch", decision: parsed.decision };
+    }
+    if (parsed.decision.decision === "needs-developer-decision") {
+      return { outcome: "needs-developer-decision", decision: parsed.decision };
+    }
+    return { outcome: "queue-empty" };
+  } catch (err) {
+    return { outcome: "queue-empty", failReason: err?.message || String(err) };
+  }
+}
+
 function buildQueuedTaskText({ repoPath, branch, task }) {
   return `REPO: ${repoPath}\nBRANCH: ${branch}\n\n${task}`;
+}
+
+/**
+ * Core of POST /queue/dispatch-next. Injectors exist so --self-test-roadmap-scan
+ * can cover empty-queue scan outcomes without spawning a real workflow.
+ */
+async function handleDispatchNext(deps = {}) {
+  const findActive = deps.findActive || findActiveThecoachRun;
+  const load = deps.load || loadQueue;
+  const save = deps.save || saveQueue;
+  const scan = deps.scan || scanRoadmapForWork;
+  const repoExists = deps.repoExists || ((p) => fs.existsSync(p));
+  const fetchStaging = deps.fetchStaging || fetchOriginStagingTip;
+  const startRun = deps.startRun || startWorkflowRun;
+  const waitRun = deps.waitRun || waitForAntfarmRunId;
+
+  const active = findActive();
+  if (active) {
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        dispatched: false,
+        reason: "run in progress",
+        activeRunId: active.id,
+        activeStatus: active.status,
+        activeRunNumber: active.run_number ?? null,
+      },
+    };
+  }
+
+  let queue = load();
+  let idx = queue.findIndex((it) => it.status === "pending");
+  if (idx < 0) {
+    let scanResult;
+    try {
+      scanResult = await scan();
+    } catch (err) {
+      logDispatchNextError(`roadmap scan failed; falling back to queue empty: ${err?.message || String(err)}`);
+      return { status: 200, body: { ok: true, dispatched: false, reason: "queue empty" } };
+    }
+    if (scanResult.outcome === "dispatch") {
+      const d = scanResult.decision;
+      const autoItem = buildQueueItem({
+        task: `${d.title}\n\n${d.description}`,
+        repoPath: DEFAULT_QUEUE_REPO_PATH,
+        source: ROADMAP_AUTO_SOURCE,
+        roadmap_ref: d.roadmap_ref,
+      });
+      queue.push(autoItem);
+      save(queue);
+      idx = queue.length - 1;
+      logDispatchNext(`roadmap auto-queued ${autoItem.id} ref=${d.roadmap_ref}`);
+    } else if (scanResult.outcome === "needs-developer-decision") {
+      const d = scanResult.decision;
+      logDispatchNext(`needs-developer-decision todo_id=${JSON.stringify(d.todo_id)} summary=${d.summary}`);
+      return {
+        status: 200,
+        body: {
+          ok: true,
+          dispatched: false,
+          reason: "needs-developer-decision",
+          todo_id: d.todo_id,
+          summary: d.summary,
+        },
+      };
+    } else {
+      if (scanResult.failReason) {
+        logDispatchNextError(`roadmap scan failed; falling back to queue empty: ${scanResult.failReason}`);
+      }
+      return { status: 200, body: { ok: true, dispatched: false, reason: "queue empty" } };
+    }
+  }
+
+  const item = queue[idx];
+
+  if (!repoExists(item.repoPath)) {
+    return { status: 400, body: { ok: false, error: `repoPath does not exist: ${item.repoPath}` } };
+  }
+
+  let stagingTip;
+  try {
+    stagingTip = await fetchStaging(item.repoPath);
+  } catch (err) {
+    return { status: 500, body: { ok: false, error: err?.message || String(err) } };
+  }
+
+  const branch = `feature/thecoach-dev-coordinator-${item.id}`;
+  const taskText = buildQueuedTaskText({
+    repoPath: item.repoPath,
+    branch,
+    task: item.task,
+  });
+
+  let spawnResult;
+  try {
+    spawnResult = startRun({ workflow: DEFAULT_WORKFLOW, task: taskText });
+  } catch (err) {
+    return { status: 500, body: { ok: false, error: err?.message || String(err) } };
+  }
+
+  const antfarmRun = await waitRun(taskText);
+  if (!antfarmRun) {
+    return {
+      status: 504,
+      body: {
+        ok: false,
+        error: "workflow spawn started but antfarm run id not observed in DB within timeout",
+        spawnLogId: spawnResult.id,
+        logPath: spawnResult.logPath,
+        stagingTip,
+        branch,
+      },
+    };
+  }
+
+  item.status = "dispatched";
+  item.runId = antfarmRun.id;
+  item.dispatchedAt = new Date().toISOString();
+  item.note = `dispatched; staging tip ${stagingTip}; branch ${branch}; antfarm run #${antfarmRun.run_number}`;
+  item.branch = branch;
+  item.stagingTip = stagingTip;
+  save(queue);
+
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      dispatched: true,
+      runId: antfarmRun.id,
+      runNumber: antfarmRun.run_number,
+      branch,
+      stagingTip,
+      spawnLogId: spawnResult.id,
+      item,
+    },
+  };
 }
 
 function verifyRunOwnership(stepsResult) {
@@ -741,105 +1169,14 @@ const server = http.createServer(async (req, res) => {
     if (!task) return json(res, { ok: false, error: "'task' (string) is required" }, 400);
     if (!repoPath) return json(res, { ok: false, error: "'repoPath' (string) is required" }, 400);
 
-    const item = {
-      id: newQueueItemId(),
-      task,
-      repoPath,
-      branchHint: branchHint || null,
-      status: "pending",
-      runId: null,
-      createdAt: new Date().toISOString(),
-      dispatchedAt: null,
-      resolvedAt: null,
-      note: null,
-    };
-    const queue = loadQueue();
-    queue.push(item);
-    saveQueue(queue);
+    const item = enqueueQueueItem({ task, repoPath, branchHint });
     return json(res, { ok: true, item }, 201);
   }
 
   if (p === "/queue/dispatch-next" && req.method === "POST") {
     if (!requireAuth(req, res, "POST", "/queue/dispatch-next")) return;
-
-    const active = findActiveThecoachRun();
-    if (active) {
-      return json(res, {
-        ok: true,
-        dispatched: false,
-        reason: "run in progress",
-        activeRunId: active.id,
-        activeStatus: active.status,
-        activeRunNumber: active.run_number ?? null,
-      });
-    }
-
-    const queue = loadQueue();
-    const idx = queue.findIndex((it) => it.status === "pending");
-    if (idx < 0) {
-      return json(res, { ok: true, dispatched: false, reason: "queue empty" });
-    }
-    const item = queue[idx];
-
-    if (!fs.existsSync(item.repoPath)) {
-      return json(res, { ok: false, error: `repoPath does not exist: ${item.repoPath}` }, 400);
-    }
-
-    let stagingTip;
-    try {
-      stagingTip = await fetchOriginStagingTip(item.repoPath);
-    } catch (err) {
-      return json(res, { ok: false, error: err?.message || String(err) }, 500);
-    }
-
-    const branch = `feature/thecoach-dev-coordinator-${item.id}`;
-    const taskText = buildQueuedTaskText({
-      repoPath: item.repoPath,
-      branch,
-      task: item.task,
-    });
-
-    let spawnResult;
-    try {
-      spawnResult = startWorkflowRun({ workflow: DEFAULT_WORKFLOW, task: taskText });
-    } catch (err) {
-      return json(res, { ok: false, error: err?.message || String(err) }, 500);
-    }
-
-    const antfarmRun = await waitForAntfarmRunId(taskText);
-    if (!antfarmRun) {
-      return json(
-        res,
-        {
-          ok: false,
-          error: "workflow spawn started but antfarm run id not observed in DB within timeout",
-          spawnLogId: spawnResult.id,
-          logPath: spawnResult.logPath,
-          stagingTip,
-          branch,
-        },
-        504,
-      );
-    }
-
-    item.status = "dispatched";
-    item.runId = antfarmRun.id;
-    item.dispatchedAt = new Date().toISOString();
-    item.note = `dispatched; staging tip ${stagingTip}; branch ${branch}; antfarm run #${antfarmRun.run_number}`;
-    item.branch = branch;
-    item.stagingTip = stagingTip;
-    saveQueue(queue);
-
-    return json(res, {
-      ok: true,
-      dispatched: true,
-      runId: antfarmRun.id,
-      runNumber: antfarmRun.run_number,
-      branch,
-      stagingTip,
-      spawnLogId: spawnResult.id,
-      item,
-    });
+    const result = await handleDispatchNext();
+    return json(res, result.body, result.status);
   }
 
   if (p === "/queue/check" && req.method === "GET") {
@@ -1059,11 +1396,375 @@ if (process.argv.includes("--self-test-auth-matrix")) {
   process.exit(0);
 }
 
+// Roadmap empty-queue scan — fixtures + injected handleDispatchNext.
+// Does not bind the port, does not spawn workflows, does not touch the live
+// queue file. Invoke:
+//   COORDINATOR_TOKEN=x node local-tools/coordinator-trigger.mjs --self-test-roadmap-scan
+if (process.argv.includes("--self-test-roadmap-scan")) {
+  const failures = [];
+
+  function check(label, cond, detail) {
+    if (!cond) failures.push({ label, detail });
+    return { case: label, ok: Boolean(cond), detail: cond ? null : detail };
+  }
+
+  function memoryQueue(initial = []) {
+    let q = initial;
+    return {
+      load: () => q,
+      save: (next) => {
+        q = next;
+      },
+      get: () => q,
+    };
+  }
+
+  const dispatchReply = {
+    decision: "dispatch",
+    title: "Add reliability note",
+    description: "Write the Phase 4 reliability paragraph into README.md",
+    roadmap_ref: "Phase 4 / reliability patch acceptance",
+  };
+  const needsReply = {
+    decision: "needs-developer-decision",
+    todo_id: "todo-42",
+    summary: "Blocked on Lahad: product copy for the empty-state CTA",
+  };
+
+  const parseCases = [
+    check("parse-dispatch", parseAgentDecision(JSON.stringify(dispatchReply)).ok === true),
+    check(
+      "parse-needs-developer-decision",
+      parseAgentDecision(JSON.stringify(needsReply)).ok === true &&
+        parseAgentDecision(JSON.stringify(needsReply)).decision.todo_id === "todo-42",
+    ),
+    check("parse-nothing-to-do", parseAgentDecision('{"decision":"nothing-to-do"}').ok === true),
+    check("parse-todo-id-null", parseAgentDecision('{"decision":"needs-developer-decision","todo_id":null,"summary":"Blocked on whom: unknown"}').ok === true),
+    check("reject-extra-prose", parseAgentDecision(`Sure.\n${JSON.stringify(dispatchReply)}`).ok === false),
+    check("reject-markdown-fence", parseAgentDecision("```json\n{\"decision\":\"nothing-to-do\"}\n```").ok === false),
+    check("reject-unknown-decision", parseAgentDecision('{"decision":"maybe"}').ok === false),
+    check("reject-dispatch-missing-title", parseAgentDecision(JSON.stringify({ decision: "dispatch", description: "x", roadmap_ref: "y" })).ok === false),
+    check("reject-dispatch-extra-key", parseAgentDecision(JSON.stringify({ ...dispatchReply, extra: true })).ok === false),
+    check("reject-empty-string-field", parseAgentDecision(JSON.stringify({ ...dispatchReply, title: "  " })).ok === false),
+  ];
+
+  const extractCases = [
+    check(
+      "extract-payloads-text",
+      extractAgentReplyText(JSON.stringify({ payloads: [{ text: JSON.stringify(dispatchReply) }] })) ===
+        JSON.stringify(dispatchReply),
+    ),
+    check(
+      "extract-final",
+      extractAgentReplyText(JSON.stringify({ ok: true, status: "ok", final: '{"decision":"nothing-to-do"}' })) ===
+        '{"decision":"nothing-to-do"}',
+    ),
+    check("extract-empty-throws", (() => {
+      try {
+        extractAgentReplyText("");
+        return false;
+      } catch {
+        return true;
+      }
+    })()),
+    check("extract-status-error-throws", (() => {
+      try {
+        extractAgentReplyText(JSON.stringify({ ok: false, status: "error", error: { message: "nope" } }));
+        return false;
+      } catch {
+        return true;
+      }
+    })()),
+  ];
+
+  const dispatchMocks = () => ({
+    findActive: () => null,
+    repoExists: () => true,
+    fetchStaging: async () => "staging-tip-abc",
+    startRun: ({ workflow, task }) => {
+      dispatchMocks.started.push({ workflow, task });
+      return { id: "spawn-log-1", pid: 1, logPath: "/tmp/spawn-log-1.log" };
+    },
+    waitRun: async () => ({ id: "run-uuid-1", status: "running", run_number: 9 }),
+  });
+  dispatchMocks.started = [];
+
+  const mqDispatch = memoryQueue([]);
+  let scanCalledOnDispatch = 0;
+  const dispatchResult = await handleDispatchNext({
+    ...dispatchMocks(),
+    load: mqDispatch.load,
+    save: mqDispatch.save,
+    scan: async () => {
+      scanCalledOnDispatch += 1;
+      return { outcome: "dispatch", decision: dispatchReply };
+    },
+  });
+  const dispatchedItem = dispatchResult.body.item;
+  const dispatchCases = [
+    check("1-status-200", dispatchResult.status === 200, dispatchResult.status),
+    check("1-dispatched-true", dispatchResult.body.dispatched === true),
+    check("1-scan-ran-once", scanCalledOnDispatch === 1, scanCalledOnDispatch),
+    check("1-startRun-called", dispatchMocks.started.length === 1, dispatchMocks.started.length),
+    check("1-source", dispatchedItem?.source === ROADMAP_AUTO_SOURCE, dispatchedItem?.source),
+    check("1-roadmap-ref", dispatchedItem?.roadmap_ref === dispatchReply.roadmap_ref, dispatchedItem?.roadmap_ref),
+    check(
+      "1-repoPath-is-trial-clone",
+      dispatchedItem?.repoPath === DEFAULT_QUEUE_REPO_PATH,
+      dispatchedItem?.repoPath,
+    ),
+    check(
+      "1-repoPath-is-not-thecoach-env",
+      dispatchedItem?.repoPath !== "/mnt/c/Users/lahad/Projects/TheCoach",
+      dispatchedItem?.repoPath,
+    ),
+    check("1-queue-item-dispatched", dispatchedItem?.status === "dispatched", dispatchedItem?.status),
+    check(
+      "1-task-contains-title-and-description",
+      typeof dispatchedItem?.task === "string" &&
+        dispatchedItem.task.includes(dispatchReply.title) &&
+        dispatchedItem.task.includes(dispatchReply.description),
+      dispatchedItem?.task,
+    ),
+    check(
+      "1-startRun-task-uses-trial-clone",
+      dispatchMocks.started[0]?.task?.includes(`REPO: ${DEFAULT_QUEUE_REPO_PATH}`),
+      dispatchMocks.started[0]?.task,
+    ),
+  ];
+
+  const mqNeeds = memoryQueue([]);
+  let startRunOnNeeds = 0;
+  const needsResult = await handleDispatchNext({
+    findActive: () => null,
+    load: mqNeeds.load,
+    save: mqNeeds.save,
+    scan: async () => ({ outcome: "needs-developer-decision", decision: needsReply }),
+    repoExists: () => true,
+    fetchStaging: async () => {
+      throw new Error("fetchStaging must not run");
+    },
+    startRun: () => {
+      startRunOnNeeds += 1;
+      throw new Error("startRun must not run");
+    },
+    waitRun: async () => {
+      throw new Error("waitRun must not run");
+    },
+  });
+  const needsCases = [
+    check("2-status-200", needsResult.status === 200, needsResult.status),
+    check("2-dispatched-false", needsResult.body.dispatched === false),
+    check("2-reason", needsResult.body.reason === "needs-developer-decision", needsResult.body.reason),
+    check("2-todo-id", needsResult.body.todo_id === "todo-42", needsResult.body.todo_id),
+    check("2-summary", needsResult.body.summary === needsReply.summary, needsResult.body.summary),
+    check("2-no-queue-item", mqNeeds.get().length === 0, mqNeeds.get().length),
+    check("2-startRun-not-called", startRunOnNeeds === 0, startRunOnNeeds),
+  ];
+
+  const mqNothing = memoryQueue([]);
+  const nothingResult = await handleDispatchNext({
+    findActive: () => null,
+    load: mqNothing.load,
+    save: mqNothing.save,
+    scan: async () => ({ outcome: "queue-empty" }),
+    startRun: () => {
+      throw new Error("startRun must not run");
+    },
+  });
+  const nothingCases = [
+    check("3-status-200", nothingResult.status === 200),
+    check("3-body-identical-to-queue-empty", JSON.stringify(nothingResult.body) === JSON.stringify({ ok: true, dispatched: false, reason: "queue empty" }), JSON.stringify(nothingResult.body)),
+    check("3-no-queue-item", mqNothing.get().length === 0),
+  ];
+
+  const failOpenScans = [];
+  failOpenScans.push(
+    await scanRoadmapForWork({
+      thecoachRepo: "/tmp/thecoach-does-not-matter",
+      fetchStaging: async () => "tip",
+      showRoadmap: async () => "# ROADMAP",
+      readTodo: () => "[]",
+      runAgent: async () => {
+        const err = new Error("openclaw agent failed: spawn ETIMEDOUT");
+        err.code = "ETIMEDOUT";
+        throw err;
+      },
+    }),
+  );
+  failOpenScans.push(
+    await scanRoadmapForWork({
+      thecoachRepo: "/tmp/thecoach-does-not-matter",
+      fetchStaging: async () => "tip",
+      showRoadmap: async () => "# ROADMAP",
+      readTodo: () => "[]",
+      runAgent: async () => {
+        throw new Error("openclaw agent failed: Command failed: openclaw agent");
+      },
+    }),
+  );
+  failOpenScans.push(
+    await scanRoadmapForWork({
+      thecoachRepo: "/tmp/thecoach-does-not-matter",
+      fetchStaging: async () => "tip",
+      showRoadmap: async () => "# ROADMAP",
+      readTodo: () => "[]",
+      runAgent: async () => "this is not json {",
+    }),
+  );
+  failOpenScans.push(
+    await scanRoadmapForWork({
+      thecoachRepo: "/tmp/thecoach-does-not-matter",
+      fetchStaging: async () => "tip",
+      showRoadmap: async () => "# ROADMAP",
+      readTodo: () => "[]",
+      runAgent: async () => JSON.stringify({ payloads: [{ text: "I think we should dispatch something." }] }),
+    }),
+  );
+  failOpenScans.push(
+    await scanRoadmapForWork({
+      thecoachRepo: "/tmp/thecoach-does-not-matter",
+      fetchStaging: async () => "tip",
+      showRoadmap: async () => {
+        throw new Error("git show origin/staging:_SSoT/ROADMAP.md failed: not found");
+      },
+      readTodo: () => "[]",
+      runAgent: async () => {
+        throw new Error("runAgent must not run after git show failure");
+      },
+    }),
+  );
+
+  const failOpenHttp = [];
+  for (const [i, scanResult] of failOpenScans.entries()) {
+    const mq = memoryQueue([]);
+    const httpResult = await handleDispatchNext({
+      findActive: () => null,
+      load: mq.load,
+      save: mq.save,
+      scan: async () => scanResult,
+      startRun: () => {
+        throw new Error("startRun must not run on fail-open");
+      },
+    });
+    failOpenHttp.push(
+      check(
+        `4-fail-open-${i}-http`,
+        httpResult.status === 200 &&
+          JSON.stringify(httpResult.body) === JSON.stringify({ ok: true, dispatched: false, reason: "queue empty" }) &&
+          mq.get().length === 0,
+        { status: httpResult.status, body: httpResult.body, queueLen: mq.get().length, failReason: scanResult.failReason },
+      ),
+    );
+  }
+  const failOpenScanOutcomes = failOpenScans.map((s, i) =>
+    check(`4-scan-${i}-queue-empty`, s.outcome === "queue-empty" && Boolean(s.failReason), s),
+  );
+
+  const humanItem = {
+    id: "human-pending-1",
+    task: "human submitted task",
+    repoPath: "/tmp/human-repo",
+    branchHint: null,
+    status: "pending",
+    runId: null,
+    createdAt: new Date().toISOString(),
+    dispatchedAt: null,
+    resolvedAt: null,
+    note: null,
+  };
+  const mqOccupied = memoryQueue([humanItem]);
+  let occupiedScanCalls = 0;
+  const occupiedStarted = [];
+  const occupiedResult = await handleDispatchNext({
+    findActive: () => null,
+    load: mqOccupied.load,
+    save: mqOccupied.save,
+    scan: async () => {
+      occupiedScanCalls += 1;
+      throw new Error("scan must not run when queue is not empty");
+    },
+    repoExists: () => true,
+    fetchStaging: async () => "occupied-tip",
+    startRun: ({ workflow, task }) => {
+      occupiedStarted.push({ workflow, task });
+      return { id: "spawn-human", pid: 2, logPath: "/tmp/spawn-human.log" };
+    },
+    waitRun: async () => ({ id: "run-human", status: "running", run_number: 3 }),
+  });
+  const occupiedCases = [
+    check("5-scan-never-ran", occupiedScanCalls === 0, occupiedScanCalls),
+    check("5-dispatched-true", occupiedResult.body.dispatched === true),
+    check("5-same-human-item", occupiedResult.body.item?.id === "human-pending-1", occupiedResult.body.item?.id),
+    check("5-no-auto-source", occupiedResult.body.item?.source === undefined, occupiedResult.body.item?.source),
+    check(
+      "5-task-is-human",
+      occupiedStarted[0]?.task?.includes("human submitted task"),
+      occupiedStarted[0]?.task,
+    ),
+  ];
+
+  const todoMissing = readDeveloperTodoFile(path.join(os.tmpdir(), `no-such-thecoach-${Date.now()}`));
+  const todoCases = [check("todo-missing-is-empty-array", todoMissing === "[]", todoMissing)];
+
+  const fetchedRepos = [];
+  const shownRepos = [];
+  const todoRepos = [];
+  const pathScan = await scanRoadmapForWork({
+    thecoachRepo: "/mnt/c/Users/lahad/Projects/TheCoach",
+    repoPath: DEFAULT_QUEUE_REPO_PATH,
+    fetchStaging: async (p) => {
+      fetchedRepos.push(p);
+      return "tip";
+    },
+    showRoadmap: async (p) => {
+      shownRepos.push(p);
+      return "# ROADMAP\n";
+    },
+    readTodo: (repo) => {
+      todoRepos.push(repo);
+      return "[]";
+    },
+    runAgent: async () => JSON.stringify({ payloads: [{ text: '{"decision":"nothing-to-do"}' }] }),
+  });
+  const pathCases = [
+    check("path-scan-queue-empty", pathScan.outcome === "queue-empty" && !pathScan.failReason, pathScan),
+    check("path-fetch-is-trial-clone", fetchedRepos[0] === DEFAULT_QUEUE_REPO_PATH, fetchedRepos),
+    check("path-show-is-trial-clone", shownRepos[0] === DEFAULT_QUEUE_REPO_PATH, shownRepos),
+    check("path-show-is-not-thecoach-env", shownRepos[0] !== "/mnt/c/Users/lahad/Projects/TheCoach", shownRepos),
+    check("path-todo-is-thecoach-env", todoRepos[0] === "/mnt/c/Users/lahad/Projects/TheCoach", todoRepos),
+    check("path-fetch-once", fetchedRepos.length === 1, fetchedRepos.length),
+  ];
+
+  const allCases = [
+    ...parseCases,
+    ...extractCases,
+    ...dispatchCases,
+    ...needsCases,
+    ...nothingCases,
+    ...failOpenScanOutcomes,
+    ...failOpenHttp,
+    ...occupiedCases,
+    ...todoCases,
+    ...pathCases,
+  ];
+
+  const report = {
+    ok: failures.length === 0,
+    failed: failures.length,
+    failures,
+    cases: allCases,
+  };
+  console.log(JSON.stringify(report, null, 2));
+  process.exit(failures.length === 0 ? 0 : 1);
+}
+
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`Coordinator trigger server: http://127.0.0.1:${PORT}`);
   console.log(`Antfarm root: ${ANTFARM_ROOT}`);
   console.log(`Antfarm CLI: ${ANTFARM_CLI}`);
   console.log(`Antfarm DB (read-only): ${ANTFARM_DB}`);
   console.log(`Queue file: ${QUEUE_PATH}`);
+  console.log(`TheCoach repo (todo only): ${THECOACH_REPO || "(unset)"}`);
   console.log(`Logs: ${LOG_DIR}`);
 });
