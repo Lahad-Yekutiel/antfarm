@@ -538,10 +538,13 @@ function fetchPrBaseRefName(prUrl) {
 
 /**
  * PR base gate using the workflow's named `pr` step as discriminator.
- * - pr step not successfully completed → no PR expected (not a failure).
- * - pr step completed but no URL in its output → PARSE FAILURE → flag.
+ * - pr step not successfully done → no PR expected (not a failure).
+ * - pr step done but no URL in its output → PARSE FAILURE → flag.
  * - URL found → gh base must be staging; gh errors → flag (never done).
  * `done` only when checked-and-correct, or positively no-PR-expected.
+ *
+ * Step-level status vocabulary is done/failed/pending/running/waiting
+ * (not run-level "completed").
  *
  * @param {object} stepsResult
  * @param {{ resolveBaseRef?: (url: string) => Promise<string> }} [opts]
@@ -550,12 +553,12 @@ function fetchPrBaseRefName(prUrl) {
 async function verifyPrBaseBranch(stepsResult, opts = {}) {
   const resolveBaseRef = opts.resolveBaseRef || fetchPrBaseRefName;
   const prStep = getPrStep(stepsResult);
-  const prSucceeded = Boolean(prStep && prStep.status === "completed");
+  const prSucceeded = Boolean(prStep && prStep.status === "done");
 
   if (!prSucceeded) {
     const why = !prStep
       ? "pr step absent from run"
-      : `pr step status is "${prStep.status}" (not completed) — no PR expected`;
+      : `pr step status is "${prStep.status}" (not done) — no PR expected`;
     return {
       noPr: true,
       noPrReason: why,
@@ -571,7 +574,7 @@ async function verifyPrBaseBranch(stepsResult, opts = {}) {
       noPrReason: null,
       mismatches: [
         {
-          reason: `unparseable PR URL: pr step completed but no GitHub PR URL matched in its output; output snippet: ${truncateForNote(prStep.output)}`,
+          reason: `unparseable PR URL: pr step done but no GitHub PR URL matched in its output; output snippet: ${truncateForNote(prStep.output)}`,
         },
       ],
       bases: [],
@@ -948,12 +951,12 @@ if (process.argv.includes("--self-test-pr-base-gate")) {
 
   const gateCases = await Promise.all([
     caseOutcome("pr-step-absent", [
-      { stepId: "implement", status: "completed", output: "done" },
+      { stepId: "implement", status: "done", output: "done" },
     ]),
     caseOutcome("pr-step-succeeded-but-unparseable", [
       {
         stepId: "pr",
-        status: "completed",
+        status: "done",
         output: "Opened a pull request but forgot the URL — see PR #42 against main.",
       },
     ]),
@@ -962,7 +965,7 @@ if (process.argv.includes("--self-test-pr-base-gate")) {
       [
         {
           stepId: "pr",
-          status: "completed",
+          status: "done",
           output: `PR ready: ${sampleUrl}`,
         },
       ],
@@ -973,7 +976,7 @@ if (process.argv.includes("--self-test-pr-base-gate")) {
       [
         {
           stepId: "pr",
-          status: "completed",
+          status: "done",
           output: `PR ready: ${sampleUrl}`,
         },
       ],
