@@ -19,10 +19,10 @@
 //     repo's `antfarm` isn't installed as a global command (only declared as
 //     a `bin` in package.json, never `npm link`ed), so it's invoked as
 //     `node dist/cli/cli.js ...` directly, same as config-dashboard.mjs does.
-//   COORDINATOR_THECOACH_REPO  Windows TheCoach checkout (WSL path). Used ONLY
-//     to read local/cursor_loop/developer_todo.json when the queue is empty.
-//     Never a default repoPath; never used to read ROADMAP.md. Unset → the
-//     empty-queue scan fails open (same as "queue empty").
+//   COORDINATOR_THECOACH_REPO  Windows TheCoach checkout (WSL path). Used to
+//     read _SSoT/ROADMAP.md and local/cursor_loop/developer_todo.json when the
+//     queue is empty. Never a default repoPath for dispatched work. Unset or
+//     unreadable files → the empty-queue scan fails open ("queue empty").
 
 import http from "node:http";
 import fs from "node:fs";
@@ -50,14 +50,19 @@ const QUEUE_PATH =
 const DEFAULT_WORKFLOW = "thecoach-dev";
 /** Trial clone dispatched work actually runs against. Not COORDINATOR_THECOACH_REPO. */
 const DEFAULT_QUEUE_REPO_PATH = "/home/lahad/trials/thecoach-antfarm-trial";
-const ROADMAP_GIT_PATH = "_SSoT/ROADMAP.md";
+const ROADMAP_RELATIVE_PATH = path.join("_SSoT", "ROADMAP.md");
+const TODO_RELATIVE_PATH = path.join("local", "cursor_loop", "developer_todo.json");
 const ROADMAP_AUTO_SOURCE = "coordinator:roadmap-auto";
-/** Windows checkout — developer_todo.json only. Loaded from EnvironmentFile, never a unit Environment= line. */
+/** Windows checkout — judgment inputs only. Loaded from EnvironmentFile, never a unit Environment= line. */
 const THECOACH_REPO = (process.env.COORDINATOR_THECOACH_REPO || "").trim();
 const PLANNER_AGENT_ID = "thecoach-dev_planner";
 const PLANNER_MODEL = "anthropic/claude-sonnet-5";
-const PLANNER_CLI_TIMEOUT_SEC = 75;
-const PLANNER_EXEC_TIMEOUT_MS = 75_000;
+// Measured live scan latency is 74–80s. Named-tunnel 524 empirically fires at
+// ~125.3s (120s request survived; 128s request returned HTTP 524). CLI timeout
+// sits above the 80s band; execFile timeout sits a few seconds above the CLI
+// so the CLI's own --timeout can fire cleanly. Both stay under the 125s ceiling.
+const PLANNER_CLI_TIMEOUT_SEC = 100;
+const PLANNER_EXEC_TIMEOUT_MS = 105_000;
 
 /** Expected ownership by workflow step_id — the delegation-authenticity map. */
 const EXPECTED_OWNERSHIP = {
@@ -478,42 +483,25 @@ function fetchOriginStagingTip(repoPath) {
   });
 }
 
-function gitShowOriginStagingFile(repoPath, gitPath) {
-  return new Promise((resolve, reject) => {
-    execFile(
-      "git",
-      ["-C", repoPath, "show", `origin/staging:${gitPath}`],
-      { timeout: 15_000, maxBuffer: 10 * 1024 * 1024 },
-      (err, stdout, stderr) => {
-        if (err) {
-          return reject(
-            new Error(
-              `git show origin/staging:${gitPath} failed: ${err.message}${stderr ? ` — ${String(stderr).trim()}` : ""}`,
-            ),
-          );
-        }
-        resolve(stdout);
-      },
-    );
-  });
+function readTheCoachJudgmentFile(thecoachRepo, relativePath) {
+  const filePath = path.join(thecoachRepo, relativePath);
+  return fs.readFileSync(filePath, "utf-8");
+}
+
+function readRoadmapFile(thecoachRepo) {
+  return readTheCoachJudgmentFile(thecoachRepo, ROADMAP_RELATIVE_PATH);
 }
 
 function readDeveloperTodoFile(thecoachRepo) {
-  const todoPath = path.join(thecoachRepo, "local", "cursor_loop", "developer_todo.json");
-  try {
-    return fs.readFileSync(todoPath, "utf-8");
-  } catch (err) {
-    if (err && err.code === "ENOENT") return "[]";
-    throw err;
-  }
+  return readTheCoachJudgmentFile(thecoachRepo, TODO_RELATIVE_PATH);
 }
 
 function buildRoadmapScanPrompt(roadmapContent, todoContent) {
   return `You are deciding whether the coordinator should queue the next piece of TheCoach work.
 
-You are given two read-only inputs:
-1) ROADMAP.md at origin/staging:_SSoT/ROADMAP.md (the commit dispatched work will run against — not a working-tree file)
-2) developer_todo.json (open developer decisions / blockers)
+You are given two read-only inputs from the Windows TheCoach checkout working tree (not a git ref — ROADMAP.md is a manual hand-merge):
+1) _SSoT/ROADMAP.md
+2) local/cursor_loop/developer_todo.json (open developer decisions / blockers)
 
 Reply with ONLY one JSON object, nothing else — no prose before or after, no markdown fences, no trailing commentary. Exactly one of these three shapes:
 
@@ -525,11 +513,12 @@ Reply with ONLY one JSON object, nothing else — no prose before or after, no m
 
 Rules:
 - "dispatch" is only correct for work that is well-defined AND already decided — no open product/design choice, no explicit "deferred"/"blocked on"/"needs sign-off" language in the roadmap text itself, and not matching an open entry in developer_todo.json.
+- Open items in developer_todo.json are blockers, not a backlog to skip. If any open entry exists whose source/summary refers to a current or earlier incomplete phase (especially type "roadmap-decision"), you MUST return needs-developer-decision for that todo_id rather than dispatching later-phase work.
 - When genuinely uncertain whether something needs a developer decision, choose "needs-developer-decision", not "dispatch". A missed dispatch costs one idle cycle; a wrong dispatch costs a whole run plus review time.
-- Reason across the roadmap top-to-bottom. You MAY skip a blocked/deferred item and continue looking for the next phase's actionable work rather than stopping at the first incomplete phase.
+- Reason across the roadmap top-to-bottom. You MAY skip a blocked/deferred roadmap checkbox and continue looking for the next phase's actionable work — but only when that checkbox is NOT represented by an open developer_todo.json entry.
 - Dispatch only the first thing you find that is genuinely ready. Do not queue multiple items in one scan.
 
---- ROADMAP.md (origin/staging:_SSoT/ROADMAP.md) ---
+--- ROADMAP.md (_SSoT/ROADMAP.md working tree) ---
 ${roadmapContent}
 
 --- developer_todo.json ---
@@ -679,24 +668,21 @@ function runPlannerAgentTurn(prompt) {
 
 /**
  * Empty-queue scan. Fail-open: any error becomes { outcome: "queue-empty", failReason }.
- * ROADMAP.md is read via git show origin/staging:... on DEFAULT_QUEUE_REPO_PATH
- * after the same fetchOriginStagingTip dispatch-next already uses — never from
- * COORDINATOR_THECOACH_REPO or a working-tree file.
+ * ROADMAP.md and developer_todo.json are both read from COORDINATOR_THECOACH_REPO
+ * (working tree). Missing or unreadable files fail the scan — never substitute
+ * empty content. Dispatched work still uses DEFAULT_QUEUE_REPO_PATH.
  */
 async function scanRoadmapForWork(deps = {}) {
-  const fetchStaging = deps.fetchStaging || fetchOriginStagingTip;
-  const showRoadmap = deps.showRoadmap || ((repoPath) => gitShowOriginStagingFile(repoPath, ROADMAP_GIT_PATH));
+  const readRoadmap = deps.readRoadmap || readRoadmapFile;
   const readTodo = deps.readTodo || readDeveloperTodoFile;
   const runAgent = deps.runAgent || runPlannerAgentTurn;
   const thecoachRepo = deps.thecoachRepo !== undefined ? deps.thecoachRepo : THECOACH_REPO;
-  const repoPath = deps.repoPath || DEFAULT_QUEUE_REPO_PATH;
 
   try {
     if (!thecoachRepo) {
       return { outcome: "queue-empty", failReason: "COORDINATOR_THECOACH_REPO is unset" };
     }
-    await fetchStaging(repoPath);
-    const roadmap = await showRoadmap(repoPath);
+    const roadmap = readRoadmap(thecoachRepo);
     const todo = readTodo(thecoachRepo);
     const prompt = buildRoadmapScanPrompt(roadmap, todo);
     const cliStdout = await runAgent(prompt);
@@ -1582,8 +1568,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   failOpenScans.push(
     await scanRoadmapForWork({
       thecoachRepo: "/tmp/thecoach-does-not-matter",
-      fetchStaging: async () => "tip",
-      showRoadmap: async () => "# ROADMAP",
+      readRoadmap: () => "# ROADMAP",
       readTodo: () => "[]",
       runAgent: async () => {
         const err = new Error("openclaw agent failed: spawn ETIMEDOUT");
@@ -1595,8 +1580,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   failOpenScans.push(
     await scanRoadmapForWork({
       thecoachRepo: "/tmp/thecoach-does-not-matter",
-      fetchStaging: async () => "tip",
-      showRoadmap: async () => "# ROADMAP",
+      readRoadmap: () => "# ROADMAP",
       readTodo: () => "[]",
       runAgent: async () => {
         throw new Error("openclaw agent failed: Command failed: openclaw agent");
@@ -1606,8 +1590,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   failOpenScans.push(
     await scanRoadmapForWork({
       thecoachRepo: "/tmp/thecoach-does-not-matter",
-      fetchStaging: async () => "tip",
-      showRoadmap: async () => "# ROADMAP",
+      readRoadmap: () => "# ROADMAP",
       readTodo: () => "[]",
       runAgent: async () => "this is not json {",
     }),
@@ -1615,8 +1598,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   failOpenScans.push(
     await scanRoadmapForWork({
       thecoachRepo: "/tmp/thecoach-does-not-matter",
-      fetchStaging: async () => "tip",
-      showRoadmap: async () => "# ROADMAP",
+      readRoadmap: () => "# ROADMAP",
       readTodo: () => "[]",
       runAgent: async () => JSON.stringify({ payloads: [{ text: "I think we should dispatch something." }] }),
     }),
@@ -1624,13 +1606,20 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   failOpenScans.push(
     await scanRoadmapForWork({
       thecoachRepo: "/tmp/thecoach-does-not-matter",
-      fetchStaging: async () => "tip",
-      showRoadmap: async () => {
-        throw new Error("git show origin/staging:_SSoT/ROADMAP.md failed: not found");
+      readRoadmap: () => {
+        throw new Error("ENOENT: no such file or directory, open '.../_SSoT/ROADMAP.md'");
       },
       readTodo: () => "[]",
       runAgent: async () => {
-        throw new Error("runAgent must not run after git show failure");
+        throw new Error("runAgent must not run after ROADMAP.md read failure");
+      },
+    }),
+  );
+  failOpenScans.push(
+    await scanRoadmapForWork({
+      thecoachRepo: path.join(os.tmpdir(), `no-such-thecoach-${Date.now()}`),
+      runAgent: async () => {
+        throw new Error("runAgent must not run after developer_todo.json ENOENT");
       },
     }),
   );
@@ -1704,36 +1693,53 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     ),
   ];
 
-  const todoMissing = readDeveloperTodoFile(path.join(os.tmpdir(), `no-such-thecoach-${Date.now()}`));
-  const todoCases = [check("todo-missing-is-empty-array", todoMissing === "[]", todoMissing)];
+  const missingRepo = path.join(os.tmpdir(), `no-such-thecoach-${Date.now()}`);
+  let todoMissingThrew = false;
+  let todoMissingCode = null;
+  try {
+    readDeveloperTodoFile(missingRepo);
+  } catch (err) {
+    todoMissingThrew = true;
+    todoMissingCode = err?.code || null;
+  }
+  const todoCases = [
+    check("todo-missing-throws", todoMissingThrew === true, todoMissingCode),
+    check("todo-missing-is-enoent", todoMissingCode === "ENOENT", todoMissingCode),
+  ];
 
-  const fetchedRepos = [];
-  const shownRepos = [];
+  const fetchedDuringScan = [];
+  const roadmapRepos = [];
   const todoRepos = [];
   const pathScan = await scanRoadmapForWork({
     thecoachRepo: "/mnt/c/Users/lahad/Projects/TheCoach",
-    repoPath: DEFAULT_QUEUE_REPO_PATH,
     fetchStaging: async (p) => {
-      fetchedRepos.push(p);
+      fetchedDuringScan.push(p);
       return "tip";
     },
-    showRoadmap: async (p) => {
-      shownRepos.push(p);
-      return "# ROADMAP\n";
+    readRoadmap: (repo) => {
+      roadmapRepos.push(repo);
+      return "# ROADMAP\n## Phase 4A\n";
     },
     readTodo: (repo) => {
       todoRepos.push(repo);
-      return "[]";
+      return '[{"id":"TODO-0001"}]';
     },
     runAgent: async () => JSON.stringify({ payloads: [{ text: '{"decision":"nothing-to-do"}' }] }),
   });
   const pathCases = [
     check("path-scan-queue-empty", pathScan.outcome === "queue-empty" && !pathScan.failReason, pathScan),
-    check("path-fetch-is-trial-clone", fetchedRepos[0] === DEFAULT_QUEUE_REPO_PATH, fetchedRepos),
-    check("path-show-is-trial-clone", shownRepos[0] === DEFAULT_QUEUE_REPO_PATH, shownRepos),
-    check("path-show-is-not-thecoach-env", shownRepos[0] !== "/mnt/c/Users/lahad/Projects/TheCoach", shownRepos),
+    check("path-scan-does-not-fetch", fetchedDuringScan.length === 0, fetchedDuringScan),
+    check("path-roadmap-is-thecoach-env", roadmapRepos[0] === "/mnt/c/Users/lahad/Projects/TheCoach", roadmapRepos),
     check("path-todo-is-thecoach-env", todoRepos[0] === "/mnt/c/Users/lahad/Projects/TheCoach", todoRepos),
-    check("path-fetch-once", fetchedRepos.length === 1, fetchedRepos.length),
+    check("path-roadmap-is-not-trial-clone", roadmapRepos[0] !== DEFAULT_QUEUE_REPO_PATH, roadmapRepos),
+  ];
+
+  const timeoutCases = [
+    check("timeout-exec-above-cli", PLANNER_EXEC_TIMEOUT_MS > PLANNER_CLI_TIMEOUT_SEC * 1000, {
+      cliSec: PLANNER_CLI_TIMEOUT_SEC,
+      execMs: PLANNER_EXEC_TIMEOUT_MS,
+    }),
+    check("timeout-cli-above-measured-band", PLANNER_CLI_TIMEOUT_SEC >= 100, PLANNER_CLI_TIMEOUT_SEC),
   ];
 
   const allCases = [
@@ -1747,6 +1753,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     ...occupiedCases,
     ...todoCases,
     ...pathCases,
+    ...timeoutCases,
   ];
 
   const report = {
@@ -1759,12 +1766,14 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   process.exit(failures.length === 0 ? 0 : 1);
 }
 
+server.requestTimeout = 300_000;
+server.headersTimeout = 310_000;
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`Coordinator trigger server: http://127.0.0.1:${PORT}`);
   console.log(`Antfarm root: ${ANTFARM_ROOT}`);
   console.log(`Antfarm CLI: ${ANTFARM_CLI}`);
   console.log(`Antfarm DB (read-only): ${ANTFARM_DB}`);
   console.log(`Queue file: ${QUEUE_PATH}`);
-  console.log(`TheCoach repo (todo only): ${THECOACH_REPO || "(unset)"}`);
+  console.log(`TheCoach repo (roadmap + todo): ${THECOACH_REPO || "(unset)"}`);
   console.log(`Logs: ${LOG_DIR}`);
 });
