@@ -22,7 +22,8 @@
 //   COORDINATOR_THECOACH_REPO  Windows TheCoach checkout (WSL path). Used to
 //     read _SSoT/ROADMAP.md and local/cursor_loop/developer_todo.json when the
 //     queue is empty. Never a default repoPath for dispatched work. Unset or
-//     unreadable files → the empty-queue scan fails open ("queue empty").
+//     unreadable judgment files throw (do not fail open into an empty-queue
+//     response). Agent/parse failures become nothing-dispatchable.
 
 import http from "node:http";
 import fs from "node:fs";
@@ -52,15 +53,23 @@ const DEFAULT_WORKFLOW = "thecoach-dev";
 const DEFAULT_QUEUE_REPO_PATH = "/home/lahad/trials/thecoach-antfarm-trial";
 const ROADMAP_RELATIVE_PATH = path.join("_SSoT", "ROADMAP.md");
 const TODO_RELATIVE_PATH = path.join("local", "cursor_loop", "developer_todo.json");
+const IDLE_STATE_RELATIVE_PATH = path.join("local", "cursor_loop", "coordinator_idle_state.json");
 const ROADMAP_AUTO_SOURCE = "coordinator:roadmap-auto";
+const OPEN_QUESTION_CEILING = 10;
+const IDLE_ESCALATION_EVERY = 12;
+const TODO_STATUS_OPEN = "open";
+const TODO_STATUS_RESOLVED = "resolved";
+const TODO_STATUS_DECLINED = "declined";
+const SCOPE_GLOBAL = "*";
+const RECORD_QUESTION_TYPES = new Set(["blocked", "passed-awaiting-dev", "roadmap-decision", "other"]);
 /** Windows checkout — judgment inputs only. Loaded from EnvironmentFile, never a unit Environment= line. */
 const THECOACH_REPO = (process.env.COORDINATOR_THECOACH_REPO || "").trim();
 const PLANNER_AGENT_ID = "thecoach-dev_planner";
 const PLANNER_MODEL = "anthropic/claude-sonnet-5";
-// Measured live scan latency is 74–80s. Named-tunnel 524 empirically fires at
+// Measured live scan latency is 4–7s. Named-tunnel 524 empirically fires at
 // ~125.3s (120s request survived; 128s request returned HTTP 524). CLI timeout
-// sits above the 80s band; execFile timeout sits a few seconds above the CLI
-// so the CLI's own --timeout can fire cleanly. Both stay under the 125s ceiling.
+// sits well above the 4–7s band; execFile timeout sits a few seconds above the
+// CLI so the CLI's own --timeout can fire cleanly. Both stay under the 125s ceiling.
 const PLANNER_CLI_TIMEOUT_SEC = 100;
 const PLANNER_EXEC_TIMEOUT_MS = 105_000;
 
@@ -362,6 +371,174 @@ function logDispatchNextError(message) {
   console.error(`[queue/dispatch-next] ${message}`);
 }
 
+function defaultIdleState() {
+  return { consecutive_idle: 0, last_idle_at: null, last_escalated_at: null };
+}
+
+function isOpenTodoStatus(status) {
+  return (status ?? TODO_STATUS_OPEN) === TODO_STATUS_OPEN;
+}
+
+function parseDeveloperTodoEntries(raw) {
+  const parsed = JSON.parse(raw);
+  if (!Array.isArray(parsed)) {
+    throw new Error("developer_todo.json is not a JSON array");
+  }
+  return parsed;
+}
+
+function normaliseBlocks(entry) {
+  if (!Array.isArray(entry?.blocks)) {
+    logDispatchNext(`schema-violation todo_id=${entry?.id} reason="missing blocks"`);
+    return [SCOPE_GLOBAL];
+  }
+  return entry.blocks;
+}
+
+function summarizeOpenTodos(entries) {
+  const open = entries.filter((e) => isOpenTodoStatus(e.status));
+  const blockedScopes = new Set(open.flatMap((e) => normaliseBlocks(e)));
+  return {
+    open,
+    open_count: open.length,
+    todo_ids: open.map((e) => e.id).filter((id) => id != null),
+    blockedScopes,
+  };
+}
+
+function writeJsonAtomic(filePath, value) {
+  const dir = path.dirname(filePath);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = `${filePath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n", "utf-8");
+  fs.renameSync(tmp, filePath);
+}
+
+function writeDeveloperTodoAtomic(thecoachRepo, entries) {
+  writeJsonAtomic(path.join(thecoachRepo, TODO_RELATIVE_PATH), entries);
+}
+
+function nextTodoId(entries) {
+  let max = 0;
+  for (const e of entries) {
+    const m = String(e.id || "").match(/^TODO-(\d+)$/);
+    if (m) max = Math.max(max, Number(m[1]));
+  }
+  return `TODO-${String(max + 1).padStart(4, "0")}`;
+}
+
+function appendDeveloperTodoEntry(thecoachRepo, draft, deps = {}) {
+  const readTodo = deps.readTodo || readDeveloperTodoFile;
+  const writeTodo = deps.writeTodo || writeDeveloperTodoAtomic;
+  const entries = parseDeveloperTodoEntries(readTodo(thecoachRepo));
+  const open = entries.filter((e) => isOpenTodoStatus(e.status));
+  if (open.some((e) => e.summary === draft.summary)) {
+    return { appended: false, reason: "duplicate-summary", entries };
+  }
+  if (!Array.isArray(draft.blocks)) {
+    throw new Error("writer requires an explicit blocks array");
+  }
+  const entry = {
+    id: nextTodoId(entries),
+    added_at: new Date().toISOString(),
+    source: draft.source,
+    type: draft.type,
+    summary: draft.summary,
+    why: draft.why,
+    evidence: draft.evidence,
+    reply_needed: draft.reply_needed,
+    status: TODO_STATUS_OPEN,
+    resolved_at: null,
+    resolution: null,
+    blocks: draft.blocks,
+  };
+  const next = [...entries, entry];
+  writeTodo(thecoachRepo, next);
+  return { appended: true, entry, entries: next };
+}
+
+function loadIdleState(thecoachRepo) {
+  const filePath = path.join(thecoachRepo, IDLE_STATE_RELATIVE_PATH);
+  const parsed = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+  return {
+    consecutive_idle: Number(parsed.consecutive_idle) || 0,
+    last_idle_at: parsed.last_idle_at ?? null,
+    last_escalated_at: parsed.last_escalated_at ?? null,
+  };
+}
+
+function saveIdleState(thecoachRepo, state) {
+  writeJsonAtomic(path.join(thecoachRepo, IDLE_STATE_RELATIVE_PATH), state);
+}
+
+function applyIdleTelemetry({ dispatched, reason }, deps = {}) {
+  const load = deps.loadIdle || loadIdleState;
+  const save = deps.saveIdle || saveIdleState;
+  const repo = deps.thecoachRepo !== undefined ? deps.thecoachRepo : THECOACH_REPO;
+  try {
+    if (reason === "active-run" || reason === "developer-attention-required") {
+      return { escalated: false };
+    }
+    if (!deps.loadIdle && !repo) {
+      return { escalated: false };
+    }
+    let state;
+    try {
+      state = load(repo);
+    } catch {
+      state = defaultIdleState();
+    }
+    if (dispatched === true) {
+      state = { ...state, consecutive_idle: 0 };
+      save(repo, state);
+      return { escalated: false, idle_state: state };
+    }
+    if (reason === "nothing-dispatchable") {
+      const now = new Date().toISOString();
+      const consecutive_idle = (state.consecutive_idle || 0) + 1;
+      state = { ...state, consecutive_idle, last_idle_at: now };
+      let escalated = false;
+      if (consecutive_idle > 0 && consecutive_idle % IDLE_ESCALATION_EVERY === 0) {
+        escalated = true;
+        state.last_escalated_at = now;
+      }
+      save(repo, state);
+      return { escalated, idle_state: state };
+    }
+    return { escalated: false };
+  } catch (err) {
+    logDispatchNextError(`idle-state telemetry failed (swallowed): ${err?.message || String(err)}`);
+    return { escalated: false, telemetry_error: err?.message || String(err) };
+  }
+}
+
+function evaluateDispatchBackstop(scopes, blockedScopes) {
+  const blocked = blockedScopes instanceof Set ? blockedScopes : new Set(blockedScopes || []);
+  if (!Array.isArray(scopes) || scopes.length === 0) {
+    return { ok: false, reason: "missing-or-empty-scopes", scopes: scopes ?? null, blocked: [...blocked] };
+  }
+  const intersection = scopes.filter((s) => blocked.has(s));
+  if (intersection.length > 0) {
+    return { ok: false, reason: "intersects-blocked", scopes, blocked: [...blocked], intersection };
+  }
+  return { ok: true, scopes, blocked: [...blocked] };
+}
+
+function attachOpenSnapshot(body, snapshot) {
+  if (body.dispatched === true) return body;
+  return {
+    ...body,
+    open_count: snapshot?.open_count ?? body.open_count ?? 0,
+    todo_ids: snapshot?.todo_ids ?? body.todo_ids ?? [],
+  };
+}
+
+function withIdleTelemetry(body, deps) {
+  const telem = applyIdleTelemetry(body, deps);
+  if (telem.escalated) return { ...body, escalated: true };
+  return body;
+}
+
 /**
  * Same shape POST /queue builds for a human-submitted item, plus optional
  * source / roadmap_ref for coordinator auto-queue.
@@ -496,27 +673,44 @@ function readDeveloperTodoFile(thecoachRepo) {
   return readTheCoachJudgmentFile(thecoachRepo, TODO_RELATIVE_PATH);
 }
 
-function buildRoadmapScanPrompt(roadmapContent, todoContent) {
+function formatBlockedScopes(blockedScopes) {
+  const list = [...blockedScopes];
+  if (list.length === 0) return "(none)";
+  return list.join(", ");
+}
+
+function buildRoadmapScanPrompt(roadmapContent, todoContent, blockedScopes) {
+  const exclusion = formatBlockedScopes(blockedScopes);
   return `You are deciding whether the coordinator should queue the next piece of TheCoach work.
 
 You are given two read-only inputs from the Windows TheCoach checkout working tree (not a git ref — ROADMAP.md is a manual hand-merge):
 1) _SSoT/ROADMAP.md
 2) local/cursor_loop/developer_todo.json (open developer decisions / blockers)
 
+HARD EXCLUSION LIST — you MUST NOT dispatch any item whose scopes intersect this set: ${exclusion}
+
+Scope grammar (for both dispatch "scopes" and record-question "blocks"):
+- phase:<id>   e.g. phase:4B, phase:9
+- oq:<id>      e.g. oq:OQ-12
+- task:<slug>  e.g. task:ci-workflow
+- *            blocks everything (use only when the question truly gates all work)
+- []           (record-question only) the question needs an answer but gates no dispatchable work
+
 Reply with ONLY one JSON object, nothing else — no prose before or after, no markdown fences, no trailing commentary. Exactly one of these three shapes:
 
-{"decision":"dispatch","title":"<short task title>","description":"<what to build, specific enough for a dev agent to act on without more context>","roadmap_ref":"<which phase/line this came from, quoted or closely paraphrased>"}
+{"decision":"dispatch","title":"<short task title>","description":"<what to build, specific enough for a dev agent to act on without more context>","roadmap_ref":"<which phase/line this came from, quoted or closely paraphrased>","scopes":["phase:<id>"]}
 
-{"decision":"needs-developer-decision","todo_id":"<matching developer_todo.json id if there is one, else null>","summary":"<one line: what's blocking, and on whom>"}
+{"decision":"record-question","summary":"<one line>","why":"<why this needs a human>","source":"<TASK-NNN or roadmap:PhaseX>","type":"roadmap-decision","evidence":"<short evidence>","reply_needed":"<what answer resolves this>","blocks":["phase:<id>"]}
 
 {"decision":"nothing-to-do"}
 
 Rules:
-- "dispatch" is only correct for work that is well-defined AND already decided — no open product/design choice, no explicit "deferred"/"blocked on"/"needs sign-off" language in the roadmap text itself, and not matching an open entry in developer_todo.json.
-- Open items in developer_todo.json are blockers, not a backlog to skip. If any open entry exists whose source/summary refers to a current or earlier incomplete phase (especially type "roadmap-decision"), you MUST return needs-developer-decision for that todo_id rather than dispatching later-phase work.
-- When genuinely uncertain whether something needs a developer decision, choose "needs-developer-decision", not "dispatch". A missed dispatch costs one idle cycle; a wrong dispatch costs a whole run plus review time.
-- Reason across the roadmap top-to-bottom. You MAY skip a blocked/deferred roadmap checkbox and continue looking for the next phase's actionable work — but only when that checkbox is NOT represented by an open developer_todo.json entry.
-- Dispatch only the first thing you find that is genuinely ready. Do not queue multiple items in one scan.
+- "dispatch" is only correct for work that is well-defined AND already decided — no open product/design choice, no explicit "deferred"/"blocked on"/"needs sign-off" language in the roadmap text itself.
+- Every dispatch MUST include a non-empty "scopes" array naming what the work belongs to (phase, oq, and/or task). Never dispatch work whose scopes intersect the exclusion list.
+- You MAY skip a blocked/deferred roadmap checkbox and continue looking for the next phase's actionable work whose scopes are outside the exclusion list. If the next well-defined item is blocked by the exclusion list, skip it and keep looking.
+- Do not return needs-developer-decision — that decision is retired. If you find a question that needs a developer answer, return record-question with an explicitly-reasoned "blocks" array: what specifically does this gate — which phase, which open question, which task? If it gates no dispatchable work, answer with an empty list.
+- When genuinely uncertain whether something is ready to dispatch, choose record-question or nothing-to-do, never a speculative dispatch. A missed dispatch costs one idle cycle; a wrong dispatch costs a whole run plus review time.
+- Dispatch only the first thing you find that is genuinely ready and unblocked. Do not queue multiple items in one scan.
 
 --- ROADMAP.md (_SSoT/ROADMAP.md working tree) ---
 ${roadmapContent}
@@ -533,6 +727,7 @@ function isNonEmptyString(value) {
 /**
  * Strict parse of the agent's final text reply. Rejects extra keys, missing
  * fields, non-objects, and anything that isn't exactly one of the three shapes.
+ * needs-developer-decision is retired and parsed as unknown.
  */
 function parseAgentDecision(text) {
   let parsed;
@@ -547,23 +742,34 @@ function parseAgentDecision(text) {
   const keys = Object.keys(parsed).sort();
   const decision = parsed.decision;
   if (decision === "dispatch") {
-    if (keys.join(",") !== "decision,description,roadmap_ref,title") {
-      return { ok: false, error: `dispatch object has unexpected keys: ${keys.join(",")}` };
+    const keyStr = keys.join(",");
+    if (keyStr !== "decision,description,roadmap_ref,title" && keyStr !== "decision,description,roadmap_ref,scopes,title") {
+      return { ok: false, error: `dispatch object has unexpected keys: ${keyStr}` };
     }
     if (!isNonEmptyString(parsed.title) || !isNonEmptyString(parsed.description) || !isNonEmptyString(parsed.roadmap_ref)) {
       return { ok: false, error: "dispatch is missing a required non-empty string field" };
     }
     return { ok: true, decision: parsed };
   }
-  if (decision === "needs-developer-decision") {
-    if (keys.join(",") !== "decision,summary,todo_id") {
-      return { ok: false, error: `needs-developer-decision object has unexpected keys: ${keys.join(",")}` };
+  if (decision === "record-question") {
+    if (keys.join(",") !== "blocks,decision,evidence,reply_needed,source,summary,type,why") {
+      return { ok: false, error: `record-question object has unexpected keys: ${keys.join(",")}` };
     }
-    if (parsed.todo_id !== null && !isNonEmptyString(parsed.todo_id)) {
-      return { ok: false, error: "todo_id must be a non-empty string or null" };
+    if (
+      !isNonEmptyString(parsed.summary) ||
+      !isNonEmptyString(parsed.why) ||
+      !isNonEmptyString(parsed.source) ||
+      !isNonEmptyString(parsed.type) ||
+      !isNonEmptyString(parsed.evidence) ||
+      !isNonEmptyString(parsed.reply_needed)
+    ) {
+      return { ok: false, error: "record-question is missing a required non-empty string field" };
     }
-    if (!isNonEmptyString(parsed.summary)) {
-      return { ok: false, error: "summary must be a non-empty string" };
+    if (!RECORD_QUESTION_TYPES.has(parsed.type)) {
+      return { ok: false, error: `record-question type is not allowed: ${parsed.type}` };
+    }
+    if (!Array.isArray(parsed.blocks)) {
+      return { ok: false, error: "record-question blocks must be an array" };
     }
     return { ok: true, decision: parsed };
   }
@@ -667,39 +873,90 @@ function runPlannerAgentTurn(prompt) {
 }
 
 /**
- * Empty-queue scan. Fail-open: any error becomes { outcome: "queue-empty", failReason }.
- * ROADMAP.md and developer_todo.json are both read from COORDINATOR_THECOACH_REPO
- * (working tree). Missing or unreadable files fail the scan — never substitute
- * empty content. Dispatched work still uses DEFAULT_QUEUE_REPO_PATH.
+ * Empty-queue scan. File-read failures throw (do not fail open). Agent/parse
+ * failures become nothing-dispatchable. Dispatched work still uses
+ * DEFAULT_QUEUE_REPO_PATH. ROADMAP.md and developer_todo.json are both read
+ * from COORDINATOR_THECOACH_REPO (working tree).
  */
 async function scanRoadmapForWork(deps = {}) {
   const readRoadmap = deps.readRoadmap || readRoadmapFile;
   const readTodo = deps.readTodo || readDeveloperTodoFile;
   const runAgent = deps.runAgent || runPlannerAgentTurn;
+  const appendTodo = deps.appendTodo || ((repo, draft) => appendDeveloperTodoEntry(repo, draft, deps));
   const thecoachRepo = deps.thecoachRepo !== undefined ? deps.thecoachRepo : THECOACH_REPO;
 
+  if (!thecoachRepo) {
+    throw new Error("COORDINATOR_THECOACH_REPO is unset");
+  }
+
+  const todoRaw = readTodo(thecoachRepo);
+  const entries = parseDeveloperTodoEntries(todoRaw);
+  const snapshot = summarizeOpenTodos(entries);
+  const snapshotFields = {
+    open_count: snapshot.open_count,
+    todo_ids: snapshot.todo_ids,
+    blockedScopes: [...snapshot.blockedScopes],
+  };
+
+  if (snapshot.open_count >= OPEN_QUESTION_CEILING) {
+    return { outcome: "developer-attention-required", ...snapshotFields };
+  }
+
+  if (snapshot.blockedScopes.has(SCOPE_GLOBAL)) {
+    const offending = snapshot.open.filter((e) => normaliseBlocks(e).includes(SCOPE_GLOBAL)).map((e) => e.id);
+    return { outcome: "nothing-dispatchable", ...snapshotFields, offending_ids: offending };
+  }
+
+  const roadmap = readRoadmap(thecoachRepo);
+
+  let parsed;
   try {
-    if (!thecoachRepo) {
-      return { outcome: "queue-empty", failReason: "COORDINATOR_THECOACH_REPO is unset" };
-    }
-    const roadmap = readRoadmap(thecoachRepo);
-    const todo = readTodo(thecoachRepo);
-    const prompt = buildRoadmapScanPrompt(roadmap, todo);
+    const prompt = buildRoadmapScanPrompt(roadmap, todoRaw, snapshot.blockedScopes);
     const cliStdout = await runAgent(prompt);
     const replyText = extractAgentReplyText(cliStdout);
-    const parsed = parseAgentDecision(replyText);
+    parsed = parseAgentDecision(replyText);
     if (!parsed.ok) {
-      return { outcome: "queue-empty", failReason: parsed.error };
+      return { outcome: "nothing-dispatchable", ...snapshotFields, failReason: parsed.error };
     }
-    if (parsed.decision.decision === "dispatch") {
-      return { outcome: "dispatch", decision: parsed.decision };
-    }
-    if (parsed.decision.decision === "needs-developer-decision") {
-      return { outcome: "needs-developer-decision", decision: parsed.decision };
-    }
-    return { outcome: "queue-empty" };
   } catch (err) {
-    return { outcome: "queue-empty", failReason: err?.message || String(err) };
+    return { outcome: "nothing-dispatchable", ...snapshotFields, failReason: err?.message || String(err) };
+  }
+
+  if (parsed.decision.decision === "dispatch") {
+    const backstop = evaluateDispatchBackstop(parsed.decision.scopes, snapshot.blockedScopes);
+    if (!backstop.ok) {
+      logDispatchNext(
+        `backstop-rejected-dispatch scopes=${JSON.stringify(parsed.decision.scopes)} blocked=${JSON.stringify([...snapshot.blockedScopes])}`,
+      );
+      return { outcome: "nothing-dispatchable", ...snapshotFields, backstop_rejected: true };
+    }
+    return { outcome: "dispatch", decision: parsed.decision, ...snapshotFields };
+  }
+
+  if (parsed.decision.decision === "record-question") {
+    try {
+      const written = appendTodo(thecoachRepo, parsed.decision);
+      if (!written.appended) {
+        logDispatchNext(`todo writer skipped duplicate summary=${JSON.stringify(parsed.decision.summary)}`);
+      }
+    } catch (err) {
+      logDispatchNextError(`todo writer failed: ${err?.message || String(err)}`);
+    }
+    return { outcome: "nothing-dispatchable", ...snapshotFields };
+  }
+
+  return { outcome: "nothing-dispatchable", ...snapshotFields };
+}
+
+function snapshotTodosBestEffort(deps = {}) {
+  const readTodo = deps.readTodo || readDeveloperTodoFile;
+  const repo = deps.thecoachRepo !== undefined ? deps.thecoachRepo : THECOACH_REPO;
+  try {
+    if (!repo) return { open_count: 0, todo_ids: [], blockedScopes: new Set() };
+    return summarizeOpenTodos(parseDeveloperTodoEntries(readTodo(repo)));
+  } catch (err) {
+    logDispatchNextError(`todo snapshot failed (swallowed): ${err?.message || String(err)}`);
+    return { open_count: 0, todo_ids: [], blockedScopes: new Set() };
   }
 }
 
@@ -723,16 +980,20 @@ async function handleDispatchNext(deps = {}) {
 
   const active = findActive();
   if (active) {
+    const snapshot = snapshotTodosBestEffort(deps);
     return {
       status: 200,
-      body: {
-        ok: true,
-        dispatched: false,
-        reason: "run in progress",
-        activeRunId: active.id,
-        activeStatus: active.status,
-        activeRunNumber: active.run_number ?? null,
-      },
+      body: attachOpenSnapshot(
+        {
+          ok: true,
+          dispatched: false,
+          reason: "active-run",
+          activeRunId: active.id,
+          activeStatus: active.status,
+          activeRunNumber: active.run_number ?? null,
+        },
+        snapshot,
+      ),
     };
   }
 
@@ -743,10 +1004,35 @@ async function handleDispatchNext(deps = {}) {
     try {
       scanResult = await scan();
     } catch (err) {
-      logDispatchNextError(`roadmap scan failed; falling back to queue empty: ${err?.message || String(err)}`);
-      return { status: 200, body: { ok: true, dispatched: false, reason: "queue empty" } };
+      logDispatchNextError(`roadmap scan failed: ${err?.message || String(err)}`);
+      return { status: 500, body: { ok: false, error: err?.message || String(err) } };
     }
+
+    const snapshot = {
+      open_count: scanResult.open_count ?? 0,
+      todo_ids: scanResult.todo_ids ?? [],
+    };
+
     if (scanResult.outcome === "dispatch") {
+      const backstop = evaluateDispatchBackstop(scanResult.decision.scopes, scanResult.blockedScopes);
+      if (!backstop.ok) {
+        logDispatchNext(
+          `backstop-rejected-dispatch scopes=${JSON.stringify(scanResult.decision.scopes)} blocked=${JSON.stringify(scanResult.blockedScopes ?? [])}`,
+        );
+        const body = withIdleTelemetry(
+          attachOpenSnapshot(
+            {
+              ok: true,
+              dispatched: false,
+              reason: "nothing-dispatchable",
+              backstop_rejected: true,
+            },
+            snapshot,
+          ),
+          deps,
+        );
+        return { status: 200, body };
+      }
       const d = scanResult.decision;
       const autoItem = buildQueueItem({
         task: `${d.title}\n\n${d.description}`,
@@ -758,24 +1044,35 @@ async function handleDispatchNext(deps = {}) {
       save(queue);
       idx = queue.length - 1;
       logDispatchNext(`roadmap auto-queued ${autoItem.id} ref=${d.roadmap_ref}`);
-    } else if (scanResult.outcome === "needs-developer-decision") {
-      const d = scanResult.decision;
-      logDispatchNext(`needs-developer-decision todo_id=${JSON.stringify(d.todo_id)} summary=${d.summary}`);
+    } else if (scanResult.outcome === "developer-attention-required") {
       return {
         status: 200,
-        body: {
-          ok: true,
-          dispatched: false,
-          reason: "needs-developer-decision",
-          todo_id: d.todo_id,
-          summary: d.summary,
-        },
+        body: attachOpenSnapshot(
+          {
+            ok: true,
+            dispatched: false,
+            reason: "developer-attention-required",
+          },
+          snapshot,
+        ),
       };
     } else {
       if (scanResult.failReason) {
-        logDispatchNextError(`roadmap scan failed; falling back to queue empty: ${scanResult.failReason}`);
+        logDispatchNextError(`roadmap scan agent/parse failed; nothing-dispatchable: ${scanResult.failReason}`);
       }
-      return { status: 200, body: { ok: true, dispatched: false, reason: "queue empty" } };
+      const body = withIdleTelemetry(
+        attachOpenSnapshot(
+          {
+            ok: true,
+            dispatched: false,
+            reason: "nothing-dispatchable",
+            ...(scanResult.backstop_rejected ? { backstop_rejected: true } : {}),
+          },
+          snapshot,
+        ),
+        deps,
+      );
+      return { status: 200, body };
     }
   }
 
@@ -829,9 +1126,8 @@ async function handleDispatchNext(deps = {}) {
   item.stagingTip = stagingTip;
   save(queue);
 
-  return {
-    status: 200,
-    body: {
+  const body = withIdleTelemetry(
+    {
       ok: true,
       dispatched: true,
       runId: antfarmRun.id,
@@ -841,7 +1137,9 @@ async function handleDispatchNext(deps = {}) {
       spawnLogId: spawnResult.id,
       item,
     },
-  };
+    deps,
+  );
+  return { status: 200, body };
 }
 
 function verifyRunOwnership(stepsResult) {
@@ -1161,8 +1459,13 @@ const server = http.createServer(async (req, res) => {
 
   if (p === "/queue/dispatch-next" && req.method === "POST") {
     if (!requireAuth(req, res, "POST", "/queue/dispatch-next")) return;
-    const result = await handleDispatchNext();
-    return json(res, result.body, result.status);
+    try {
+      const result = await handleDispatchNext();
+      return json(res, result.body, result.status);
+    } catch (err) {
+      logDispatchNextError(`unhandled: ${err?.message || String(err)}`);
+      return json(res, { ok: false, error: err?.message || String(err) }, 500);
+    }
   }
 
   if (p === "/queue/check" && req.method === "GET") {
@@ -1405,11 +1708,46 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     };
   }
 
+  function memoryIdle(initial = defaultIdleState()) {
+    let s = { ...initial };
+    return {
+      loadIdle: () => ({ ...s }),
+      saveIdle: (_repo, next) => {
+        s = { ...next };
+      },
+      get: () => s,
+    };
+  }
+
+  const capturedLogs = [];
+  const origLog = console.log;
+  console.log = (...args) => {
+    capturedLogs.push(args.map(String).join(" "));
+    origLog(...args);
+  };
+
   const dispatchReply = {
     decision: "dispatch",
     title: "Add reliability note",
     description: "Write the Phase 4 reliability paragraph into README.md",
     roadmap_ref: "Phase 4 / reliability patch acceptance",
+    scopes: ["phase:9"],
+  };
+  const dispatchReplyNoScopes = {
+    decision: "dispatch",
+    title: "Add reliability note",
+    description: "Write the Phase 4 reliability paragraph into README.md",
+    roadmap_ref: "Phase 4 / reliability patch acceptance",
+  };
+  const recordQuestionReply = {
+    decision: "record-question",
+    summary: "Need a yes/no on adding CI",
+    why: "Spends Actions minutes",
+    source: "roadmap:Phase9",
+    type: "roadmap-decision",
+    evidence: "no .github/workflows",
+    reply_needed: "yes or no",
+    blocks: ["task:ci-workflow"],
   };
   const needsReply = {
     decision: "needs-developer-decision",
@@ -1419,13 +1757,11 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
 
   const parseCases = [
     check("parse-dispatch", parseAgentDecision(JSON.stringify(dispatchReply)).ok === true),
-    check(
-      "parse-needs-developer-decision",
-      parseAgentDecision(JSON.stringify(needsReply)).ok === true &&
-        parseAgentDecision(JSON.stringify(needsReply)).decision.todo_id === "todo-42",
-    ),
+    check("parse-dispatch-without-scopes", parseAgentDecision(JSON.stringify(dispatchReplyNoScopes)).ok === true),
+    check("parse-record-question", parseAgentDecision(JSON.stringify(recordQuestionReply)).ok === true),
     check("parse-nothing-to-do", parseAgentDecision('{"decision":"nothing-to-do"}').ok === true),
-    check("parse-todo-id-null", parseAgentDecision('{"decision":"needs-developer-decision","todo_id":null,"summary":"Blocked on whom: unknown"}').ok === true),
+    check("reject-needs-developer-decision", parseAgentDecision(JSON.stringify(needsReply)).ok === false),
+    check("reject-todo-id-null", parseAgentDecision('{"decision":"needs-developer-decision","todo_id":null,"summary":"Blocked on whom: unknown"}').ok === false),
     check("reject-extra-prose", parseAgentDecision(`Sure.\n${JSON.stringify(dispatchReply)}`).ok === false),
     check("reject-markdown-fence", parseAgentDecision("```json\n{\"decision\":\"nothing-to-do\"}\n```").ok === false),
     check("reject-unknown-decision", parseAgentDecision('{"decision":"maybe"}').ok === false),
@@ -1463,6 +1799,24 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     })()),
   ];
 
+  const parsedBlocked = parseAgentDecision(JSON.stringify({
+    decision: "dispatch",
+    title: "OAuth client wiring",
+    description: "Wire Google OAuth into auth",
+    roadmap_ref: "Phase 4B",
+    scopes: ["phase:4B"],
+  }));
+  const blockedBackstop = evaluateDispatchBackstop(parsedBlocked.decision.scopes, new Set(["phase:4B", "oq:OQ-12"]));
+  const missingScopesBackstop = evaluateDispatchBackstop(undefined, new Set());
+  const emptyScopesBackstop = evaluateDispatchBackstop([], new Set());
+  const emptyBlocksBackstop = evaluateDispatchBackstop(["phase:9"], new Set(summarizeOpenTodos([{ id: "TODO-0006", status: "open", blocks: [] }]).blockedScopes));
+  const backstopDirectCases = [
+    check("backstop-blocked-scope-direct", parsedBlocked.ok === true && blockedBackstop.ok === false, blockedBackstop),
+    check("backstop-missing-scopes-direct", missingScopesBackstop.ok === false, missingScopesBackstop),
+    check("backstop-empty-scopes-direct", emptyScopesBackstop.ok === false, emptyScopesBackstop),
+    check("backstop-empty-blocks-does-not-block", emptyBlocksBackstop.ok === true, emptyBlocksBackstop),
+  ];
+
   const dispatchMocks = () => ({
     findActive: () => null,
     repoExists: () => true,
@@ -1483,7 +1837,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     save: mqDispatch.save,
     scan: async () => {
       scanCalledOnDispatch += 1;
-      return { outcome: "dispatch", decision: dispatchReply };
+      return { outcome: "dispatch", decision: dispatchReply, blockedScopes: [], open_count: 0, todo_ids: [] };
     },
   });
   const dispatchedItem = dispatchResult.body.item;
@@ -1517,55 +1871,219 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
       dispatchMocks.started[0]?.task?.includes(`REPO: ${DEFAULT_QUEUE_REPO_PATH}`),
       dispatchMocks.started[0]?.task,
     ),
+    check("1-reason-not-needs-developer-decision", dispatchResult.body.reason !== "needs-developer-decision"),
   ];
 
-  const mqNeeds = memoryQueue([]);
-  let startRunOnNeeds = 0;
-  const needsResult = await handleDispatchNext({
+  const mqBlocked = memoryQueue([]);
+  let startRunOnBlocked = 0;
+  const blockedHttp = await handleDispatchNext({
     findActive: () => null,
-    load: mqNeeds.load,
-    save: mqNeeds.save,
-    scan: async () => ({ outcome: "needs-developer-decision", decision: needsReply }),
-    repoExists: () => true,
-    fetchStaging: async () => {
-      throw new Error("fetchStaging must not run");
-    },
+    load: mqBlocked.load,
+    save: mqBlocked.save,
+    scan: async () => ({
+      outcome: "dispatch",
+      decision: { ...dispatchReply, scopes: ["phase:4B"] },
+      blockedScopes: ["phase:4B", "oq:OQ-12"],
+      open_count: 1,
+      todo_ids: ["TODO-0004"],
+    }),
     startRun: () => {
-      startRunOnNeeds += 1;
-      throw new Error("startRun must not run");
-    },
-    waitRun: async () => {
-      throw new Error("waitRun must not run");
+      startRunOnBlocked += 1;
+      throw new Error("startRun must not run on blocked-scope");
     },
   });
-  const needsCases = [
-    check("2-status-200", needsResult.status === 200, needsResult.status),
-    check("2-dispatched-false", needsResult.body.dispatched === false),
-    check("2-reason", needsResult.body.reason === "needs-developer-decision", needsResult.body.reason),
-    check("2-todo-id", needsResult.body.todo_id === "todo-42", needsResult.body.todo_id),
-    check("2-summary", needsResult.body.summary === needsReply.summary, needsResult.body.summary),
-    check("2-no-queue-item", mqNeeds.get().length === 0, mqNeeds.get().length),
-    check("2-startRun-not-called", startRunOnNeeds === 0, startRunOnNeeds),
+  const blockedScopeCases = [
+    check("blocked-scope-status-200", blockedHttp.status === 200, blockedHttp.status),
+    check("blocked-scope-not-dispatched", blockedHttp.body.dispatched === false),
+    check("blocked-scope-reason", blockedHttp.body.reason === "nothing-dispatchable", blockedHttp.body.reason),
+    check("blocked-scope-backstop-rejected", blockedHttp.body.backstop_rejected === true, blockedHttp.body),
+    check("blocked-scope-open-count", blockedHttp.body.open_count === 1, blockedHttp.body.open_count),
+    check("blocked-scope-todo-ids", JSON.stringify(blockedHttp.body.todo_ids) === JSON.stringify(["TODO-0004"]), blockedHttp.body.todo_ids),
+    check("blocked-scope-no-queue-item", mqBlocked.get().length === 0, mqBlocked.get().length),
+    check("blocked-scope-startRun-not-called", startRunOnBlocked === 0, startRunOnBlocked),
+    check(
+      "blocked-scope-logged",
+      capturedLogs.some((l) => l.includes("backstop-rejected-dispatch") && l.includes("phase:4B")),
+      capturedLogs.filter((l) => l.includes("backstop")),
+    ),
+  ];
+
+  const mqMissingScopes = memoryQueue([]);
+  let startRunOnMissingScopes = 0;
+  const missingScopesHttp = await handleDispatchNext({
+    findActive: () => null,
+    load: mqMissingScopes.load,
+    save: mqMissingScopes.save,
+    scan: async () => ({
+      outcome: "dispatch",
+      decision: dispatchReplyNoScopes,
+      blockedScopes: [],
+      open_count: 0,
+      todo_ids: [],
+    }),
+    startRun: () => {
+      startRunOnMissingScopes += 1;
+      throw new Error("startRun must not run on missing scopes");
+    },
+  });
+  const missingScopesCases = [
+    check("missing-scopes-not-dispatched", missingScopesHttp.body.dispatched === false),
+    check("missing-scopes-reason", missingScopesHttp.body.reason === "nothing-dispatchable", missingScopesHttp.body.reason),
+    check("missing-scopes-backstop-rejected", missingScopesHttp.body.backstop_rejected === true, missingScopesHttp.body),
+    check("missing-scopes-startRun-not-called", startRunOnMissingScopes === 0, startRunOnMissingScopes),
+  ];
+
+  const mqEmptyBlocks = memoryQueue([]);
+  dispatchMocks.started = [];
+  let emptyBlocksAgentCalls = 0;
+  const emptyBlocksHttp = await handleDispatchNext({
+    ...dispatchMocks(),
+    load: mqEmptyBlocks.load,
+    save: mqEmptyBlocks.save,
+    scan: async () =>
+      scanRoadmapForWork({
+        thecoachRepo: "/tmp/thecoach-does-not-matter",
+        readTodo: () => JSON.stringify([{ id: "TODO-0006", status: "open", summary: "billing", blocks: [] }]),
+        readRoadmap: () => "# ROADMAP",
+        runAgent: async () => {
+          emptyBlocksAgentCalls += 1;
+          return JSON.stringify({ payloads: [{ text: JSON.stringify(dispatchReply) }] });
+        },
+      }),
+  });
+  const emptyBlocksCases = [
+    check("empty-blocks-agent-called", emptyBlocksAgentCalls === 1, emptyBlocksAgentCalls),
+    check("empty-blocks-dispatched", emptyBlocksHttp.body.dispatched === true, emptyBlocksHttp.body),
+  ];
+
+  const schemaLogsBefore = capturedLogs.length;
+  const missingBlocksTodo = [{ id: "TODO-0007", status: "open", summary: "unscoped" }];
+  let missingBlocksAgentCalls = 0;
+  const missingBlocksScan = await scanRoadmapForWork({
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
+    readTodo: () => JSON.stringify(missingBlocksTodo),
+    readRoadmap: () => "# ROADMAP",
+    runAgent: async () => {
+      missingBlocksAgentCalls += 1;
+      throw new Error("runAgent must not run when blocks missing (treated as *)");
+    },
+  });
+  const schemaLogs = capturedLogs.slice(schemaLogsBefore);
+  const missingBlocksHttp = await handleDispatchNext({
+    findActive: () => null,
+    load: memoryQueue([]).load,
+    save: () => {},
+    scan: async () => missingBlocksScan,
+    startRun: () => {
+      throw new Error("startRun must not run on missing-blocks star");
+    },
+  });
+  const missingBlocksCases = [
+    check("missing-blocks-agent-not-called", missingBlocksAgentCalls === 0, missingBlocksAgentCalls),
+    check("missing-blocks-outcome", missingBlocksScan.outcome === "nothing-dispatchable", missingBlocksScan),
+    check("missing-blocks-star", missingBlocksScan.blockedScopes.includes(SCOPE_GLOBAL), missingBlocksScan.blockedScopes),
+    check(
+      "missing-blocks-logged",
+      schemaLogs.some((l) => l.includes('schema-violation todo_id=TODO-0007 reason="missing blocks"')),
+      schemaLogs,
+    ),
+    check("missing-blocks-http-not-dispatched", missingBlocksHttp.body.dispatched === false),
+    check("missing-blocks-http-reason", missingBlocksHttp.body.reason === "nothing-dispatchable", missingBlocksHttp.body.reason),
+  ];
+
+  const tenOpen = Array.from({ length: 10 }, (_, i) => ({
+    id: `TODO-${String(i + 1).padStart(4, "0")}`,
+    status: "open",
+    summary: `q${i}`,
+    blocks: [],
+  }));
+  let ceilingAgentCalls = 0;
+  let ceilingScan = { outcome: "threw-before-return" };
+  try {
+    ceilingScan = await scanRoadmapForWork({
+      thecoachRepo: "/tmp/thecoach-does-not-matter",
+      readTodo: () => JSON.stringify(tenOpen),
+      readRoadmap: () => "# ROADMAP",
+      runAgent: async () => {
+        ceilingAgentCalls += 1;
+        return JSON.stringify({ payloads: [{ text: JSON.stringify(dispatchReply) }] });
+      },
+    });
+  } catch (err) {
+    ceilingScan = { outcome: "threw", error: err?.message || String(err) };
+  }
+  const ceilingHttp = await handleDispatchNext({
+    findActive: () => null,
+    load: memoryQueue([]).load,
+    save: () => {},
+    scan: async () => ceilingScan,
+    startRun: () => {
+      throw new Error("startRun must not run on ceiling");
+    },
+  });
+  const ceilingCases = [
+    check("ceiling-agent-not-called", ceilingAgentCalls === 0, ceilingAgentCalls),
+    check("ceiling-outcome", ceilingScan.outcome === "developer-attention-required", ceilingScan.outcome),
+    check("ceiling-reason", ceilingHttp.body.reason === "developer-attention-required", ceilingHttp.body.reason),
+    check("ceiling-open-count", ceilingHttp.body.open_count === 10, ceilingHttp.body.open_count),
+    check("ceiling-not-dispatched", ceilingHttp.body.dispatched === false),
+  ];
+
+  const nineOpen = Array.from({ length: 9 }, (_, i) => ({
+    id: `TODO-${String(i + 1).padStart(4, "0")}`,
+    status: "open",
+    summary: `q${i}`,
+    blocks: [],
+  }));
+  let nineAgentCalls = 0;
+  dispatchMocks.started = [];
+  const mqNine = memoryQueue([]);
+  const nineHttp = await handleDispatchNext({
+    ...dispatchMocks(),
+    load: mqNine.load,
+    save: mqNine.save,
+    scan: async () =>
+      scanRoadmapForWork({
+        thecoachRepo: "/tmp/thecoach-does-not-matter",
+        readTodo: () => JSON.stringify(nineOpen),
+        readRoadmap: () => "# ROADMAP",
+        runAgent: async () => {
+          nineAgentCalls += 1;
+          return JSON.stringify({ payloads: [{ text: JSON.stringify(dispatchReply) }] });
+        },
+      }),
+  });
+  const nineEmptyCases = [
+    check("nine-empty-blocks-agent-called", nineAgentCalls === 1, nineAgentCalls),
+    check("nine-empty-blocks-dispatched", nineHttp.body.dispatched === true, nineHttp.body),
   ];
 
   const mqNothing = memoryQueue([]);
+  const idleNothing = memoryIdle();
   const nothingResult = await handleDispatchNext({
     findActive: () => null,
     load: mqNothing.load,
     save: mqNothing.save,
-    scan: async () => ({ outcome: "queue-empty" }),
+    loadIdle: idleNothing.loadIdle,
+    saveIdle: idleNothing.saveIdle,
+    thecoachRepo: "/tmp/idle",
+    scan: async () => ({ outcome: "nothing-dispatchable", open_count: 2, todo_ids: ["TODO-0004", "TODO-0006"] }),
     startRun: () => {
       throw new Error("startRun must not run");
     },
   });
   const nothingCases = [
     check("3-status-200", nothingResult.status === 200),
-    check("3-body-identical-to-queue-empty", JSON.stringify(nothingResult.body) === JSON.stringify({ ok: true, dispatched: false, reason: "queue empty" }), JSON.stringify(nothingResult.body)),
+    check("3-reason-nothing-dispatchable", nothingResult.body.reason === "nothing-dispatchable", nothingResult.body.reason),
+    check("3-open-count", nothingResult.body.open_count === 2, nothingResult.body.open_count),
+    check("3-todo-ids", JSON.stringify(nothingResult.body.todo_ids) === JSON.stringify(["TODO-0004", "TODO-0006"]), nothingResult.body.todo_ids),
     check("3-no-queue-item", mqNothing.get().length === 0),
+    check("3-no-needs-developer-decision", nothingResult.body.reason !== "needs-developer-decision"),
+    check("3-idle-incremented", idleNothing.get().consecutive_idle === 1, idleNothing.get()),
   ];
 
-  const failOpenScans = [];
-  failOpenScans.push(
+  const agentFailScans = [];
+  agentFailScans.push(
     await scanRoadmapForWork({
       thecoachRepo: "/tmp/thecoach-does-not-matter",
       readRoadmap: () => "# ROADMAP",
@@ -1577,7 +2095,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
       },
     }),
   );
-  failOpenScans.push(
+  agentFailScans.push(
     await scanRoadmapForWork({
       thecoachRepo: "/tmp/thecoach-does-not-matter",
       readRoadmap: () => "# ROADMAP",
@@ -1587,7 +2105,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
       },
     }),
   );
-  failOpenScans.push(
+  agentFailScans.push(
     await scanRoadmapForWork({
       thecoachRepo: "/tmp/thecoach-does-not-matter",
       readRoadmap: () => "# ROADMAP",
@@ -1595,7 +2113,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
       runAgent: async () => "this is not json {",
     }),
   );
-  failOpenScans.push(
+  agentFailScans.push(
     await scanRoadmapForWork({
       thecoachRepo: "/tmp/thecoach-does-not-matter",
       readRoadmap: () => "# ROADMAP",
@@ -1603,29 +2121,8 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
       runAgent: async () => JSON.stringify({ payloads: [{ text: "I think we should dispatch something." }] }),
     }),
   );
-  failOpenScans.push(
-    await scanRoadmapForWork({
-      thecoachRepo: "/tmp/thecoach-does-not-matter",
-      readRoadmap: () => {
-        throw new Error("ENOENT: no such file or directory, open '.../_SSoT/ROADMAP.md'");
-      },
-      readTodo: () => "[]",
-      runAgent: async () => {
-        throw new Error("runAgent must not run after ROADMAP.md read failure");
-      },
-    }),
-  );
-  failOpenScans.push(
-    await scanRoadmapForWork({
-      thecoachRepo: path.join(os.tmpdir(), `no-such-thecoach-${Date.now()}`),
-      runAgent: async () => {
-        throw new Error("runAgent must not run after developer_todo.json ENOENT");
-      },
-    }),
-  );
-
-  const failOpenHttp = [];
-  for (const [i, scanResult] of failOpenScans.entries()) {
+  const agentFailHttp = [];
+  for (const [i, scanResult] of agentFailScans.entries()) {
     const mq = memoryQueue([]);
     const httpResult = await handleDispatchNext({
       findActive: () => null,
@@ -1633,22 +2130,97 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
       save: mq.save,
       scan: async () => scanResult,
       startRun: () => {
-        throw new Error("startRun must not run on fail-open");
+        throw new Error("startRun must not run on agent-fail");
       },
     });
-    failOpenHttp.push(
+    agentFailHttp.push(
       check(
-        `4-fail-open-${i}-http`,
+        `4-agent-fail-${i}-http`,
         httpResult.status === 200 &&
-          JSON.stringify(httpResult.body) === JSON.stringify({ ok: true, dispatched: false, reason: "queue empty" }) &&
+          httpResult.body.dispatched === false &&
+          httpResult.body.reason === "nothing-dispatchable" &&
           mq.get().length === 0,
         { status: httpResult.status, body: httpResult.body, queueLen: mq.get().length, failReason: scanResult.failReason },
       ),
     );
   }
-  const failOpenScanOutcomes = failOpenScans.map((s, i) =>
-    check(`4-scan-${i}-queue-empty`, s.outcome === "queue-empty" && Boolean(s.failReason), s),
+  const agentFailScanOutcomes = agentFailScans.map((s, i) =>
+    check(`4-scan-${i}-nothing-dispatchable`, s.outcome === "nothing-dispatchable" && Boolean(s.failReason), s),
   );
+
+  let roadmapThrowAgent = 0;
+  let roadmapThrew = false;
+  try {
+    await scanRoadmapForWork({
+      thecoachRepo: "/tmp/thecoach-does-not-matter",
+      readTodo: () => "[]",
+      readRoadmap: () => {
+        throw new Error("ENOENT: no such file or directory, open '.../_SSoT/ROADMAP.md'");
+      },
+      runAgent: async () => {
+        roadmapThrowAgent += 1;
+        throw new Error("runAgent must not run after ROADMAP.md read failure");
+      },
+    });
+  } catch {
+    roadmapThrew = true;
+  }
+  const missingRepo = path.join(os.tmpdir(), `no-such-thecoach-${Date.now()}`);
+  let missingRepoAgent = 0;
+  let missingRepoThrew = false;
+  let missingRepoErr = null;
+  try {
+    await scanRoadmapForWork({
+      thecoachRepo: missingRepo,
+      runAgent: async () => {
+        missingRepoAgent += 1;
+        throw new Error("runAgent must not run after developer_todo.json ENOENT");
+      },
+    });
+  } catch (err) {
+    missingRepoThrew = true;
+    missingRepoErr = err;
+  }
+  const mqFileFail = memoryQueue([]);
+  let fileFailAgent = 0;
+  const fileFailHttp = await handleDispatchNext({
+    findActive: () => null,
+    load: mqFileFail.load,
+    save: mqFileFail.save,
+    scan: async () =>
+      scanRoadmapForWork({
+        thecoachRepo: missingRepo,
+        runAgent: async () => {
+          fileFailAgent += 1;
+          throw new Error("runAgent must not run");
+        },
+      }),
+    startRun: () => {
+      throw new Error("startRun must not run on file-fail");
+    },
+  });
+  let unsetRepoAgent = 0;
+  let unsetRepoThrew = false;
+  try {
+    await scanRoadmapForWork({
+      thecoachRepo: "",
+      runAgent: async () => {
+        unsetRepoAgent += 1;
+        throw new Error("runAgent must not run when repo unset");
+      },
+    });
+  } catch {
+    unsetRepoThrew = true;
+  }
+  const fileFailCases = [
+    check("file-roadmap-throws", roadmapThrew === true && roadmapThrowAgent === 0, { roadmapThrew, roadmapThrowAgent }),
+    check("file-missing-repo-throws", missingRepoThrew === true && missingRepoAgent === 0, { missingRepoThrew, missingRepoAgent, code: missingRepoErr?.code }),
+    check("file-missing-repo-enoent", missingRepoErr?.code === "ENOENT", missingRepoErr?.code),
+    check("file-fail-http-not-queue-empty", fileFailHttp.status === 500 && fileFailHttp.body.reason !== "queue empty" && fileFailHttp.body.ok === false, fileFailHttp),
+    check("file-fail-http-not-nothing-dispatchable", fileFailHttp.body.reason !== "nothing-dispatchable", fileFailHttp.body),
+    check("file-fail-agent-not-called", fileFailAgent === 0, fileFailAgent),
+    check("file-unset-repo-throws", unsetRepoThrew === true && unsetRepoAgent === 0, { unsetRepoThrew, unsetRepoAgent }),
+  ];
 
   const humanItem = {
     id: "human-pending-1",
@@ -1693,7 +2265,26 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     ),
   ];
 
-  const missingRepo = path.join(os.tmpdir(), `no-such-thecoach-${Date.now()}`);
+  const activeHttp = await handleDispatchNext({
+    findActive: () => ({ id: "run-active", status: "running", run_number: 7 }),
+    load: () => {
+      throw new Error("load must not run on active-run");
+    },
+    scan: async () => {
+      throw new Error("scan must not run on active-run");
+    },
+    startRun: () => {
+      throw new Error("startRun must not run on active-run");
+    },
+  });
+  const activeCases = [
+    check("active-run-reason", activeHttp.body.reason === "active-run", activeHttp.body.reason),
+    check("active-run-not-dispatched", activeHttp.body.dispatched === false),
+    check("active-run-has-open-count", typeof activeHttp.body.open_count === "number", activeHttp.body),
+    check("active-run-has-todo-ids", Array.isArray(activeHttp.body.todo_ids), activeHttp.body),
+    check("active-run-not-needs-developer-decision", activeHttp.body.reason !== "needs-developer-decision"),
+  ];
+
   let todoMissingThrew = false;
   let todoMissingCode = null;
   try {
@@ -1722,12 +2313,12 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     },
     readTodo: (repo) => {
       todoRepos.push(repo);
-      return '[{"id":"TODO-0001"}]';
+      return '[{"id":"TODO-0001","status":"open","blocks":[]}]';
     },
     runAgent: async () => JSON.stringify({ payloads: [{ text: '{"decision":"nothing-to-do"}' }] }),
   });
   const pathCases = [
-    check("path-scan-queue-empty", pathScan.outcome === "queue-empty" && !pathScan.failReason, pathScan),
+    check("path-scan-nothing-dispatchable", pathScan.outcome === "nothing-dispatchable" && !pathScan.failReason, pathScan),
     check("path-scan-does-not-fetch", fetchedDuringScan.length === 0, fetchedDuringScan),
     check("path-roadmap-is-thecoach-env", roadmapRepos[0] === "/mnt/c/Users/lahad/Projects/TheCoach", roadmapRepos),
     check("path-todo-is-thecoach-env", todoRepos[0] === "/mnt/c/Users/lahad/Projects/TheCoach", todoRepos),
@@ -1742,18 +2333,140 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     check("timeout-cli-above-measured-band", PLANNER_CLI_TIMEOUT_SEC >= 100, PLANNER_CLI_TIMEOUT_SEC),
   ];
 
+  const idle = memoryIdle();
+  const idleResults = [];
+  for (let i = 1; i <= 24; i += 1) {
+    const r = await handleDispatchNext({
+      findActive: () => null,
+      load: memoryQueue([]).load,
+      save: () => {},
+      loadIdle: idle.loadIdle,
+      saveIdle: idle.saveIdle,
+      thecoachRepo: "/tmp/idle",
+      scan: async () => ({ outcome: "nothing-dispatchable", open_count: 0, todo_ids: [] }),
+      startRun: () => {
+        throw new Error("startRun must not run");
+      },
+    });
+    idleResults.push({ i, escalated: r.body.escalated === true, consecutive: idle.get().consecutive_idle });
+  }
+  dispatchMocks.started = [];
+  const idleAfterDispatch = memoryIdle({ consecutive_idle: 5, last_idle_at: "t", last_escalated_at: null });
+  await handleDispatchNext({
+    ...dispatchMocks(),
+    load: memoryQueue([]).load,
+    save: () => {},
+    loadIdle: idleAfterDispatch.loadIdle,
+    saveIdle: idleAfterDispatch.saveIdle,
+    thecoachRepo: "/tmp/idle",
+    scan: async () => ({ outcome: "dispatch", decision: dispatchReply, blockedScopes: [], open_count: 0, todo_ids: [] }),
+  });
+  const idleBeforeActive = memoryIdle({ consecutive_idle: 3, last_idle_at: "t", last_escalated_at: null });
+  await handleDispatchNext({
+    findActive: () => ({ id: "x", status: "running", run_number: 1 }),
+    loadIdle: idleBeforeActive.loadIdle,
+    saveIdle: idleBeforeActive.saveIdle,
+    thecoachRepo: "/tmp/idle",
+  });
+  const idleBeforeCeiling = memoryIdle({ consecutive_idle: 3, last_idle_at: "t", last_escalated_at: null });
+  await handleDispatchNext({
+    findActive: () => null,
+    load: memoryQueue([]).load,
+    save: () => {},
+    loadIdle: idleBeforeCeiling.loadIdle,
+    saveIdle: idleBeforeCeiling.saveIdle,
+    thecoachRepo: "/tmp/idle",
+    scan: async () => ({ outcome: "developer-attention-required", open_count: 10, todo_ids: tenOpen.map((e) => e.id) }),
+  });
+  let idleThrowLoads = 0;
+  const idleSwallowHttp = await handleDispatchNext({
+    ...dispatchMocks(),
+    load: memoryQueue([]).load,
+    save: () => {},
+    loadIdle: () => {
+      idleThrowLoads += 1;
+      throw new Error("idle read boom");
+    },
+    saveIdle: () => {
+      throw new Error("idle write boom");
+    },
+    thecoachRepo: "/tmp/idle",
+    scan: async () => ({ outcome: "dispatch", decision: dispatchReply, blockedScopes: [], open_count: 0, todo_ids: [] }),
+  });
+  const idleCases = [
+    check("idle-count-after-24", idle.get().consecutive_idle === 24, idle.get()),
+    check("idle-escalate-at-12", idleResults[11].escalated === true && idleResults[11].consecutive === 12, idleResults[11]),
+    check("idle-escalate-at-24", idleResults[23].escalated === true && idleResults[23].consecutive === 24, idleResults[23]),
+    check("idle-not-at-11", idleResults[10].escalated === false, idleResults[10]),
+    check("idle-not-at-13", idleResults[12].escalated === false, idleResults[12]),
+    check("idle-reset-on-dispatch", idleAfterDispatch.get().consecutive_idle === 0, idleAfterDispatch.get()),
+    check("idle-untouched-on-active-run", idleBeforeActive.get().consecutive_idle === 3, idleBeforeActive.get()),
+    check("idle-untouched-on-ceiling", idleBeforeCeiling.get().consecutive_idle === 3, idleBeforeCeiling.get()),
+    check("idle-failure-swallowed", idleSwallowHttp.body.dispatched === true, idleSwallowHttp.body),
+  ];
+
+  const storedTodos = [
+    { id: "TODO-0001", status: "open", summary: "Need a yes/no on adding CI", blocks: [] },
+  ];
+  const writes = [];
+  const dupScan = await scanRoadmapForWork({
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
+    readTodo: () => JSON.stringify(storedTodos),
+    readRoadmap: () => "# ROADMAP",
+    writeTodo: (_repo, entries) => {
+      writes.push(entries);
+    },
+    runAgent: async () => JSON.stringify({ payloads: [{ text: JSON.stringify(recordQuestionReply) }] }),
+  });
+  const freshWrites = [];
+  const freshStored = [];
+  const appendScan = await scanRoadmapForWork({
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
+    readTodo: () => JSON.stringify(freshStored),
+    readRoadmap: () => "# ROADMAP",
+    writeTodo: (_repo, entries) => {
+      freshWrites.push(JSON.parse(JSON.stringify(entries)));
+      freshStored.splice(0, freshStored.length, ...entries);
+    },
+    runAgent: async () =>
+      JSON.stringify({
+        payloads: [{ text: JSON.stringify({ ...recordQuestionReply, summary: "brand new question", blocks: [] }) }],
+      }),
+  });
+  const writerCases = [
+    check("dup-summary-no-write", writes.length === 0, writes.length),
+    check("dup-summary-nothing-dispatchable", dupScan.outcome === "nothing-dispatchable", dupScan.outcome),
+    check("append-wrote-once", freshWrites.length === 1, freshWrites.length),
+    check("append-status-open", freshStored[0]?.status === "open", freshStored[0]),
+    check("append-blocks-empty", Array.isArray(freshStored[0]?.blocks) && freshStored[0].blocks.length === 0, freshStored[0]),
+    check("append-id", freshStored[0]?.id === "TODO-0001", freshStored[0]?.id),
+    check("append-outcome", appendScan.outcome === "nothing-dispatchable", appendScan.outcome),
+  ];
+
+  console.log = origLog;
+
   const allCases = [
     ...parseCases,
     ...extractCases,
+    ...backstopDirectCases,
     ...dispatchCases,
-    ...needsCases,
+    ...blockedScopeCases,
+    ...missingScopesCases,
+    ...emptyBlocksCases,
+    ...missingBlocksCases,
+    ...ceilingCases,
+    ...nineEmptyCases,
     ...nothingCases,
-    ...failOpenScanOutcomes,
-    ...failOpenHttp,
+    ...agentFailScanOutcomes,
+    ...agentFailHttp,
+    ...fileFailCases,
     ...occupiedCases,
+    ...activeCases,
     ...todoCases,
     ...pathCases,
     ...timeoutCases,
+    ...idleCases,
+    ...writerCases,
   ];
 
   const report = {
@@ -1762,7 +2475,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     failures,
     cases: allCases,
   };
-  console.log(JSON.stringify(report, null, 2));
+  origLog(JSON.stringify(report, null, 2));
   process.exit(failures.length === 0 ? 0 : 1);
 }
 
