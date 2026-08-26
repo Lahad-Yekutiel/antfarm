@@ -7,7 +7,11 @@ import { readOpenClawConfig, writeOpenClawConfig } from "../installer/openclaw-c
 
 const MEDIC_CRON_NAME = "antfarm/medic";
 const MEDIC_EVERY_MS = 5 * 60 * 1000; // 5 minutes
-const MEDIC_MODEL = "default";
+// A real, configured model id — never the literal "default". OpenClaw resolves the bare
+// string "default" to the OpenAI provider, which is not configured on this install, so every
+// scheduled medic run failed with `FailoverError: Unknown model: openai/default`.
+// Confirmed 2026-08-12, still live 2026-08-25 (72 consecutive errors); fixed under TASK-031.
+const MEDIC_MODEL = "anthropic/claude-sonnet-5";
 const MEDIC_TIMEOUT_SECONDS = 120;
 
 function buildMedicPrompt(): string {
@@ -34,7 +38,16 @@ async function ensureMedicAgent(): Promise<void> {
   try {
     const { path, config } = await readOpenClawConfig();
     const agents = config.agents?.list ?? [];
-    if (agents.some((a: any) => a.id === "antfarm-medic")) return;
+    const existing = agents.find((a: any) => a.id === "antfarm-medic") as any;
+    if (existing) {
+      // Repair entries written by older versions that stored the literal string "default",
+      // which the cron then inherited and failed on every run.
+      if (!existing.model || existing.model === "default") {
+        existing.model = MEDIC_MODEL;
+        await writeOpenClawConfig(path, config);
+      }
+      return;
+    }
 
     if (!config.agents) config.agents = {};
     if (!config.agents.list) config.agents.list = [];

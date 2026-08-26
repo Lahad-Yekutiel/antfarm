@@ -158,6 +158,13 @@ export async function createAgentCronJob(job: {
 
     if (job.delivery?.mode === "announce") {
       args.push("--announce");
+    } else if (job.delivery?.mode === "none") {
+      // Say "no delivery" explicitly. `openclaw cron add` otherwise defaults to
+      // announce/last, and with no chat channel configured every run then fails on delivery
+      // ("Channel is required (no configured channels detected)") — marking a job that did
+      // its work perfectly as errored. Callers all pass mode "none"; honour it.
+      // Confirmed on antfarm/medic's first restored run, 2026-08-25 15:16Z (TASK-031).
+      args.push("--no-deliver");
     }
 
     if (!job.enabled) {
