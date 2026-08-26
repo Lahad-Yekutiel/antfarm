@@ -80,7 +80,14 @@ const TASK_ID_RE = /TASK-(\d+)/i;
 const PHASE_HEADING_RE = /phase\s+(\d+[a-z]?)\b/i;
 /** `## Phase 9 — ...` / `## Phase 4B — ...` — ground truth for dispatch phase. */
 const PHASE_HEADING_LINE_RE = /^##\s+Phase\s+(\d+[a-z]?)\b/i;
-const CHECKBOX_LINE_RE = /^\s*-\s*\[[ xX]\]/;
+/** Open checklist items only. `[x]` / `[X]` are completed and must not dispatch. */
+const OPEN_CHECKBOX_LINE_RE = /^\s*-\s*\[\s*\]/;
+const RESOLVED_CHECKBOX_LINE_RE = /^\s*-\s*\[[xX]\]/;
+/**
+ * Wall-clock budget for a single ROADMAP.md walk. A zero-length-regex hang
+ * would never return; this is the guard that makes that class of bug visible.
+ */
+const ROADMAP_PARSE_BUDGET_MS = 2_000;
 /**
  * Measured 2026-08-26 on the trial clone: git fetch origin = 873ms / 928ms
  * (two consecutive runs), rev-parse = 1.8ms. 25s is ~27× observed fetch and
@@ -195,6 +202,7 @@ function identifyAuthRole(req) {
 const LOOP_TOKEN_ALLOWLIST = new Set([
   "GET /queue/check",
   "GET /queue",
+  "GET /queue/scan-state",
   "GET /status",
   "GET /steps",
   "POST /queue/dispatch-next",
@@ -489,22 +497,45 @@ function extractAllTaskIdsFromText(...parts) {
   return ids;
 }
 
-function collectRoadmapPhaseHeadings(roadmapText) {
-  const text = String(roadmapText || "");
-  const headings = [];
-  const lineRe = /^.*$/gm;
-  let m;
-  while ((m = lineRe.exec(text)) !== null) {
-    const hm = m[0].match(PHASE_HEADING_LINE_RE);
-    if (hm) {
-      headings.push({
-        phaseId: hm[1].toLowerCase(),
-        scope: canonicalizeScopeToken(`phase:${hm[1]}`),
-        index: m.index,
-        heading: m[0],
-      });
+/**
+ * Walk ROADMAP.md line-by-line with a wall-clock budget. Uses split("\\n")
+ * rather than `/^.*$/gm` so a blank line cannot pin lastIndex and spin
+ * the event loop. Index is the original-string offset of each line start
+ * (counts the stripped `\\n`, and keeps `\\r` on CRLF lines).
+ */
+function iterateRoadmapLines(text, onLine, deps = {}) {
+  const budget = Number.isFinite(deps.parseBudgetMs) ? deps.parseBudgetMs : ROADMAP_PARSE_BUDGET_MS;
+  const t0 = nowMs(deps);
+  const lines = String(text || "").split("\n");
+  let index = 0;
+  for (let i = 0; i < lines.length; i += 1) {
+    if (nowMs(deps) - t0 > budget) {
+      const err = new Error(`roadmap-parse-timeout after ${i} lines`);
+      err.reason = "roadmap-parse-timeout";
+      throw err;
     }
+    onLine(lines[i], index);
+    index += lines[i].length + 1;
   }
+}
+
+function collectRoadmapPhaseHeadings(roadmapText, deps = {}) {
+  const headings = [];
+  iterateRoadmapLines(
+    roadmapText,
+    (line, index) => {
+      const hm = line.match(PHASE_HEADING_LINE_RE);
+      if (hm) {
+        headings.push({
+          phaseId: hm[1].toLowerCase(),
+          scope: canonicalizeScopeToken(`phase:${hm[1]}`),
+          index,
+          heading: line,
+        });
+      }
+    },
+    deps,
+  );
   return headings;
 }
 
@@ -517,20 +548,24 @@ function phaseHeadingAt(headings, index) {
   return found;
 }
 
-function findTaskCheckboxInRoadmap(roadmapText, taskId) {
-  const text = String(roadmapText || "");
+function findTaskCheckboxInRoadmap(roadmapText, taskId, deps = {}) {
   const num = String(taskId || "").replace(/^TASK-/i, "");
   if (!/^\d+$/.test(num)) return null;
   const padded = num.padStart(3, "0");
   const idRe = new RegExp(`TASK-0*${Number(padded)}\\b`, "i");
-  const lineRe = /^.*$/gm;
-  let m;
-  while ((m = lineRe.exec(text)) !== null) {
-    if (CHECKBOX_LINE_RE.test(m[0]) && idRe.test(m[0])) {
-      return { index: m.index, line: m[0], taskId: `TASK-${padded}` };
-    }
-  }
-  return null;
+  let hit = null;
+  iterateRoadmapLines(
+    roadmapText,
+    (line, index) => {
+      if (hit) return;
+      const isOpen = OPEN_CHECKBOX_LINE_RE.test(line);
+      const isResolved = RESOLVED_CHECKBOX_LINE_RE.test(line);
+      if (!(isOpen || isResolved) || !idRe.test(line)) return;
+      hit = { index, line, taskId: `TASK-${padded}`, resolved: isResolved };
+    },
+    deps,
+  );
+  return hit;
 }
 
 /**
@@ -538,15 +573,25 @@ function findTaskCheckboxInRoadmap(roadmapText, taskId) {
  * model reply are search keys only; the checkbox line and the `## Phase`
  * heading it sits under are ground truth. No checkbox → unlocatable.
  */
-function locateDispatchInRoadmap(roadmapText, decision) {
-  const headings = collectRoadmapPhaseHeadings(roadmapText);
+function locateDispatchInRoadmap(roadmapText, decision, deps = {}) {
+  const headings = collectRoadmapPhaseHeadings(roadmapText, deps);
   const hints = extractAllTaskIdsFromText(decision?.title, decision?.description, decision?.roadmap_ref);
   if (hints.length === 0) {
     return { ok: false, reason: "item-unlocatable", headings };
   }
   for (const hint of hints) {
-    const hit = findTaskCheckboxInRoadmap(roadmapText, hint);
+    const hit = findTaskCheckboxInRoadmap(roadmapText, hint, deps);
     if (!hit) continue;
+    if (hit.resolved) {
+      return {
+        ok: false,
+        reason: "item-resolved",
+        taskId: hit.taskId,
+        headings,
+        matchIndex: hit.index,
+        line: hit.line,
+      };
+    }
     const heading = phaseHeadingAt(headings, hit.index);
     if (!heading) {
       return {
@@ -569,8 +614,8 @@ function locateDispatchInRoadmap(roadmapText, decision) {
   return { ok: false, reason: "item-unlocatable", headings, hints };
 }
 
-function ledgerKeyFromDecision(decision, roadmapText) {
-  const located = locateDispatchInRoadmap(roadmapText, decision);
+function ledgerKeyFromDecision(decision, roadmapText, deps = {}) {
+  const located = locateDispatchInRoadmap(roadmapText, decision, deps);
   return located.ok ? located.taskId : null;
 }
 
@@ -581,11 +626,15 @@ function resolveQueueItemTaskId(item, deps = {}) {
     const repo = deps.thecoachRepo !== undefined ? deps.thecoachRepo : THECOACH_REPO;
     const readRoadmap = deps.readRoadmap || readRoadmapFile;
     if (!repo && !deps.readRoadmap) return null;
-    const located = locateDispatchInRoadmap(readRoadmap(repo), {
-      title: item?.task,
-      description: "",
-      roadmap_ref: item?.roadmap_ref,
-    });
+    const located = locateDispatchInRoadmap(
+      readRoadmap(repo),
+      {
+        title: item?.task,
+        description: "",
+        roadmap_ref: item?.roadmap_ref,
+      },
+      deps,
+    );
     if (located.ok) return located.taskId;
   } catch {
     // spawn still needs a stable key; a judgment-file miss becomes unledgerable
@@ -800,7 +849,7 @@ function applyIdleTelemetry({ dispatched, reason }, deps = {}) {
       save(repo, state);
       return { escalated: false, idle_state: state };
     }
-    if (reason === "nothing-dispatchable") {
+    if (reason === "nothing-dispatchable" || reason === "scan-errored" || reason === "queue-item-rejected") {
       const now = new Date().toISOString();
       const consecutive_idle = (state.consecutive_idle || 0) + 1;
       state = { ...state, consecutive_idle, last_idle_at: now };
@@ -819,7 +868,7 @@ function applyIdleTelemetry({ dispatched, reason }, deps = {}) {
   }
 }
 
-function evaluateDispatchBackstop(scopes, blockedScopes, roadmapRef, roadmapText, decision) {
+function evaluateDispatchBackstop(scopes, blockedScopes, roadmapRef, roadmapText, decision, deps = {}) {
   const blockedRaw = blockedScopes instanceof Set ? [...blockedScopes] : [...(blockedScopes || [])];
   const blocked = new Set();
   for (const raw of blockedRaw) {
@@ -836,7 +885,7 @@ function evaluateDispatchBackstop(scopes, blockedScopes, roadmapRef, roadmapText
     return { ok: false, reason, scopes: scopes ?? null, blocked: [...blocked], detail: listed };
   }
 
-  const headings = collectRoadmapPhaseHeadings(roadmapText);
+  const headings = collectRoadmapPhaseHeadings(roadmapText, deps);
   const assertedPhases = listed.canonical.filter((s) => s.startsWith("phase:"));
   for (const phaseScope of assertedPhases) {
     if (!headings.some((h) => h.scope === phaseScope)) {
@@ -880,6 +929,7 @@ function evaluateDispatchBackstop(scopes, blockedScopes, roadmapRef, roadmapText
   const located = locateDispatchInRoadmap(
     roadmapText,
     decision || { title: "", description: "", roadmap_ref: roadmapRef },
+    deps,
   );
   if (!located.ok) {
     return {
@@ -1343,6 +1393,19 @@ async function scanRoadmapForWork(deps = {}) {
   }
 
   const roadmap = readRoadmap(thecoachRepo);
+  try {
+    collectRoadmapPhaseHeadings(roadmap, deps);
+  } catch (err) {
+    if (err?.reason === "roadmap-parse-timeout") {
+      return {
+        outcome: "developer-attention-required",
+        ...snapshotFields,
+        failReason: err.message,
+        backstop_reason: "roadmap-parse-timeout",
+      };
+    }
+    throw err;
+  }
 
   let parsed;
   try {
@@ -1351,20 +1414,45 @@ async function scanRoadmapForWork(deps = {}) {
     const replyText = extractAgentReplyText(cliStdout);
     parsed = parseAgentDecision(replyText);
     if (!parsed.ok) {
-      return { outcome: "nothing-dispatchable", ...snapshotFields, failReason: parsed.error };
+      return {
+        outcome: "developer-attention-required",
+        ...snapshotFields,
+        failReason: parsed.error,
+        backstop_reason: "agent-unparseable",
+      };
     }
   } catch (err) {
-    return { outcome: "nothing-dispatchable", ...snapshotFields, failReason: err?.message || String(err) };
+    const reason = err?.reason === "roadmap-parse-timeout" ? "roadmap-parse-timeout" : "agent-unparseable";
+    return {
+      outcome: "developer-attention-required",
+      ...snapshotFields,
+      failReason: err?.message || String(err),
+      backstop_reason: reason,
+    };
   }
 
   if (parsed.decision.decision === "dispatch") {
-    const backstop = evaluateDispatchBackstop(
-      parsed.decision.scopes,
-      snapshot.blockedScopes,
-      parsed.decision.roadmap_ref,
-      roadmap,
-      parsed.decision,
-    );
+    let backstop;
+    try {
+      backstop = evaluateDispatchBackstop(
+        parsed.decision.scopes,
+        snapshot.blockedScopes,
+        parsed.decision.roadmap_ref,
+        roadmap,
+        parsed.decision,
+        deps,
+      );
+    } catch (err) {
+      if (err?.reason === "roadmap-parse-timeout") {
+        return {
+          outcome: "developer-attention-required",
+          ...snapshotFields,
+          failReason: err.message,
+          backstop_reason: "roadmap-parse-timeout",
+        };
+      }
+      throw err;
+    }
     if (!backstop.ok) {
       logDispatchNext(
         `backstop-rejected-dispatch reason=${backstop.reason} scopes=${JSON.stringify(parsed.decision.scopes)} derived=${JSON.stringify(backstop.derived ?? null)} asserted=${JSON.stringify(backstop.asserted ?? backstop.assertedPhases ?? null)} blocked=${JSON.stringify([...snapshot.blockedScopes])}`,
@@ -1442,6 +1530,45 @@ function buildQueuedTaskText({ repoPath, branch, task }) {
   return `REPO: ${repoPath}\nBRANCH: ${branch}\n\n${task}`;
 }
 
+function finishScanErrored(scanId, error, snapshot, deps) {
+  const body = withIdleTelemetry(
+    {
+      ok: false,
+      dispatched: false,
+      reason: "scan-errored",
+      error: typeof error === "string" ? error : error?.message || String(error),
+      ...(snapshot || {}),
+    },
+    deps,
+  );
+  finishScanState(
+    scanId,
+    {
+      dispatched: false,
+      reason: "scan-errored",
+      error: body.error,
+      escalated: body.escalated === true,
+      ...(snapshot || {}),
+    },
+    deps,
+  );
+  return body;
+}
+
+function publicScanState(deps = {}) {
+  const state = loadScanState(deps);
+  if (!state) {
+    return { ok: true, scan: null, backstop_reason: null };
+  }
+  return {
+    ok: true,
+    scan: state,
+    backstop_reason: state.outcome?.backstop_reason ?? state.previousOutcome?.backstop_reason ?? null,
+    scan_status: state.status ?? null,
+    last_scan_reason: state.outcome?.reason ?? state.previousOutcome?.reason ?? null,
+  };
+}
+
 function finishScanState(scanId, outcome, deps) {
   const current = loadScanState(deps);
   if (!current || current.scanId !== scanId) return;
@@ -1472,13 +1599,45 @@ async function spawnPendingQueueItem(queue, idx, deps = {}) {
 
   const ledgerKey = resolveQueueItemTaskId(item, deps);
   if (!ledgerKey) {
+    item.status = "flagged";
+    item.resolvedAt = new Date().toISOString();
+    item.note = "unledgerable dispatch: no TASK-NNN; parked so the queue can advance";
+    save(queue);
+    try {
+      const appendTodo = deps.appendTodo || ((repo, draft) => appendDeveloperTodoEntry(repo, draft, deps));
+      const repo = deps.thecoachRepo !== undefined ? deps.thecoachRepo : THECOACH_REPO;
+      if (repo || deps.appendTodo) {
+        const written = appendTodo(repo, {
+          summary: `Queue item ${item.id} has no TASK-NNN and cannot be dispatched`,
+          why: "An item with no stable identity cannot be ledgered; leaving it pending blocked all later work.",
+          source: `queue:${item.id}`,
+          type: "blocked",
+          evidence: String(item.task || "(empty task)"),
+          reply_needed: `Remove or rewrite queue item ${item.id} with a TASK-NNN, or delete it from the queue.`,
+          blocks: [],
+        });
+        if (!written.appended) {
+          logDispatchNext(`todo writer skipped duplicate summary for unledgerable queue item ${item.id}`);
+        }
+      }
+    } catch (err) {
+      logDispatchNextError(`todo writer failed for unledgerable queue item ${item.id}: ${err?.message || String(err)}`);
+    }
+    const nextIdx = queue.findIndex((it) => it.status === "pending");
+    if (nextIdx >= 0) {
+      return spawnPendingQueueItem(queue, nextIdx, deps);
+    }
     return {
-      status: 400,
-      body: {
-        ok: false,
-        error: "unledgerable dispatch: no TASK-NNN resolved from the queue item or roadmap",
-        reason: "item-unlocatable",
-      },
+      status: 200,
+      body: withIdleTelemetry(
+        {
+          ok: true,
+          dispatched: false,
+          reason: "queue-item-rejected",
+          queueItemId: item.id,
+        },
+        deps,
+      ),
     };
   }
   if (ledgerBlocksKey(loadLedger(deps), ledgerKey)) {
@@ -1597,11 +1756,7 @@ async function runBackgroundScanAndDispatch(deps, scanId) {
       scanResult = await scan(deps);
     } catch (err) {
       logDispatchNextError(`background roadmap scan failed: ${err?.message || String(err)}`);
-      finishScanState(
-        scanId,
-        { dispatched: false, reason: "scan-errored", error: err?.message || String(err) },
-        deps,
-      );
+      finishScanErrored(scanId, err, {}, deps);
       return;
     }
 
@@ -1638,14 +1793,10 @@ async function runBackgroundScanAndDispatch(deps, scanId) {
       logDispatchNext(`roadmap auto-queued ${autoItem.id} ref=${d.roadmap_ref}`);
       const spawned = await spawnPendingQueueItem(queue, queue.length - 1, deps);
       if (spawned.status !== 200 || spawned.body?.dispatched !== true) {
-        finishScanState(
+        finishScanErrored(
           scanId,
-          {
-            dispatched: false,
-            reason: "scan-errored",
-            error: spawned.body?.error || `spawn status ${spawned.status}`,
-            ...snapshot,
-          },
+          spawned.body?.error || `spawn status ${spawned.status}`,
+          snapshot,
           deps,
         );
         return;
@@ -1667,7 +1818,13 @@ async function runBackgroundScanAndDispatch(deps, scanId) {
     if (scanResult.outcome === "developer-attention-required") {
       finishScanState(
         scanId,
-        { dispatched: false, reason: "developer-attention-required", ...snapshot },
+        {
+          dispatched: false,
+          reason: "developer-attention-required",
+          backstop_reason: scanResult.backstop_reason ?? null,
+          failReason: scanResult.failReason ?? null,
+          ...snapshot,
+        },
         deps,
       );
       return;
@@ -1676,12 +1833,13 @@ async function runBackgroundScanAndDispatch(deps, scanId) {
     if (scanResult.failReason) {
       logDispatchNextError(`roadmap scan agent/parse failed; nothing-dispatchable: ${scanResult.failReason}`);
     }
-    withIdleTelemetry(
+    const idleBody = withIdleTelemetry(
       attachOpenSnapshot(
         {
           ok: true,
           dispatched: false,
           reason: "nothing-dispatchable",
+          backstop_reason: scanResult.backstop_reason ?? null,
           ...(scanResult.backstop_rejected ? { backstop_rejected: true } : {}),
           ...(scanResult.ledger_blocked ? { ledger_blocked: scanResult.ledger_blocked } : {}),
         },
@@ -1698,17 +1856,14 @@ async function runBackgroundScanAndDispatch(deps, scanId) {
         backstop_reason: scanResult.backstop_reason ?? null,
         ledger_blocked: scanResult.ledger_blocked ?? null,
         failReason: scanResult.failReason ?? null,
+        escalated: idleBody.escalated === true,
         ...snapshot,
       },
       deps,
     );
   } catch (err) {
     logDispatchNextError(`background scan unhandled: ${err?.message || String(err)}`);
-    finishScanState(
-      scanId,
-      { dispatched: false, reason: "scan-errored", error: err?.message || String(err) },
-      deps,
-    );
+    finishScanErrored(scanId, err, {}, deps);
   }
 }
 
@@ -1761,6 +1916,8 @@ async function handleDispatchNext(deps = {}) {
           dispatched: false,
           reason: "scan-in-progress",
           scanId: existing.scanId,
+          backstop_reason: existing.outcome?.backstop_reason ?? existing.previousOutcome?.backstop_reason ?? null,
+          last_scan_reason: existing.outcome?.reason ?? existing.previousOutcome?.reason ?? null,
         },
         {
           open_count: existing.open_count ?? 0,
@@ -1807,6 +1964,7 @@ async function handleDispatchNext(deps = {}) {
     return { status: 200, body };
   }
 
+  const previousOutcome = existing?.outcome ?? existing?.previousOutcome ?? null;
   const scanId = newScanId();
   saveScanState(
     {
@@ -1815,6 +1973,7 @@ async function handleDispatchNext(deps = {}) {
       startedAt: new Date(now).toISOString(),
       finishedAt: null,
       outcome: null,
+      previousOutcome,
       open_count: snapshot.open_count,
       todo_ids: snapshot.todo_ids,
     },
@@ -1831,6 +1990,8 @@ async function handleDispatchNext(deps = {}) {
         dispatched: false,
         reason: "scan-started",
         scanId,
+        backstop_reason: previousOutcome?.backstop_reason ?? null,
+        last_scan_reason: previousOutcome?.reason ?? null,
       },
       snapshot,
     ),
@@ -2138,6 +2299,11 @@ const server = http.createServer(async (req, res) => {
     return json(res, { ok: true, queue: loadQueue() });
   }
 
+  if (p === "/queue/scan-state" && req.method === "GET") {
+    if (!requireAuth(req, res, "GET", "/queue/scan-state")) return;
+    return json(res, publicScanState());
+  }
+
   if (p === "/queue" && req.method === "POST") {
     if (!requireAuth(req, res, "POST", "/queue")) return;
     const body = await readBody(req).catch(() => null);
@@ -2347,6 +2513,7 @@ if (process.argv.includes("--self-test-auth-matrix")) {
     ["POST", "/trigger"],
     ["POST", "/queue"],
     ["GET", "/queue/check"],
+    ["GET", "/queue/scan-state"],
     ["POST", "/queue/dispatch-next"],
     ["GET", "/no-such-endpoint"],
   ];
@@ -2486,11 +2653,19 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
 
   const STUB_ROADMAP = [
     "# ROADMAP",
+    "",
     "## Phase 4A — Visual Design System",
+    "",
+    "- [x] **Design system build-out (TASK-019)**",
+    "- [x] ~~Staging integration (TASK-022)~~",
     "- [ ] **Promote design-preview (TASK-025)**",
+    "",
     "## Phase 4B — Trainer Web App Build",
+    "",
     "- [ ] **Auth rework (TASK-040)**",
+    "",
     "## Phase 9 — Testing & QA Hardening",
+    "",
     "- [ ] **Add reliability note (TASK-099)**",
     "- [ ] **Schema/types drift check (TASK-026)**",
   ].join("\n");
@@ -3107,7 +3282,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     );
   }
   const agentFailScanOutcomes = agentFailScans.map((s, i) =>
-    check(`4-scan-${i}-nothing-dispatchable`, s.outcome === "nothing-dispatchable" && Boolean(s.failReason), s),
+    check(`4-scan-${i}-developer-attention`, s.outcome === "developer-attention-required" && Boolean(s.failReason), s),
   );
 
   let roadmapThrowAgent = 0;
@@ -3724,10 +3899,10 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     check("human-ledger-no-fetch", humanLedgerFetch === 0, humanLedgerFetch),
     check("human-cleared-dispatched", humanClearedHttp.body.dispatched === true, humanClearedHttp.body),
     check("human-cleared-did-start", humanClearedStarted.length === 1, humanClearedStarted.length),
-    check("unledgerable-status-400", unledgerableHttp.status === 400, unledgerableHttp.status),
-    check("unledgerable-reason", unledgerableHttp.body.reason === "item-unlocatable", unledgerableHttp.body),
+    check("unledgerable-status-200", unledgerableHttp.status === 200, unledgerableHttp.status),
+    check("unledgerable-reason", unledgerableHttp.body.reason === "queue-item-rejected", unledgerableHttp.body),
     check("unledgerable-no-startRun", unledgerableStartRun === 0, unledgerableStartRun),
-    check("unledgerable-still-pending", mqUnledgerable.get()[0]?.status === "pending", mqUnledgerable.get()[0]),
+    check("unledgerable-flagged", mqUnledgerable.get()[0]?.status === "flagged", mqUnledgerable.get()[0]),
     check("504-status", http504.status === 504, http504.status),
     check("504-item-still-pending", mq504.get()[0]?.status === "pending", mq504.get()[0]),
     check("504-ledger-failed", ledger504.get()["TASK-026"]?.outcome === "failed", ledger504.get()["TASK-026"]),
@@ -3760,6 +3935,252 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   ];
   await bgSlow.flush();
 
+  const mqAdvance = memoryQueue([
+    {
+      id: "bad-head",
+      task: "human submitted task with no stable id",
+      repoPath: "/tmp/human-repo",
+      status: "pending",
+      runId: null,
+      createdAt: new Date().toISOString(),
+    },
+    {
+      id: "good-next",
+      task: "real work TASK-099",
+      repoPath: "/tmp/human-repo",
+      status: "pending",
+      runId: null,
+      createdAt: new Date().toISOString(),
+    },
+  ]);
+  const advanceStarted = [];
+  const todoWritesAdvance = [];
+  const advanceHttp = await handleDispatchNext({
+    findActive: () => null,
+    load: mqAdvance.load,
+    save: mqAdvance.save,
+    ...memoryLedger(),
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
+    appendTodo: (_repo, draft) => {
+      todoWritesAdvance.push(draft);
+      return { appended: true, entry: draft };
+    },
+    repoExists: () => true,
+    fetchStaging: async () => "advance-tip",
+    startRun: ({ task }) => {
+      advanceStarted.push(task);
+      return { id: "spawn-advance", pid: 6, logPath: "/tmp/spawn-advance.log" };
+    },
+    waitRun: async () => ({ id: "run-advance", status: "running", run_number: 5 }),
+  });
+  const advanceCases = [
+    check("advance-dispatched-second", advanceHttp.body.dispatched === true, advanceHttp.body),
+    check("advance-head-flagged", mqAdvance.get()[0]?.status === "flagged", mqAdvance.get()[0]),
+    check("advance-second-dispatched", mqAdvance.get()[1]?.status === "dispatched", mqAdvance.get()[1]),
+    check("advance-started-good-item", advanceStarted.length === 1 && advanceStarted[0].includes("TASK-099"), advanceStarted),
+    check("advance-todo-scoped-to-item", todoWritesAdvance[0]?.source === "queue:bad-head" && Array.isArray(todoWritesAdvance[0]?.blocks) && todoWritesAdvance[0].blocks.length === 0, todoWritesAdvance[0]),
+  ];
+
+  const stubBlankCases = [
+    check("stub-has-blank-lines", STUB_ROADMAP.split("\n").some((line) => line === ""), STUB_ROADMAP),
+  ];
+  const resolved022 = locateDispatchInRoadmap(STUB_ROADMAP, { title: "TASK-022", description: "", roadmap_ref: "" });
+  const resolved019 = locateDispatchInRoadmap(STUB_ROADMAP, { title: "TASK-019", description: "", roadmap_ref: "" });
+  const resolvedCases = [
+    check("resolved-022-rejected", resolved022.ok === false && resolved022.reason === "item-resolved", resolved022),
+    check("resolved-019-rejected", resolved019.ok === false && resolved019.reason === "item-resolved", resolved019),
+  ];
+
+  let budgetTicks = 0;
+  let budgetErr = null;
+  try {
+    collectRoadmapPhaseHeadings("a\n\nb\n\nc\n\n", {
+      parseBudgetMs: 5,
+      now: () => {
+        budgetTicks += 1;
+        return budgetTicks * 100;
+      },
+    });
+  } catch (err) {
+    budgetErr = err;
+  }
+  const budgetCases = [
+    check("parse-budget-throws", budgetErr?.reason === "roadmap-parse-timeout", budgetErr),
+    check("parse-budget-did-not-spin", budgetTicks >= 2 && budgetTicks < 20, budgetTicks),
+  ];
+
+  const realRoadmapPath = "/mnt/c/Users/lahad/Projects/TheCoach/_SSoT/ROADMAP.md";
+  const realRoadmap = fs.readFileSync(realRoadmapPath, "utf-8");
+  const realParseT0 = process.hrtime.bigint();
+  const realHeadings = collectRoadmapPhaseHeadings(realRoadmap);
+  const realParseMs = Number(process.hrtime.bigint() - realParseT0) / 1e6;
+  const openTaskIds = [
+    "TASK-031", "TASK-032", "TASK-035", "TASK-034",
+    "TASK-025", "TASK-023", "TASK-030", "TASK-028",
+    "TASK-026", "TASK-027", "TASK-029", "TASK-033",
+    "TASK-024",
+  ];
+  const expectedOpen = {
+    "TASK-031": "underivable-phase",
+    "TASK-032": "underivable-phase",
+    "TASK-035": "underivable-phase",
+    "TASK-034": "underivable-phase",
+    "TASK-025": "phase:4a",
+    "TASK-023": "phase:4b",
+    "TASK-030": "phase:4b",
+    "TASK-028": "phase:4b",
+    "TASK-026": "phase:9",
+    "TASK-027": "phase:9",
+    "TASK-029": "phase:9",
+    "TASK-033": "phase:9",
+    "TASK-024": "phase:10",
+  };
+  const realOpen = {};
+  for (const id of openTaskIds) {
+    realOpen[id] = locateDispatchInRoadmap(realRoadmap, { title: id, description: "", roadmap_ref: "" });
+  }
+  const completed4a = ["TASK-013", "TASK-014", "TASK-015", "TASK-016", "TASK-017", "TASK-018", "TASK-019", "TASK-020", "TASK-022"];
+  const realCompleted = completed4a.map((id) => locateDispatchInRoadmap(realRoadmap, { title: id, description: "", roadmap_ref: "" }));
+  origLog(
+    JSON.stringify(
+      {
+        real_roadmap_parse_ms: realParseMs,
+        headings: realHeadings.map((h) => h.scope),
+        open: Object.fromEntries(
+          openTaskIds.map((id) => [
+            id,
+            realOpen[id].ok ? realOpen[id].filePhase : realOpen[id].reason,
+          ]),
+        ),
+        completed_4a: Object.fromEntries(completed4a.map((id, i) => [id, realCompleted[i].reason])),
+      },
+      null,
+      2,
+    ),
+  );
+  const realParseCases = [
+    check("real-roadmap-parse-returns", Number.isFinite(realParseMs) && realParseMs < ROADMAP_PARSE_BUDGET_MS, realParseMs),
+    check("real-roadmap-has-blank-lines", realRoadmap.split("\n").filter((l) => l.trim() === "").length >= 70, realRoadmap.split("\n").filter((l) => l.trim() === "").length),
+    ...openTaskIds.map((id) =>
+      check(
+        `real-open-${id}`,
+        expectedOpen[id].startsWith("phase:")
+          ? realOpen[id].ok === true && realOpen[id].filePhase === expectedOpen[id]
+          : realOpen[id].ok === false && realOpen[id].reason === expectedOpen[id],
+        { id, expected: expectedOpen[id], got: realOpen[id] },
+      ),
+    ),
+    ...completed4a.map((id, i) =>
+      check(`real-completed-${id}-rejected`, realCompleted[i].ok === false && realCompleted[i].reason === "item-resolved", realCompleted[i]),
+    ),
+  ];
+
+  const idleErr1 = memoryIdle();
+  const bgErr1 = backgroundBox();
+  const scanErr1 = memoryScanState();
+  await handleDispatchNext({
+    findActive: () => null,
+    load: memoryQueue([]).load,
+    save: () => {},
+    readTodo: emptyTodo,
+    loadIdle: idleErr1.loadIdle,
+    saveIdle: idleErr1.saveIdle,
+    thecoachRepo: "/tmp/idle",
+    ...bgErr1,
+    ...scanErr1,
+    ...memoryLedger(),
+    scan: async () => {
+      throw new Error("scan boom path1");
+    },
+  });
+  await bgErr1.flush();
+  const idleErr2 = memoryIdle();
+  const bgErr2 = backgroundBox();
+  const scanErr2 = memoryScanState();
+  await handleDispatchNext({
+    findActive: () => null,
+    load: memoryQueue([]).load,
+    save: () => {},
+    readTodo: emptyTodo,
+    loadIdle: idleErr2.loadIdle,
+    saveIdle: idleErr2.saveIdle,
+    thecoachRepo: "/tmp/idle",
+    ...bgErr2,
+    ...scanErr2,
+    ...memoryLedger(),
+    scan: async () => ({ outcome: "dispatch", decision: dispatchReply, open_count: 0, todo_ids: [] }),
+    repoExists: () => true,
+    fetchStaging: async () => "x",
+    startRun: () => {
+      throw new Error("spawn boom path2");
+    },
+  });
+  await bgErr2.flush();
+  const idleErr3 = memoryIdle();
+  const bgErr3 = backgroundBox();
+  const scanErr3 = memoryScanState();
+  let findActiveErr3 = 0;
+  await handleDispatchNext({
+    findActive: () => {
+      findActiveErr3 += 1;
+      if (findActiveErr3 === 1) return null;
+      throw new Error("unhandled boom path3");
+    },
+    load: memoryQueue([]).load,
+    save: () => {},
+    readTodo: emptyTodo,
+    loadIdle: idleErr3.loadIdle,
+    saveIdle: idleErr3.saveIdle,
+    thecoachRepo: "/tmp/idle",
+    ...bgErr3,
+    ...scanErr3,
+    ...memoryLedger(),
+    scan: async () => ({ outcome: "dispatch", decision: dispatchReply, open_count: 0, todo_ids: [] }),
+  });
+  await bgErr3.flush();
+
+  const bgBackstop = backgroundBox();
+  const scanBackstop = memoryScanState();
+  const backstopFirst = await handleDispatchNext({
+    findActive: () => null,
+    load: memoryQueue([]).load,
+    save: () => {},
+    readTodo: emptyTodo,
+    ...bgBackstop,
+    ...scanBackstop,
+    ...memoryLedger(),
+    scan: async () => ({
+      outcome: "nothing-dispatchable",
+      open_count: 0,
+      todo_ids: [],
+      backstop_rejected: true,
+      backstop_reason: "phase-disagreement",
+    }),
+  });
+  await bgBackstop.flush();
+  const viewed = publicScanState(scanBackstop);
+  const backstopSecond = await handleDispatchNext({
+    findActive: () => null,
+    load: memoryQueue([]).load,
+    save: () => {},
+    readTodo: emptyTodo,
+    enqueueBackground: () => {},
+    ...memoryScanState(scanBackstop.get()),
+    ...memoryLedger(),
+    scan: async () => ({ outcome: "nothing-dispatchable", open_count: 0, todo_ids: [] }),
+  });
+  const silentFailCases = [
+    check("scan-err-path1-reason", scanErr1.get()?.outcome?.reason === "scan-errored", scanErr1.get()),
+    check("scan-err-path1-telemetry", idleErr1.get().consecutive_idle === 1, idleErr1.get()),
+    check("scan-err-path2-reason", scanErr2.get()?.outcome?.reason === "scan-errored", scanErr2.get()),
+    check("scan-err-path2-telemetry", idleErr2.get().consecutive_idle === 1, idleErr2.get()),
+    check("scan-err-path3-reason", scanErr3.get()?.outcome?.reason === "scan-errored", scanErr3.get()),
+    check("scan-err-path3-telemetry", idleErr3.get().consecutive_idle === 1, idleErr3.get()),
+    check("backstop-reason-in-scan-state", viewed.backstop_reason === "phase-disagreement", viewed),
+    check("backstop-reason-in-next-response", backstopSecond.body.backstop_reason === "phase-disagreement", backstopSecond.body),
+    check("backstop-first-was-scan-started", backstopFirst.body.reason === "scan-started", backstopFirst.body.reason),
+  ];
+
   console.log = origLog;
 
   const allCases = [
@@ -3791,6 +4212,12 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     ...staleCases,
     ...ledgerCases,
     ...ledgerQueueCases,
+    ...advanceCases,
+    ...stubBlankCases,
+    ...resolvedCases,
+    ...budgetCases,
+    ...realParseCases,
+    ...silentFailCases,
     ...timingCases,
   ];
 

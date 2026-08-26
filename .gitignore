@@ -14,6 +14,8 @@ local-tools/.delegate-trigger.env
 
 # Coordinator queue — service infrastructure state, not project content
 local-tools/coordinator-queue.json
+local-tools/coordinator-scan-state.json
+local-tools/coordinator-dispatch-ledger.json
 
 # Local fix-session artifacts (may contain secrets in config backups)
 _fix_backups/**/*.bak
