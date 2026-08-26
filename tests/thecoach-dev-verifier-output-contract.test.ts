@@ -12,6 +12,9 @@ describe("thecoach-dev verifier AGENTS.md output contract", () => {
   it("requires GATE: and STATUS: pass|fail, not the implement STATUS: done format", () => {
     assert.ok(content.includes("GATE: pass | fail"));
     assert.ok(content.includes("STATUS: pass | fail"));
-    assert.ok(content.includes("Do not end with `STATUS: done`"));
+    assert.ok(content.includes("Do not start with"));
+    assert.ok(content.includes("STATUS: done"));
+    assert.ok(content.includes("CHANGES: GATE: pass"));
+    assert.ok(content.includes("missing_required_keys: gate"));
   });
 });

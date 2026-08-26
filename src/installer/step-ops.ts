@@ -41,8 +41,22 @@ export function parseOutputKeyValues(output: string): Record<string, string> {
     if (match) {
       // New KEY: line found — flush previous key
       commitPending();
-      pendingKey = match[1];
-      pendingValue = match[2];
+      let key = match[1];
+      let value = match[2];
+      // Same-line nested KEY: (run #23: "CHANGES: GATE: pass"). The engine
+      // requires GATE as its own key; nesting it as another key's value
+      // used to drop it. Only split when the entire remainder is itself a
+      // KEY: line — prose values like "CHANGES: ran the verifier" stay intact.
+      const nested = value.match(/^([A-Z_]+):\s*(.*)$/);
+      if (nested) {
+        pendingKey = key;
+        pendingValue = "";
+        commitPending();
+        key = nested[1];
+        value = nested[2];
+      }
+      pendingKey = key;
+      pendingValue = value;
     } else if (pendingKey) {
       // Continuation line — append to current key's value
       pendingValue += "\n" + line;

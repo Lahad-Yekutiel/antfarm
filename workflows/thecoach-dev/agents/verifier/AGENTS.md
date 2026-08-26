@@ -75,12 +75,25 @@ replacement for actually calling Cursor.
 
 ## Required reply format
 
-The engine parses your final message for `GATE:` and `STATUS:` keys. Both
-are required. Do not end with `STATUS: done` — that is the developer /
-implement format and will fail this step (missing `gate`).
+The engine parses `KEY:` tokens at the **start of a line**. Both `GATE:`
+and `STATUS:` are required. Nested keys do not count: `CHANGES: GATE: pass`
+is not a `GATE:` line (run #23 failed this way — `GATE:` sat inside
+`CHANGES:`, then a second `STATUS: pass` block followed).
 
-Reply with exactly these keys, each on its own line:
+Do not emit implement/developer keys at all: no `STATUS: done`, no
+`CHANGES:`, no `TEST_RESULT:`, no `COMMIT_SHA:`. Do not start with
+`STATUS: done` and do not end with it.
 
+`GATE:` must be its own line. Put it first.
+
+BAD (run #23 — engine error `missing_required_keys: gate`):
+```
+STATUS: done
+CHANGES: GATE: pass
+STATUS: pass
+```
+
+GOOD:
 ```
 GATE: pass | fail
 GATE_REASON: (only if fail — exact offending path(s))

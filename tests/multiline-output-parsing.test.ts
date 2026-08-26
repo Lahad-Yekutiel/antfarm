@@ -122,4 +122,27 @@ describe("parseOutputKeyValues — multi-line output parsing", () => {
     assert.equal(result["status"], "done");
     assert.equal(result["note"], "some note");
   });
+
+  it("extracts GATE nested on the same line as CHANGES (run #23 verifier anti-pattern)", () => {
+    const output = [
+      "STATUS: done",
+      "CHANGES: GATE: pass",
+      "GATE_REASON: (n/a — pass) only package.json touched",
+      "STATUS: pass",
+      "STATUS_REASON: (n/a — pass) matches the claim",
+      "TESTS: npm test exit 0",
+    ].join("\n");
+    const result = parseOutputKeyValues(output);
+    assert.equal(result["gate"], "pass");
+    assert.equal(result["status"], "pass", "later STATUS: pass must overwrite STATUS: done");
+    assert.equal(result["changes"], "", "CHANGES should not swallow GATE");
+  });
+
+  it("does not treat a prose CHANGES value as a nested key", () => {
+    const output = "STATUS: done\nCHANGES: ran the verifier, looks fine";
+    const result = parseOutputKeyValues(output);
+    assert.equal(result["status"], "done");
+    assert.equal(result["changes"], "ran the verifier, looks fine");
+    assert.equal(result["gate"], undefined);
+  });
 });

@@ -434,6 +434,36 @@ describe("completeStep status and contract gates", () => {
     const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
     assert.equal(run.status, "running");
   });
+
+  it("verify CHANGES: GATE: pass (run #23 nested-key anti-pattern) still counts as GATE and advances", () => {
+    const { runId, stepDbIds } = insertVerifyEachFixture();
+
+    completeStep(stepDbIds.implement, IMPLEMENT_OUTPUT_WITHOUT_GATE);
+    dbSetVerifyRunning(stepDbIds.verify);
+
+    const run23OriginalOutput = [
+      "STATUS: done",
+      "CHANGES: GATE: pass",
+      "GATE_REASON: (n/a — pass) only package.json touched",
+      "STATUS: pass",
+      "STATUS_REASON: (n/a — pass) matches the claim",
+      "TESTS: npm test exit 0",
+    ].join("\n");
+    const result = completeStep(stepDbIds.verify, run23OriginalOutput);
+
+    assert.equal(result.advanced, true);
+
+    const db = getDb();
+    const verify = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(stepDbIds.verify) as {
+      status: string;
+      output: string;
+    };
+    assert.equal(verify.status, "done");
+    assert.equal(verify.output.includes("ENGINE_ERROR: missing_required_keys"), false);
+
+    const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    assert.equal(run.status, "running");
+  });
 });
 
 function dbSetVerifyRunning(verifyDbId: string): void {
