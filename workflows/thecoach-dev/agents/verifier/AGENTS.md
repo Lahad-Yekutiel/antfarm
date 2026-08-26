@@ -72,3 +72,18 @@ replacement for actually calling Cursor.
 - Don't let a passing sanity check override a gate failure, or vice
   versa — report both fields independently, exactly as they are.
 - Don't be vague in a fail reason — name the file and line.
+
+## Required reply format
+
+The engine parses your final message for `GATE:` and `STATUS:` keys. Both
+are required. Do not end with `STATUS: done` — that is the developer /
+implement format and will fail this step (missing `gate`).
+
+Reply with exactly these keys, each on its own line:
+
+```
+GATE: pass | fail
+GATE_REASON: (only if fail — exact offending path(s))
+STATUS: pass | fail
+STATUS_REASON: (only if fail — what's wrong, specific enough to act on)
+```

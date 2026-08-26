@@ -12,6 +12,7 @@ describe("completeStep status and contract gates", () => {
   afterEach(() => {
     const db = getDb();
     for (const runId of testRunIds) {
+      db.prepare("DELETE FROM stories WHERE run_id = ?").run(runId);
       db.prepare("DELETE FROM steps WHERE run_id = ?").run(runId);
       db.prepare("DELETE FROM runs WHERE id = ?").run(runId);
     }
@@ -27,6 +28,9 @@ describe("completeStep status and contract gates", () => {
     status: string;
     maxRetries?: number;
     inputTemplate?: string;
+    type?: string;
+    loopConfig?: Record<string, unknown>;
+    currentStoryId?: string;
   }>, context: Record<string, string> = {}): { runId: string; stepDbIds: Record<string, string> } {
     const db = getDb();
     const runId = randomUUID();
@@ -44,8 +48,8 @@ describe("completeStep status and contract gates", () => {
       stepDbIds[step.stepId] = id;
       testStepIds.push(id);
       db.prepare(
-        `INSERT INTO steps (id, step_id, run_id, agent_id, step_index, input_template, expects, status, max_retries, created_at, updated_at, type)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'single')`
+        `INSERT INTO steps (id, step_id, run_id, agent_id, step_index, input_template, expects, status, max_retries, created_at, updated_at, type, loop_config, current_story_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         id,
         step.stepId,
@@ -58,10 +62,57 @@ describe("completeStep status and contract gates", () => {
         step.maxRetries ?? 2,
         now,
         now,
+        step.type ?? "single",
+        step.loopConfig ? JSON.stringify(step.loopConfig) : null,
+        step.currentStoryId ?? null,
       );
     }
 
     return { runId, stepDbIds };
+  }
+
+  const IMPLEMENT_OUTPUT_WITHOUT_GATE =
+    "STATUS: done\nCHANGES: touched packages/check-types/src/type-aliases.ts\nCOMMIT_SHA: abc123def\nTEST_RESULT: 1 pass";
+
+  function insertVerifyEachFixture(opts: { verifyMaxRetries?: number } = {}) {
+    const storyPk = randomUUID();
+    const now = new Date().toISOString();
+    const { runId, stepDbIds } = insertRun(
+      [
+        {
+          stepId: "implement",
+          agentId: "thecoach-dev_developer",
+          stepIndex: 0,
+          expects: "STATUS:",
+          status: "running",
+          type: "loop",
+          loopConfig: { over: "stories", verifyEach: true, verifyStep: "verify" },
+          currentStoryId: storyPk,
+        },
+        {
+          stepId: "verify",
+          agentId: "thecoach-dev_verifier",
+          stepIndex: 1,
+          expects: "GATE: STATUS:",
+          status: "waiting",
+          maxRetries: opts.verifyMaxRetries ?? 1,
+        },
+        {
+          stepId: "pr",
+          agentId: "thecoach-dev_pr",
+          stepIndex: 2,
+          expects: "STATUS:",
+          status: "waiting",
+        },
+      ],
+      { repo: "/tmp/repo", branch: "feat-x", commit_sha: "abc123def" },
+    );
+    const db = getDb();
+    db.prepare(
+      `INSERT INTO stories (id, run_id, story_index, story_id, title, description, acceptance_criteria, status, retry_count, max_retries, created_at, updated_at)
+       VALUES (?, ?, 0, 'STORY-01', 'One story', 'desc', '[]', 'pending', 0, 2, ?, ?)`,
+    ).run(storyPk, runId, now, now);
+    return { runId, stepDbIds, storyPk };
   }
 
   it("STATUS: blocked routes through failStep — pending retry, no advance", () => {
@@ -110,6 +161,8 @@ describe("completeStep status and contract gates", () => {
     assert.equal(setup.status, "pending");
     assert.equal(setup.retry_count, 1);
     assert.ok(setup.output.includes("missing required key(s): status"));
+    assert.ok(setup.output.includes("ENGINE_ERROR: missing_required_keys: status"));
+    assert.ok(setup.output.includes("BUILD_CMD: npm run build"));
   });
 
   it("STATUS: done with required keys present advances the pipeline", () => {
@@ -302,4 +355,88 @@ describe("completeStep status and contract gates", () => {
     const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
     assert.equal(run.status, "running");
   });
+
+  it("implement STATUS: done without GATE completes the story and leaves verify pending", () => {
+    const { runId, stepDbIds } = insertVerifyEachFixture();
+
+    const result = completeStep(stepDbIds.implement, IMPLEMENT_OUTPUT_WITHOUT_GATE);
+
+    assert.equal(result.advanced, false);
+    assert.equal(result.runCompleted, false);
+
+    const db = getDb();
+    const implement = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepDbIds.implement) as { status: string };
+    assert.equal(implement.status, "running");
+
+    const verify = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepDbIds.verify) as { status: string };
+    assert.equal(verify.status, "pending");
+
+    const pr = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepDbIds.pr) as { status: string };
+    assert.equal(pr.status, "waiting");
+
+    const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    assert.equal(run.status, "running");
+  });
+
+  it("verify missing GATE is an engine error, not a gate verdict, and terminalizes the run", () => {
+    const { runId, stepDbIds } = insertVerifyEachFixture({ verifyMaxRetries: 0 });
+
+    completeStep(stepDbIds.implement, IMPLEMENT_OUTPUT_WITHOUT_GATE);
+    dbSetVerifyRunning(stepDbIds.verify);
+
+    const agentOutput = "STATUS: done\nCHANGES: ran the verifier, looks fine";
+    const result = completeStep(stepDbIds.verify, agentOutput);
+
+    assert.equal(result.advanced, false);
+
+    const db = getDb();
+    const verify = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(stepDbIds.verify) as {
+      status: string;
+      output: string;
+    };
+    assert.equal(verify.status, "failed");
+    assert.ok(verify.output.startsWith("ENGINE_ERROR: missing_required_keys: gate"));
+    assert.ok(verify.output.includes("ORIGINAL_OUTPUT:"));
+    assert.ok(verify.output.includes(agentOutput));
+    assert.notEqual(verify.output.trim(), "Step output missing required key(s): gate");
+
+    const implement = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepDbIds.implement) as { status: string };
+    assert.equal(implement.status, "failed");
+
+    const pr = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepDbIds.pr) as { status: string };
+    assert.equal(pr.status, "cancelled");
+
+    const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    assert.equal(run.status, "failed");
+  });
+
+  it("verify GATE: pass STATUS: pass after implement-without-gate reaches the pr step", () => {
+    const { runId, stepDbIds } = insertVerifyEachFixture();
+
+    completeStep(stepDbIds.implement, IMPLEMENT_OUTPUT_WITHOUT_GATE);
+    dbSetVerifyRunning(stepDbIds.verify);
+
+    const result = completeStep(stepDbIds.verify, "GATE: pass\nSTATUS: pass");
+
+    assert.equal(result.advanced, true);
+    assert.equal(result.runCompleted, false);
+
+    const db = getDb();
+    const implement = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepDbIds.implement) as { status: string };
+    assert.equal(implement.status, "done");
+
+    const verify = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepDbIds.verify) as { status: string };
+    assert.equal(verify.status, "done");
+
+    const pr = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepDbIds.pr) as { status: string };
+    assert.equal(pr.status, "pending");
+
+    const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    assert.equal(run.status, "running");
+  });
 });
+
+function dbSetVerifyRunning(verifyDbId: string): void {
+  const db = getDb();
+  db.prepare("UPDATE steps SET status = 'running', updated_at = datetime('now') WHERE id = ?").run(verifyDbId);
+}

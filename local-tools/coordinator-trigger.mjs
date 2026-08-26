@@ -125,6 +125,9 @@ const EXPECTED_OWNERSHIP = {
 };
 
 const TERMINAL_RUN_STATUSES = new Set(["completed", "failed", "cancelled", "canceled"]);
+/** Run statuses that are terminal AND unsuccessful — must not resolve as queue "done". */
+const FAILED_RUN_STATUSES = new Set(["failed", "cancelled", "canceled"]);
+const SUCCESS_RUN_STATUS = "completed";
 
 /** Mechanical PR base gate — only "staging" is allowed (not prompt prose). */
 const EXPECTED_PR_BASE = "staging";
@@ -2176,9 +2179,15 @@ async function verifyPrBaseBranch(stepsResult, opts = {}) {
 
 /**
  * Shared resolution used by /queue/check and --self-test-pr-base-gate.
- * `done` only when ownership ok AND (base verified staging OR positively no PR expected).
+ * Keys on the run's terminal status first: a failed/cancelled run is never
+ * `done`, even when the `pr` step is still waiting (that waiting state cannot
+ * distinguish "no PR expected" from "died before pr"). `done` only when the
+ * run completed AND ownership ok AND (base verified staging OR positively
+ * no PR expected on a successful run).
+ *
+ * `runStatus` defaults to completed so existing PR-gate fixtures stay valid.
  */
-function resolveQueueVerification(ownershipMismatches, baseCheck) {
+function resolveQueueVerification(ownershipMismatches, baseCheck, runStatus = SUCCESS_RUN_STATUS) {
   const noteParts = [];
   if (ownershipMismatches.length > 0) {
     noteParts.push(
@@ -2189,6 +2198,24 @@ function resolveQueueVerification(ownershipMismatches, baseCheck) {
   }
   if (baseCheck.mismatches.length > 0) {
     noteParts.push(`PR base gate: ${baseCheck.mismatches.map((m) => m.reason).join("; ")}`);
+  }
+
+  if (FAILED_RUN_STATUSES.has(runStatus)) {
+    const failNote = `run status is "${runStatus}" — not a successful completion`;
+    if (baseCheck.noPr && baseCheck.noPrReason) {
+      noteParts.push(`${failNote}; ${baseCheck.noPrReason}`);
+    } else {
+      noteParts.push(failNote);
+    }
+    return {
+      status: "failed",
+      note: noteParts.join("; "),
+      prBases: baseCheck.bases,
+      noPr: baseCheck.noPr,
+      noPrReason: baseCheck.noPrReason || null,
+      mismatches: ownershipMismatches,
+      prBaseMismatches: baseCheck.mismatches,
+    };
   }
 
   if (noteParts.length === 0) {
@@ -2375,7 +2402,7 @@ const server = http.createServer(async (req, res) => {
       const baseCheck = await verifyPrBaseBranch(stepsResult);
       item.resolvedAt = new Date().toISOString();
 
-      const outcome = resolveQueueVerification(ownershipMismatches, baseCheck);
+      const outcome = resolveQueueVerification(ownershipMismatches, baseCheck, run.status);
       item.status = outcome.status;
       item.note = outcome.note;
       const ledgerKey = extractTaskIdFromText(item.task, item.roadmap_ref);
@@ -2425,6 +2452,7 @@ const server = http.createServer(async (req, res) => {
         checked: changed.length,
         done: changed.filter((c) => c.change === "done").length,
         flagged: changed.filter((c) => c.change === "flagged").length,
+        failed: changed.filter((c) => c.change === "failed").length,
         stillRunning: changed.filter((c) => c.change === "still-running").length,
       },
       changed,
@@ -2449,9 +2477,9 @@ if (process.argv.includes("--self-test-pr-base-gate")) {
   // we only exercise verifyPrBaseBranch + resolveQueueVerification here.
   const ownershipOk = [];
 
-  async function caseOutcome(label, steps, resolveBaseRef) {
+  async function caseOutcome(label, steps, resolveBaseRef, runStatus) {
     const baseCheck = await verifyPrBaseBranch({ steps }, { resolveBaseRef });
-    const outcome = resolveQueueVerification(ownershipOk, baseCheck);
+    const outcome = resolveQueueVerification(ownershipOk, baseCheck, runStatus);
     return {
       case: label,
       status: outcome.status,
@@ -2497,10 +2525,70 @@ if (process.argv.includes("--self-test-pr-base-gate")) {
       ],
       async () => "main",
     ),
+    caseOutcome(
+      "failed-run-pr-waiting",
+      [
+        { stepId: "implement", status: "running", output: "STATUS: done" },
+        {
+          stepId: "verify",
+          status: "failed",
+          output: "ENGINE_ERROR: missing_required_keys: gate",
+        },
+        { stepId: "pr", status: "waiting", output: null },
+      ],
+      undefined,
+      "failed",
+    ),
+    caseOutcome(
+      "completed-run-pr-waiting-legitimate-no-pr",
+      [
+        { stepId: "implement", status: "done", output: "STATUS: done" },
+        { stepId: "pr", status: "waiting", output: null },
+      ],
+      undefined,
+      "completed",
+    ),
+    caseOutcome(
+      "cancelled-run-pr-waiting",
+      [
+        { stepId: "implement", status: "done", output: "STATUS: done" },
+        { stepId: "pr", status: "waiting", output: null },
+      ],
+      undefined,
+      "cancelled",
+    ),
   ]);
 
-  console.log(JSON.stringify({ evaluatePrBaseRef: evaluateCases, gateCases }, null, 2));
-  process.exit(0);
+  const failedRun = gateCases.find((c) => c.case === "failed-run-pr-waiting");
+  const legitNoPr = gateCases.find((c) => c.case === "completed-run-pr-waiting-legitimate-no-pr");
+  const cancelledRun = gateCases.find((c) => c.case === "cancelled-run-pr-waiting");
+  const errors = [];
+  if (failedRun?.status === "done") {
+    errors.push('failed-run-pr-waiting resolved as done — must key on run status');
+  }
+  if (failedRun?.status !== "failed") {
+    errors.push(`failed-run-pr-waiting status=${failedRun?.status}, expected failed`);
+  }
+  if (legitNoPr?.status !== "done") {
+    errors.push(`completed-run-pr-waiting-legitimate-no-pr status=${legitNoPr?.status}, expected done`);
+  }
+  if (cancelledRun?.status === "done") {
+    errors.push("cancelled-run-pr-waiting resolved as done");
+  }
+  // ledgerOutcome sourcing is load-bearing: it reads run.status, not the
+  // /queue/check verdict. Confirm the formula is unchanged for these cases.
+  function ledgerOutcome(runStatus, queueStatus) {
+    return runStatus === "failed" || queueStatus === "flagged" ? "failed" : "completed";
+  }
+  if (ledgerOutcome("failed", failedRun?.status) !== "failed") {
+    errors.push("ledgerOutcome for a failed run must stay failed");
+  }
+  if (ledgerOutcome("completed", legitNoPr?.status) !== "completed") {
+    errors.push("ledgerOutcome for a completed no-PR run must stay completed");
+  }
+
+  console.log(JSON.stringify({ evaluatePrBaseRef: evaluateCases, gateCases, errors }, null, 2));
+  process.exit(errors.length === 0 ? 0 : 1);
 }
 
 // Authorization matrix — calls the REAL authorizeEndpoint / timingSafeTokenEqual.

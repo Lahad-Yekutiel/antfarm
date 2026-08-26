@@ -84,6 +84,54 @@ export function parseExpectsKeys(expects: string): string[] {
   return keys;
 }
 
+/** Run/step status vocabulary — no magic strings at call sites. */
+const RUN_STATUS_FAILED = "failed";
+const STEP_STATUS_FAILED = "failed";
+const STEP_STATUS_CANCELLED = "cancelled";
+const STEP_STATUS_RUNNING = "running";
+const STEP_STATUS_PENDING = "pending";
+const STEP_STATUS_WAITING = "waiting";
+
+/**
+ * Engine parse/contract failures are stored under this prefix so they cannot
+ * be mistaken for an agent's GATE/STATUS verdict. The original agent output
+ * is preserved below ORIGINAL_OUTPUT: rather than being overwritten.
+ */
+export const ENGINE_ERROR_MISSING_REQUIRED_KEYS = "ENGINE_ERROR: missing_required_keys";
+export const ENGINE_ERROR_ORIGINAL_OUTPUT_HEADER = "ORIGINAL_OUTPUT:";
+
+export function formatMissingRequiredKeysEngineError(
+  missingKeys: string[],
+  originalOutput: string,
+): string {
+  const keyList = missingKeys.join(", ");
+  return [
+    `${ENGINE_ERROR_MISSING_REQUIRED_KEYS}: ${keyList}`,
+    `Step output missing required key(s): ${keyList}`,
+    ENGINE_ERROR_ORIGINAL_OUTPUT_HEADER,
+    originalOutput,
+  ].join("\n");
+}
+
+/**
+ * When a run fails, leftover in-flight steps must not stay running/pending
+ * and unstarted steps must not stay waiting. Terminal states stay terminal.
+ */
+function markRunFailedAndTerminalizeOpenSteps(runId: string, failedStepDbId: string): void {
+  const db = getDb();
+  db.prepare(
+    "UPDATE runs SET status = ?, updated_at = datetime('now') WHERE id = ? AND status != ?",
+  ).run(RUN_STATUS_FAILED, runId, RUN_STATUS_FAILED);
+  db.prepare(
+    `UPDATE steps SET status = ?, updated_at = datetime('now')
+     WHERE run_id = ? AND id != ? AND status IN (?, ?)`,
+  ).run(STEP_STATUS_FAILED, runId, failedStepDbId, STEP_STATUS_RUNNING, STEP_STATUS_PENDING);
+  db.prepare(
+    `UPDATE steps SET status = ?, updated_at = datetime('now')
+     WHERE run_id = ? AND status = ?`,
+  ).run(STEP_STATUS_CANCELLED, runId, STEP_STATUS_WAITING);
+}
+
 /**
  * Per-key merge: start from DEFAULT_FAIL_WHEN, then overlay any keys the
  * step declared. Declared values for a key replace the default for that
@@ -456,7 +504,7 @@ export function cleanupAbandonedSteps(): void {
         if (newRetry > story.max_retries) {
           db.prepare("UPDATE stories SET status = 'failed', retry_count = ?, updated_at = datetime('now') WHERE id = ?").run(newRetry, story.id);
           db.prepare("UPDATE steps SET status = 'failed', output = 'Story abandoned and retries exhausted', current_story_id = NULL, updated_at = datetime('now') WHERE id = ?").run(step.id);
-          db.prepare("UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?").run(step.run_id);
+          markRunFailedAndTerminalizeOpenSteps(step.run_id, step.id);
           emitEvent({ ts: new Date().toISOString(), event: "story.failed", runId: step.run_id, workflowId: wfId, stepId: step.step_id, storyId: story.story_id, storyTitle: story.title, detail: "Abandoned — retries exhausted" });
           emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: "Story abandoned and retries exhausted" });
           emitEvent({ ts: new Date().toISOString(), event: "run.failed", runId: step.run_id, workflowId: wfId, detail: "Story abandoned and retries exhausted" });
@@ -478,9 +526,7 @@ export function cleanupAbandonedSteps(): void {
       db.prepare(
         "UPDATE steps SET status = 'failed', output = 'Agent abandoned step without completing (' || ? || ' times)', abandoned_count = ?, updated_at = datetime('now') WHERE id = ?"
       ).run(newAbandonCount, newAbandonCount, step.id);
-      db.prepare(
-        "UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?"
-      ).run(step.run_id);
+      markRunFailedAndTerminalizeOpenSteps(step.run_id, step.id);
       const wfId = getWorkflowId(step.run_id);
       emitEvent({ ts: new Date().toISOString(), event: "step.timeout", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: `Retries exhausted — step failed` });
       emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: step.run_id, workflowId: wfId, stepId: step.step_id, detail: "Agent abandoned step without completing" });
@@ -717,9 +763,7 @@ export function claimStep(agentId: string): ClaimResult {
         db.prepare(
           "UPDATE steps SET status = 'failed', output = ?, updated_at = datetime('now') WHERE id = ?"
         ).run(message, step.id);
-        db.prepare(
-          "UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?"
-        ).run(step.run_id);
+        markRunFailedAndTerminalizeOpenSteps(step.run_id, step.id);
         const wfId = getWorkflowId(step.run_id);
         emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: step.run_id, workflowId: wfId, stepId: step.step_id, agentId: agentId, detail: message });
         emitEvent({ ts: new Date().toISOString(), event: "run.failed", runId: step.run_id, workflowId: wfId, detail: message });
@@ -742,9 +786,7 @@ export function claimStep(agentId: string): ClaimResult {
           db.prepare(
             "UPDATE steps SET status = 'failed', output = ?, updated_at = datetime('now') WHERE id = ?"
           ).run("Loop cannot continue because one or more stories failed", step.id);
-          db.prepare(
-            "UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?"
-          ).run(step.run_id);
+          markRunFailedAndTerminalizeOpenSteps(step.run_id, step.id);
           const wfId = getWorkflowId(step.run_id);
           emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId: step.run_id, workflowId: wfId, stepId: step.id, agentId: agentId, detail: "Loop has failed stories and no pending stories" });
           emitEvent({ ts: new Date().toISOString(), event: "run.failed", runId: step.run_id, workflowId: wfId, detail: "Loop has failed stories and no pending stories" });
@@ -911,7 +953,10 @@ export function completeStep(stepId: string, output: string): { advanced: boolea
   const requiredKeys = parseExpectsKeys(step.expects);
   const missingExpectedKeys = requiredKeys.filter((key) => !(key in parsed));
   if (missingExpectedKeys.length > 0) {
-    const message = `Step output missing required key(s): ${missingExpectedKeys.join(", ")}`;
+    // Engine parse/contract failure — not an agent GATE/STATUS verdict.
+    // Preserve the original output; do not store only the engine message
+    // (that 41-byte string was previously handed downstream as step content).
+    const message = formatMissingRequiredKeysEngineError(missingExpectedKeys, output);
     const failResult = failStepSync(stepId, message, { stdoutTail: tailOutput(output) });
     if (failResult.runFailed) {
       notifyFailureExhausted(step.run_id, step.step_id, message).catch(() => {});
@@ -1034,7 +1079,7 @@ function handleVerifyEachCompletion(
         // Story retries exhausted — fail everything
         db.prepare("UPDATE stories SET status = 'failed', retry_count = ?, updated_at = datetime('now') WHERE id = ?").run(newRetry, lastDoneStory.id);
         db.prepare("UPDATE steps SET status = 'failed', updated_at = datetime('now') WHERE id = ?").run(loopStepId);
-        db.prepare("UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?").run(verifyStep.run_id);
+        markRunFailedAndTerminalizeOpenSteps(verifyStep.run_id, loopStepId);
         const wfId = getWorkflowId(verifyStep.run_id);
         emitEvent({ ts: new Date().toISOString(), event: "story.failed", runId: verifyStep.run_id, workflowId: wfId, stepId: verifyStep.step_id });
         emitEvent({ ts: new Date().toISOString(), event: "run.failed", runId: verifyStep.run_id, workflowId: wfId, detail: "Verification retries exhausted" });
@@ -1104,9 +1149,7 @@ function checkLoopContinuation(runId: string, loopStepId: string): { advanced: b
     db.prepare(
       "UPDATE steps SET status = 'failed', output = ?, updated_at = datetime('now') WHERE id = ?"
     ).run("Loop cannot continue because one or more stories failed", loopStepId);
-    db.prepare(
-      "UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?"
-    ).run(runId);
+    markRunFailedAndTerminalizeOpenSteps(runId, loopStepId);
     const wfId = getWorkflowId(runId);
     emitEvent({ ts: new Date().toISOString(), event: "step.failed", runId, workflowId: wfId, stepId: loopStepId, detail: "Loop has failed stories and no pending stories" });
     emitEvent({ ts: new Date().toISOString(), event: "run.failed", runId, workflowId: wfId, detail: "Loop has failed stories and no pending stories" });
@@ -1292,7 +1335,7 @@ export function failStepSync(
         // Story retries exhausted
         db.prepare("UPDATE stories SET status = 'failed', retry_count = ?, updated_at = datetime('now') WHERE id = ?").run(newRetry, story.id);
         db.prepare("UPDATE steps SET status = 'failed', output = ?, current_story_id = NULL, updated_at = datetime('now') WHERE id = ?").run(error, stepId);
-        db.prepare("UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?").run(step.run_id);
+        markRunFailedAndTerminalizeOpenSteps(step.run_id, stepId);
         const wfId = getWorkflowId(step.run_id);
         emitEvent({ ts: new Date().toISOString(), event: "story.failed", runId: step.run_id, workflowId: wfId, stepId: stepId, storyId: storyRow?.story_id, storyTitle: storyRow?.title, detail: error });
         emitEvent({
@@ -1323,9 +1366,7 @@ export function failStepSync(
     db.prepare(
       "UPDATE steps SET status = 'failed', output = ?, retry_count = ?, updated_at = datetime('now') WHERE id = ?"
     ).run(error, newRetryCount, stepId);
-    db.prepare(
-      "UPDATE runs SET status = 'failed', updated_at = datetime('now') WHERE id = ?"
-    ).run(step.run_id);
+    markRunFailedAndTerminalizeOpenSteps(step.run_id, stepId);
     const wfId2 = getWorkflowId(step.run_id);
     emitEvent({
       ts: new Date().toISOString(),
