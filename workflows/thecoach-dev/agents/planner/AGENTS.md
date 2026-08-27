@@ -23,9 +23,12 @@ do the planning work itself well.
    (max 20, dependency-ordered, one story per developer context window,
    every acceptance criterion mechanically verifiable, typecheck +
    tests required on every story).
-5. Cross-check the task's own protected-paths list. If a story would
-   require touching one, that's a blocker, not a workaround — reply
-   `STATUS: blocked` with a clear reason; this becomes an Open Question
+5. Cross-check BOTH protected-path lists: the host-enforced list in
+   your per-step instructions (unconditional, identical to the verify
+   gate), AND the task's own "Protected — do not modify" list if the
+   task text has one. If a story would require touching either, that's
+   a blocker, not a workaround — reply `STATUS: blocked` with a clear
+   reason naming the matching pattern(s); this becomes an Open Question
    for the developer, never something you route around silently.
 
 ## What NOT to do

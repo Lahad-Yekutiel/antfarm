@@ -1,6 +1,8 @@
 /**
  * Protected paths the thecoach-dev verify gate must fail on.
- * Keep this list in sync with workflows/thecoach-dev/workflow.yml's verify step.
+ * Injected into plan/verify templates as {{protected_paths}} at claim time
+ * (step-ops). Do not hand-copy this list into prompts — that drift is what
+ * left the planner blind on TASK-037.
  */
 export const PROTECTED_PATH_PATTERNS = [
   "_SSoT/**",
@@ -8,6 +10,11 @@ export const PROTECTED_PATH_PATTERNS = [
   ".github/workflows/**",
   ".gitignore",
 ] as const;
+
+/** Prompt bullet list derived from PROTECTED_PATH_PATTERNS — never a second copy. */
+export function formatProtectedPathPatternsForPrompt(): string {
+  return PROTECTED_PATH_PATTERNS.map((pattern) => `- \`${pattern}\``).join("\n");
+}
 
 function normalizePath(file: string): string {
   return file.replace(/\\/g, "/").replace(/^\.\//, "");

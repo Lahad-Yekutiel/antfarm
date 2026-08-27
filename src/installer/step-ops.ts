@@ -13,7 +13,7 @@ import { getMaxRoleTimeoutSeconds } from "./install.js";
 import { getStepFailWhen, loadWorkflowSpec } from "./workflow-spec.js";
 import { resolveWorkflowDir } from "./paths.js";
 import { isFrontendChange } from "../lib/frontend-detect.js";
-import { findProtectedPaths } from "../lib/protected-paths.js";
+import { findProtectedPaths, formatProtectedPathPatternsForPrompt } from "../lib/protected-paths.js";
 import type { WorkflowStepFailure } from "./types.js";
 
 /**
@@ -760,6 +760,9 @@ export function claimStep(agentId: string): ClaimResult {
 
   // Always inject run_id so templates can use {{run_id}} (e.g. for scoped progress files)
   context["run_id"] = step.run_id;
+  // Host-enforced protected paths — same list verify uses. Must not be a
+  // hand-copied string in workflow.yml (TASK-037 planner blind spot).
+  context["protected_paths"] = formatProtectedPathPatternsForPrompt();
 
   // Compute has_frontend_changes from git diff when repo and branch are available
   if (context["repo"] && context["branch"]) {

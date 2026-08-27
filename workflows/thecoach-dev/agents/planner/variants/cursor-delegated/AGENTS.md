@@ -27,9 +27,12 @@ planning work itself well.
    Build `<prompt>` to include: the full task text, the story format you
    need back (max 20 stories, dependency-ordered, one story per developer
    context window, every acceptance criterion mechanically verifiable,
-   typecheck + tests required on every story), and the task's own
-   protected-paths list with an explicit instruction to flag (not route
-   around) any story that would require touching one.
+   typecheck + tests required on every story), the host-enforced
+   protected-path list from the per-step instructions (unconditional,
+   identical to the verify gate; present even when the task has no
+   "Protected — do not modify" section), and the task's own protected-paths
+   list if present, with an explicit instruction to flag (not route
+   around) any story that would require touching either list.
 4. Take Cursor's proposed stories as a draft, not a final answer — review
    them yourself against the same criteria you gave Cursor before
    producing your own output. If a story doesn't actually meet them

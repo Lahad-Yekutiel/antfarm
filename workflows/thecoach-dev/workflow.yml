@@ -251,12 +251,17 @@ steps:
       8. Always include "Typecheck passes" as the last criterion in every story.
       9. Every story MUST include test criteria — "Tests for [feature] pass".
       10. The developer is expected to write tests as part of each story.
-      11. Cross-check the task's own "Protected — do not modify" list (if
-          present in the task text) and make sure no story requires
-          touching a protected path. If the task's requirements seem to
-          require it, STOP and reply STATUS: blocked with a REASON — this
-          is an Open Question for the developer, not something to route
-          around.
+      11. Cross-check BOTH protected-path lists and make sure no story
+          requires touching a protected path. If the task's requirements
+          seem to require it, STOP and reply STATUS: blocked with a
+          REASON naming the matching pattern(s) — this is an Open
+          Question for the developer, not something to route around.
+          a. Host-enforced list (unconditional, identical to the verify
+             gate, not optional, not overridable). Present even when the
+             task text has no "Protected — do not modify" section:
+          {{protected_paths}}
+          b. The task's own "Protected — do not modify" list, if present
+             in the task text.
 
       Reply with EXACTLY these labels (STATUS is always required; the
       others only on STATUS: done):
@@ -408,11 +413,10 @@ steps:
 
       1. PROTECTED-PATH GATE (unconditional, run first):
          `git -C {{repo}} diff --stat staging...{{commit_sha}}`
-         Compare the touched-file list against:
-           - `_SSoT/**` (never writable by a Dev agent)
-           - `supabase/**` (config.toml, seed.sql, migrations — the whole tree)
-           - `.github/workflows/**`
-           - `.gitignore`
+         Compare the touched-file list against the host-enforced list
+         (identical to the plan-step list, injected from the engine) plus
+         anything outside this story's own claimed CHANGES:
+          {{protected_paths}}
            - anything outside this story's own claimed CHANGES
          If ANY touched file matches a protected path, or falls outside
          the claimed CHANGES, this is a GATE_FAIL regardless of whether
