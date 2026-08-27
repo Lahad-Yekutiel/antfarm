@@ -32,6 +32,13 @@ import path from "node:path";
 import { spawn, execFile } from "node:child_process";
 import crypto from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
+import { PROTECTED_PATH_PATTERNS } from "../dist/lib/protected-paths.js";
+import {
+  evaluateTaskScopeGate,
+  maskManualDispatchRoadmap,
+  parseDispatchFromMarkdown,
+  SCOPE_GATE_SKIPPED_LOG,
+} from "../dist/lib/task-dispatch-gate.js";
 
 const PORT = process.env.COORDINATOR_PORT ? Number(process.env.COORDINATOR_PORT) : 3335;
 const TOKEN = process.env.COORDINATOR_TOKEN;
@@ -637,12 +644,186 @@ function loadTaskContractForId(taskId, deps = {}) {
     return { ok: false, missing: false, field: "task-file", reason: "task-file-unreadable", taskId, path: filePath, error: err?.message || String(err) };
   }
   const parsed = parseTaskContract(markdown);
-  if (!parsed.ok) return { ...parsed, missing: false, path: filePath, taskId };
-  return { ok: true, branch: parsed.branch, tool: parsed.tool, path: filePath, taskId };
+  const dispatchParsed = parseDispatchFromMarkdown(markdown);
+  const dispatchFields = {
+    markdown,
+    dispatch: dispatchParsed.dispatch,
+    dispatchUnknown: dispatchParsed.unknown,
+    dispatchValue: dispatchParsed.value,
+    dispatchDefaulted: dispatchParsed.defaulted,
+  };
+  if (!parsed.ok) return { ...parsed, missing: false, path: filePath, taskId, ...dispatchFields };
+  return { ok: true, branch: parsed.branch, tool: parsed.tool, path: filePath, taskId, ...dispatchFields };
 }
 
 function hardcodedCoordinatorBranch(queueItemId) {
   return `feature/thecoach-dev-coordinator-${queueItemId}`;
+}
+
+/**
+ * A1: ## Dispatch: manual. Quiet — no ledger, no developer_todo. Continue
+ * to the next pending item as if this one were already [x].
+ */
+async function skipManualDispatchItem(queue, item, deps, taskId) {
+  const save = deps.save || saveQueue;
+  item.status = "flagged";
+  item.resolvedAt = new Date().toISOString();
+  item.note = `${taskId} ## Dispatch is manual; coordinator will not dispatch. Quiet skip.`;
+  save(queue);
+  const nextIdx = queue.findIndex((it) => it.status === "pending");
+  if (nextIdx >= 0) {
+    return spawnPendingQueueItem(queue, nextIdx, deps);
+  }
+  return {
+    status: 200,
+    body: withIdleTelemetry(
+      {
+        ok: true,
+        dispatched: false,
+        reason: "not-dispatchable-manual",
+        task: taskId,
+      },
+      deps,
+    ),
+  };
+}
+
+/**
+ * A2: declared expected files intersect the engine protected-path list.
+ * One ledger failure entry + one developer_todo entry; item flagged.
+ */
+async function refuseProtectedPathScope(queue, item, deps, taskId, matches) {
+  const save = deps.save || saveQueue;
+  const named = matches.map((m) => `${m.path} -> ${m.pattern}`).join("; ");
+  const note = `${taskId} expected files intersect the engine protected-path list (${named}). Re-scope the task or mark ## Dispatch: manual.`;
+  item.status = "flagged";
+  item.resolvedAt = new Date().toISOString();
+  item.note = note;
+  save(queue);
+  recordLedgerAttempt(
+    taskId,
+    {
+      lastDispatchedAt: new Date().toISOString(),
+      queueItemId: item.id,
+      outcome: "failed",
+      reason: "protected-path-scope",
+      matches,
+      roadmap_ref: item.roadmap_ref ?? null,
+    },
+    deps,
+  );
+  try {
+    const appendTodo = deps.appendTodo || ((repo, draft) => appendDeveloperTodoEntry(repo, draft, deps));
+    const repo = deps.thecoachRepo !== undefined ? deps.thecoachRepo : THECOACH_REPO;
+    if (repo || deps.appendTodo) {
+      const written = appendTodo(repo, {
+        summary: `Dispatch of ${taskId} refused: expected files are on the protected-path list (${named})`,
+        why: `${taskId} must be either re-scoped off ${named} or marked ## Dispatch: manual. The coordinator will not start a run whose declared deliverable the engine would reject.`,
+        source: taskId,
+        type: "blocked",
+        evidence: note,
+        reply_needed: `Re-scope ${taskId} or set ## Dispatch: manual, then clear the ledger entry for ${taskId}.`,
+        blocks: [`task:${taskId}`],
+      });
+      if (!written.appended) {
+        logDispatchNext(`todo writer skipped duplicate summary for protected-path-scope ${taskId}`);
+      }
+    }
+  } catch (err) {
+    logDispatchNextError(`todo writer failed for protected-path-scope ${taskId}: ${err?.message || String(err)}`);
+  }
+  const nextIdx = queue.findIndex((it) => it.status === "pending");
+  if (nextIdx >= 0) {
+    return spawnPendingQueueItem(queue, nextIdx, deps);
+  }
+  return {
+    status: 200,
+    body: withIdleTelemetry(
+      {
+        ok: true,
+        dispatched: false,
+        reason: "protected-path-scope",
+        task: taskId,
+        matches,
+      },
+      deps,
+    ),
+  };
+}
+
+/**
+ * Host-side gates only: Dispatch -> Tool/model -> Branch (via contract parse) -> A2.
+ * No agent, no startRun. Used by spawnPendingQueueItem and --eval-dispatch-gates.
+ */
+function evaluateHostDispatchGates(ledgerKey, contract) {
+  if (!contract.missing && contract.dispatch === "manual") {
+    if (contract.dispatchUnknown) {
+      logDispatchNext(
+        `warning: ${ledgerKey} ## Dispatch has unknown value ${JSON.stringify(contract.dispatchValue)}; treating as manual`,
+      );
+    }
+    return {
+      dispatched: false,
+      reason: "not-dispatchable-manual",
+      task: ledgerKey,
+      dispatch_unknown: Boolean(contract.dispatchUnknown),
+    };
+  }
+  if (contract.ok) {
+    if (contract.tool !== DISPATCHABLE_TOOL) {
+      return {
+        dispatched: false,
+        reason: "unsupported-tool",
+        task: ledgerKey,
+        contract_field: "Tool/model",
+        contract_value: contract.tool,
+        tool: contract.tool,
+        branch: contract.branch,
+      };
+    }
+  } else if (!contract.missing) {
+    return {
+      dispatched: false,
+      reason: contract.reason || "refused",
+      task: ledgerKey,
+      contract_field: contract.field || "task-file",
+      contract_value: contract.value,
+    };
+  }
+
+  if (contract.missing || !contract.markdown) {
+    logDispatchNext(SCOPE_GATE_SKIPPED_LOG);
+    return {
+      dispatched: true,
+      scope_gate: "skipped",
+      skip_log: SCOPE_GATE_SKIPPED_LOG,
+      branch: null,
+      tool: null,
+    };
+  }
+
+  const scope = evaluateTaskScopeGate(contract.markdown);
+  if (scope.skipped) {
+    logDispatchNext(SCOPE_GATE_SKIPPED_LOG);
+    return {
+      dispatched: true,
+      scope_gate: "skipped",
+      skip_log: SCOPE_GATE_SKIPPED_LOG,
+      branch: contract.branch,
+      tool: contract.tool,
+    };
+  }
+  if (scope.matches.length > 0) {
+    return {
+      dispatched: false,
+      reason: "protected-path-scope",
+      task: ledgerKey,
+      matches: scope.matches,
+      branch: contract.branch,
+      tool: contract.tool,
+    };
+  }
+  return { dispatched: true, branch: contract.branch, tool: contract.tool, matches: [] };
 }
 
 /**
@@ -1618,9 +1799,21 @@ async function scanRoadmapForWork(deps = {}) {
     throw err;
   }
 
+  const loadContract = deps.loadTaskContract || ((id) => loadTaskContractForId(id, { ...deps, thecoachRepo }));
+  const maskedRoadmap = maskManualDispatchRoadmap(roadmap, (taskId) => {
+    const loaded = loadContract(taskId);
+    if (loaded?.missing) return "auto";
+    if (loaded?.dispatchUnknown) {
+      logDispatchNext(
+        `warning: ${taskId} ## Dispatch has unknown value ${JSON.stringify(loaded.dispatchValue)}; treating as manual`,
+      );
+    }
+    return loaded?.dispatch === "manual" ? "manual" : "auto";
+  });
+
   let parsed;
   try {
-    const prompt = buildRoadmapScanPrompt(roadmap, todoRaw, snapshot.blockedScopes);
+    const prompt = buildRoadmapScanPrompt(maskedRoadmap, todoRaw, snapshot.blockedScopes);
     const cliStdout = await runAgent(prompt);
     const replyText = extractAgentReplyText(cliStdout);
     parsed = parseAgentDecision(replyText);
@@ -1869,33 +2062,40 @@ async function spawnPendingQueueItem(queue, idx, deps = {}) {
 
   const loadContract = deps.loadTaskContract || ((id) => loadTaskContractForId(id, deps));
   const contract = loadContract(ledgerKey);
-  let branch;
-  if (contract.ok) {
-    if (contract.tool !== DISPATCHABLE_TOOL) {
-      logDispatchNext(`task-contract-refused key=${ledgerKey} field=Tool/model value=${contract.tool}`);
-      return flagTaskContractRefusal(queue, item, deps, {
-        taskId: ledgerKey,
-        field: "Tool/model",
-        reason: "unsupported-tool",
-        value: contract.tool,
-        note: `${ledgerKey} ## Tool/model is ${contract.tool}; coordinator dispatches Cursor only and will not substitute. Run this task by hand with ${contract.tool}.`,
-        why: `The coordinator has no ${contract.tool} dispatch route. Silently substituting ${DISPATCHABLE_TOOL} would send this work to the wrong tool.`,
-        replyNeeded: `Run ${ledgerKey} by hand with ${contract.tool}, or change ## Tool/model if that routing was wrong.`,
-      });
-    }
-    branch = contract.branch;
-  } else if (contract.missing) {
-    branch = hardcodedCoordinatorBranch(item.id);
-  } else {
-    logDispatchNext(`task-contract-refused key=${ledgerKey} field=${contract.field} reason=${contract.reason}`);
+  const gates = evaluateHostDispatchGates(ledgerKey, contract);
+
+  if (gates.reason === "not-dispatchable-manual") {
+    logDispatchNext(`task-dispatch-manual key=${ledgerKey}`);
+    return skipManualDispatchItem(queue, item, deps, ledgerKey);
+  }
+  if (gates.reason === "unsupported-tool") {
+    logDispatchNext(`task-contract-refused key=${ledgerKey} field=Tool/model value=${gates.contract_value}`);
     return flagTaskContractRefusal(queue, item, deps, {
       taskId: ledgerKey,
-      field: contract.field || "task-file",
-      reason: contract.reason,
-      value: contract.value || (Array.isArray(contract.files) ? contract.files.join(",") : undefined),
-      note: `${ledgerKey} ## ${contract.field || "task-file"} refused (${contract.reason}${contract.value ? `: ${contract.value}` : ""}). Will not dispatch.`,
+      field: "Tool/model",
+      reason: "unsupported-tool",
+      value: gates.contract_value,
+      note: `${ledgerKey} ## Tool/model is ${gates.contract_value}; coordinator dispatches Cursor only and will not substitute. Run this task by hand with ${gates.contract_value}.`,
+      why: `The coordinator has no ${gates.contract_value} dispatch route. Silently substituting ${DISPATCHABLE_TOOL} would send this work to the wrong tool.`,
+      replyNeeded: `Run ${ledgerKey} by hand with ${gates.contract_value}, or change ## Tool/model if that routing was wrong.`,
     });
   }
+  if (gates.reason === "protected-path-scope") {
+    logDispatchNext(`protected-path-scope key=${ledgerKey} matches=${JSON.stringify(gates.matches)}`);
+    return refuseProtectedPathScope(queue, item, deps, ledgerKey, gates.matches);
+  }
+  if (gates.dispatched !== true) {
+    logDispatchNext(`task-contract-refused key=${ledgerKey} field=${gates.contract_field} reason=${gates.reason}`);
+    return flagTaskContractRefusal(queue, item, deps, {
+      taskId: ledgerKey,
+      field: gates.contract_field || "task-file",
+      reason: gates.reason,
+      value: gates.contract_value || (Array.isArray(contract.files) ? contract.files.join(",") : undefined),
+      note: `${ledgerKey} ## ${gates.contract_field || "task-file"} refused (${gates.reason}${gates.contract_value ? `: ${gates.contract_value}` : ""}). Will not dispatch.`,
+    });
+  }
+
+  const branch = contract.ok ? contract.branch : hardcodedCoordinatorBranch(item.id);
 
   if (!repoExists(item.repoPath)) {
     return { status: 400, body: { ok: false, error: `repoPath does not exist: ${item.repoPath}` } };
@@ -2032,6 +2232,26 @@ async function runBackgroundScanAndDispatch(deps, scanId) {
       save(queue);
       logDispatchNext(`roadmap auto-queued ${autoItem.id} ref=${d.roadmap_ref}`);
       const spawned = await spawnPendingQueueItem(queue, queue.length - 1, deps);
+      const hostRefusalReasons = new Set([
+        "not-dispatchable-manual",
+        "protected-path-scope",
+        "queue-item-rejected",
+        "ledger-blocked",
+      ]);
+      if (spawned.status === 200 && spawned.body?.dispatched !== true && hostRefusalReasons.has(spawned.body?.reason)) {
+        finishScanState(
+          scanId,
+          {
+            dispatched: false,
+            reason: spawned.body.reason,
+            task: spawned.body.task ?? null,
+            matches: spawned.body.matches ?? null,
+            ...snapshot,
+          },
+          deps,
+        );
+        return;
+      }
       if (spawned.status !== 200 || spawned.body?.dispatched !== true) {
         finishScanErrored(
           scanId,
@@ -4773,6 +4993,229 @@ if (process.argv.includes("--self-test-task-contract")) {
     failures,
     cases: allCases,
     fixtures: { task027Path, task029Path, fixtureRepo },
+  };
+  origLog(JSON.stringify(report, null, 2));
+  process.exit(failures.length === 0 ? 0 : 1);
+}
+
+// Dry-run the host-side dispatch gates against a TheCoach checkout's
+// _SSoT/tasks/ without startRun. Invoke:
+//   COORDINATOR_TOKEN=x node local-tools/coordinator-trigger.mjs --eval-dispatch-gates
+if (process.argv.includes("--eval-dispatch-gates")) {
+  const repo =
+    process.env.COORDINATOR_EVAL_TASKS_REPO ||
+    process.env.COORDINATOR_THECOACH_REPO ||
+    DEFAULT_QUEUE_REPO_PATH;
+  const ids = ["TASK-033", "TASK-037", "TASK-038", "TASK-039"];
+  const results = ids.map((id) => {
+    const contract = loadTaskContractForId(id, { thecoachRepo: repo });
+    const gates = evaluateHostDispatchGates(id, contract);
+    const scope =
+      contract.missing || !contract.markdown
+        ? { skipped: true, matches: [] }
+        : evaluateTaskScopeGate(contract.markdown);
+    return {
+      task: id,
+      missing: Boolean(contract.missing),
+      dispatch: contract.missing ? null : contract.dispatch,
+      tool: contract.ok ? contract.tool : null,
+      scope_matches: scope.matches ?? [],
+      scope_skipped: Boolean(scope.skipped),
+      ...gates,
+    };
+  });
+  console.log(
+    JSON.stringify(
+      {
+        ok: true,
+        dryRun: true,
+        repo,
+        patterns: [...PROTECTED_PATH_PATTERNS],
+        results,
+      },
+      null,
+      2,
+    ),
+  );
+  process.exit(0);
+}
+
+// Dispatch-time A1/A2 against tests/fixtures copies. Invoke:
+//   COORDINATOR_TOKEN=x node local-tools/coordinator-trigger.mjs --self-test-dispatch-scope-gate
+if (process.argv.includes("--self-test-dispatch-scope-gate")) {
+  const origLog = console.log;
+  const captured = [];
+  console.log = (...args) => {
+    const line = args.map(String).join(" ");
+    captured.push(line);
+    if (line.startsWith("[queue/dispatch-next]")) return;
+    origLog(...args);
+  };
+  const failures = [];
+  function check(label, cond, detail) {
+    if (!cond) failures.push({ label, detail });
+    return { case: label, ok: Boolean(cond), detail: cond ? null : detail };
+  }
+  function memoryQueue(initial = []) {
+    let q = initial;
+    return {
+      load: () => q,
+      save: (next) => {
+        q = next;
+      },
+      get: () => q,
+    };
+  }
+  function memoryLedger(initial = {}) {
+    let l = JSON.parse(JSON.stringify(initial));
+    return {
+      loadLedger: () => JSON.parse(JSON.stringify(l)),
+      saveLedger: (next) => {
+        l = JSON.parse(JSON.stringify(next));
+      },
+      get: () => l,
+    };
+  }
+  function pendingItem(id, task) {
+    return {
+      id,
+      task,
+      repoPath: "/tmp/dispatch-scope-repo",
+      status: "pending",
+      runId: null,
+      createdAt: new Date().toISOString(),
+      dispatchedAt: null,
+      resolvedAt: null,
+      note: null,
+    };
+  }
+
+  const fixtureSrc = path.join(ANTFARM_ROOT, "tests", "fixtures");
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "dispatch-scope-gate-"));
+  const tasksDir = path.join(fixtureRoot, "_SSoT", "tasks");
+  fs.mkdirSync(tasksDir, { recursive: true });
+  for (const name of [
+    "TASK-033-ci-typecheck-and-tests.md",
+    "TASK-037-rls-defense-in-depth.md",
+    "TASK-038-ci-dependency-secret-scanning.md",
+    "TASK-137-rls-defense-in-depth-manual.md",
+    "TASK-040-apps-only.md",
+    "TASK-041-no-expected-files.md",
+  ]) {
+    fs.copyFileSync(path.join(fixtureSrc, name), path.join(tasksDir, name));
+  }
+  const cases = [];
+
+  async function runSpawn(taskId, taskText, extraDeps = {}) {
+    const mq = memoryQueue([pendingItem(`q-${taskId}`, taskText)]);
+    const ledger = memoryLedger();
+    const started = [];
+    const todos = [];
+    const http = await spawnPendingQueueItem(mq.get(), 0, {
+      ...ledger,
+      thecoachRepo: fixtureRoot,
+      save: mq.save,
+      appendTodo: (_repo, draft) => {
+        todos.push(draft);
+        return { appended: true, entry: draft };
+      },
+      repoExists: () => true,
+      fetchStaging: async () => "tip",
+      startRun: ({ task }) => {
+        started.push(task);
+        return { id: `spawn-${taskId}`, pid: 1, logPath: "/tmp/spawn.log" };
+      },
+      waitRun: async () => ({ id: `run-${taskId}`, status: "running", run_number: 1 }),
+      ...extraDeps,
+    });
+    return { http, mq, started, todos, ledger };
+  }
+
+  const r033 = await runSpawn("TASK-033", "CI typecheck TASK-033");
+  cases.push(check("033-refused", r033.http.body.dispatched === false, r033.http.body));
+  cases.push(check("033-reason", r033.http.body.reason === "protected-path-scope", r033.http.body.reason));
+  cases.push(
+    check(
+      "033-match-ci-yml",
+      Array.isArray(r033.http.body.matches) &&
+        r033.http.body.matches.some(
+          (m) => m.path.includes(".github/workflows/ci.yml") && m.pattern === ".github/workflows/**",
+        ),
+      r033.http.body.matches,
+    ),
+  );
+  cases.push(check("033-no-startRun", r033.started.length === 0, r033.started));
+  cases.push(
+    check(
+      "033-ledger-failed",
+      r033.ledger.get()["TASK-033"]?.outcome === "failed" &&
+        r033.ledger.get()["TASK-033"]?.reason === "protected-path-scope",
+      r033.ledger.get(),
+    ),
+  );
+  cases.push(
+    check(
+      "033-todo-blocks",
+      r033.todos.length === 1 && Array.isArray(r033.todos[0].blocks) && r033.todos[0].blocks.includes("task:TASK-033"),
+      r033.todos,
+    ),
+  );
+
+  const r037 = await runSpawn("TASK-037", "RLS defense TASK-037");
+  cases.push(check("037-refused", r037.http.body.dispatched === false, r037.http.body));
+  cases.push(
+    check(
+      "037-reason-first-gate",
+      r037.http.body.reason === "queue-item-rejected" || r037.http.body.reason === "protected-path-scope",
+      r037.http.body.reason,
+    ),
+  );
+  cases.push(check("037-no-startRun", r037.started.length === 0, r037.started));
+
+  const r038 = await runSpawn("TASK-038", "CI secret scan TASK-038");
+  cases.push(check("038-refused", r038.http.body.dispatched === false, r038.http.body));
+  cases.push(check("038-reason", r038.http.body.reason === "protected-path-scope", r038.http.body.reason));
+  cases.push(
+    check(
+      "038-match-workflows",
+      Array.isArray(r038.http.body.matches) &&
+        r038.http.body.matches.some((m) => m.pattern === ".github/workflows/**"),
+      r038.http.body.matches,
+    ),
+  );
+
+  const rManual = await runSpawn("TASK-137", "RLS defense TASK-137");
+  cases.push(check("manual-refused", rManual.http.body.dispatched === false, rManual.http.body));
+  cases.push(
+    check("manual-reason", rManual.http.body.reason === "not-dispatchable-manual", rManual.http.body.reason),
+  );
+  cases.push(check("manual-no-todo", rManual.todos.length === 0, rManual.todos));
+  cases.push(check("manual-no-startRun", rManual.started.length === 0, rManual.started));
+  cases.push(
+    check("manual-no-ledger", Object.keys(rManual.ledger.get()).length === 0, rManual.ledger.get()),
+  );
+
+  const rApps = await runSpawn("TASK-040", "Apps only TASK-040");
+  cases.push(check("apps-dispatched", rApps.http.body.dispatched === true, rApps.http.body));
+  cases.push(check("apps-startRun", rApps.started.length === 1, rApps.started));
+
+  captured.length = 0;
+  const rSkip = await runSpawn("TASK-041", "No expected files TASK-041");
+  cases.push(check("skip-dispatched", rSkip.http.body.dispatched === true, rSkip.http.body));
+  cases.push(
+    check(
+      "skip-log",
+      captured.some((l) => l.includes(SCOPE_GATE_SKIPPED_LOG)),
+      captured,
+    ),
+  );
+
+  const report = {
+    ok: failures.length === 0,
+    failed: failures.length,
+    failures,
+    cases,
+    patterns: [...PROTECTED_PATH_PATTERNS],
   };
   origLog(JSON.stringify(report, null, 2));
   process.exit(failures.length === 0 ? 0 : 1);

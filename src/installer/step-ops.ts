@@ -13,7 +13,12 @@ import { getMaxRoleTimeoutSeconds } from "./install.js";
 import { getStepFailWhen, loadWorkflowSpec } from "./workflow-spec.js";
 import { resolveWorkflowDir } from "./paths.js";
 import { isFrontendChange } from "../lib/frontend-detect.js";
-import { findProtectedPaths, formatProtectedPathPatternsForPrompt } from "../lib/protected-paths.js";
+import {
+  findProtectedPaths,
+  formatProtectedPathPatternsForPrompt,
+  missingProtectedDiffField,
+  PROTECTED_PATH_DIFF_DEFAULT_BASE,
+} from "../lib/protected-paths.js";
 import {
   formatExpectedFailuresForPrompt,
   matchesExpectedFailureBaseline,
@@ -118,6 +123,9 @@ const STEP_STATUS_WAITING = "waiting";
  */
 export const ENGINE_ERROR_MISSING_REQUIRED_KEYS = "ENGINE_ERROR: missing_required_keys";
 export const ENGINE_ERROR_ORIGINAL_OUTPUT_HEADER = "ORIGINAL_OUTPUT:";
+export const ENGINE_ERROR_PROTECTED_PATH_MISSING_CONTEXT =
+  "ENGINE_ERROR: protected_path_gate_missing_context";
+export const ENGINE_ERROR_PROTECTED_PATH_GIT_FAILED = "ENGINE_ERROR: protected_path_gate_git_failed";
 
 export function formatMissingRequiredKeysEngineError(
   missingKeys: string[],
@@ -130,6 +138,31 @@ export function formatMissingRequiredKeysEngineError(
     ENGINE_ERROR_ORIGINAL_OUTPUT_HEADER,
     originalOutput,
   ].join("\n");
+}
+
+export function formatProtectedPathGateMissingContextError(
+  field: string,
+  originalOutput: string,
+): string {
+  return [
+    `${ENGINE_ERROR_PROTECTED_PATH_MISSING_CONTEXT}: ${field}`,
+    `Protected-path gate cannot run: missing ${field}`,
+    ENGINE_ERROR_ORIGINAL_OUTPUT_HEADER,
+    originalOutput,
+  ].join("\n");
+}
+
+function formatProtectedPathGateGitFailedError(detail: string, originalOutput: string): string {
+  return [
+    `${ENGINE_ERROR_PROTECTED_PATH_GIT_FAILED}: ${detail}`,
+    "Protected-path gate cannot run: git diff failed",
+    ENGINE_ERROR_ORIGINAL_OUTPUT_HEADER,
+    originalOutput,
+  ].join("\n");
+}
+
+function formatProtectedPathHitsMessage(hits: string[]): string {
+  return `Protected-path gate: diff touches ${hits.join(", ")}`;
 }
 
 /**
@@ -642,11 +675,12 @@ export function computeHasFrontendChanges(repo: string, branch: string): string 
 /**
  * Host-side protected-path gate for verify: list files in staging...commit
  * (falls back to main...commit) and return those matching PROTECTED_PATH_PATTERNS.
- * Returns [] if git is unavailable or the repo/sha is missing — never throws.
+ * Callers must fail closed on missing repo/commit_sha via missingProtectedDiffField
+ * before calling this. Returns [] if git is unavailable — never throws.
  */
 export function listProtectedDiffFiles(repo: string | undefined, commitSha: string | undefined): string[] {
-  if (!repo?.trim() || !commitSha?.trim()) return [];
-  for (const base of ["staging", "main"]) {
+  if (missingProtectedDiffField(repo, commitSha)) return [];
+  for (const base of [PROTECTED_PATH_DIFF_DEFAULT_BASE, "main"]) {
     try {
       const output = execFileSync("git", ["diff", "--name-only", `${base}...${commitSha}`], {
         cwd: repo,
@@ -660,6 +694,67 @@ export function listProtectedDiffFiles(repo: string | undefined, commitSha: stri
     }
   }
   return [];
+}
+
+/**
+ * Full-branch protected-path check for pr/merge: `git diff --name-only base...head`.
+ * Throws if git fails — callers fail closed.
+ */
+export function listProtectedDiffFilesVsBase(repo: string, base: string, head: string): string[] {
+  const output = execFileSync("git", ["diff", "--name-only", `${base}...${head}`], {
+    cwd: repo,
+    encoding: "utf-8",
+    timeout: 10_000,
+  });
+  const files = output.trim().split("\n").filter((f) => f.length > 0);
+  return findProtectedPaths(files);
+}
+
+function protectedPathStoryDiffFailure(
+  runCtx: Record<string, string>,
+  originalOutput: string,
+): string | null {
+  const missing = missingProtectedDiffField(runCtx.repo, runCtx.commit_sha);
+  if (missing) return formatProtectedPathGateMissingContextError(missing, originalOutput);
+  const hits = listProtectedDiffFiles(runCtx.repo, runCtx.commit_sha);
+  if (hits.length > 0) return formatProtectedPathHitsMessage(hits);
+  return null;
+}
+
+function protectedPathBranchDiffFailure(
+  runCtx: Record<string, string>,
+  originalOutput: string,
+): string | null {
+  if (typeof runCtx.repo !== "string" || runCtx.repo.trim() === "") {
+    return formatProtectedPathGateMissingContextError("repo", originalOutput);
+  }
+  const head = (runCtx.branch || runCtx.commit_sha || "").trim();
+  if (!head) {
+    return formatProtectedPathGateMissingContextError("commit_sha", originalOutput);
+  }
+  const base = (runCtx.pr_base || PROTECTED_PATH_DIFF_DEFAULT_BASE).trim();
+  try {
+    const hits = listProtectedDiffFilesVsBase(runCtx.repo, base, head);
+    if (hits.length > 0) return formatProtectedPathHitsMessage(hits);
+    return null;
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    return formatProtectedPathGateGitFailedError(detail, originalOutput);
+  }
+}
+
+function failCompleteOnProtectedPath(
+  stepId: string,
+  stepPublicId: string,
+  runId: string,
+  message: string,
+  output: string,
+): { advanced: boolean; runCompleted: boolean } {
+  const failResult = failStepSync(stepId, message, { stdoutTail: tailOutput(output) });
+  if (failResult.runFailed) {
+    notifyFailureExhausted(runId, stepPublicId, message).catch(() => {});
+  }
+  return { advanced: false, runCompleted: false };
 }
 
 function failStepWithMissingInputs(
@@ -917,6 +1012,17 @@ export function claimStep(agentId: string): ClaimResult {
     }
   }
 
+  // Merge must never receive a prompt (and therefore never run `gh pr merge`)
+  // if the full branch diff vs the PR base still contains a protected path.
+  // completeStep on merge is too late — the agent would already have merged.
+  if (step.step_id === "merge") {
+    const mergeGate = protectedPathBranchDiffFailure(context, "");
+    if (mergeGate) {
+      failStepSync(step.id, mergeGate);
+      return { found: false };
+    }
+  }
+
   // Single step: existing logic
   db.prepare(
     "UPDATE steps SET status = 'running', updated_at = datetime('now') WHERE id = ? AND status = 'pending'"
@@ -992,14 +1098,18 @@ export function completeStep(stepId: string, output: string): { advanced: boolea
   if (step.step_id === "verify") {
     const runCtxRow = db.prepare("SELECT context FROM runs WHERE id = ?").get(step.run_id) as { context: string } | undefined;
     const runCtx: Record<string, string> = runCtxRow ? JSON.parse(runCtxRow.context) : {};
-    const protectedHits = listProtectedDiffFiles(runCtx.repo, runCtx.commit_sha);
-    if (protectedHits.length > 0) {
-      const message = `Protected-path gate: diff touches ${protectedHits.join(", ")}`;
-      const failResult = failStepSync(stepId, message, { stdoutTail: tailOutput(output) });
-      if (failResult.runFailed) {
-        notifyFailureExhausted(step.run_id, step.step_id, message).catch(() => {});
-      }
-      return { advanced: false, runCompleted: false };
+    const message = protectedPathStoryDiffFailure(runCtx, output);
+    if (message) {
+      return failCompleteOnProtectedPath(stepId, step.step_id, step.run_id, message, output);
+    }
+  }
+
+  if (step.step_id === "pr" || step.step_id === "merge") {
+    const runCtxRow = db.prepare("SELECT context FROM runs WHERE id = ?").get(step.run_id) as { context: string } | undefined;
+    const runCtx: Record<string, string> = runCtxRow ? JSON.parse(runCtxRow.context) : {};
+    const message = protectedPathBranchDiffFailure(runCtx, output);
+    if (message) {
+      return failCompleteOnProtectedPath(stepId, step.step_id, step.run_id, message, output);
     }
   }
 

@@ -5,9 +5,9 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { isProtectedPath, findProtectedPaths } from "../src/lib/protected-paths.ts";
+import { isProtectedPath, findProtectedPaths, missingProtectedDiffField } from "../src/lib/protected-paths.ts";
 import { getDb } from "../dist/db.js";
-import { completeStep, listProtectedDiffFiles } from "../dist/installer/step-ops.js";
+import { claimStep, completeStep, listProtectedDiffFiles } from "../dist/installer/step-ops.js";
 
 describe("isProtectedPath / findProtectedPaths", () => {
   it("still catches _SSoT/**", () => {
@@ -116,4 +116,155 @@ describe("listProtectedDiffFiles + completeStep host-side gate", () => {
       assert.ok(verify.output.includes(rel), `expected output to name ${rel}, got: ${verify.output}`);
     });
   }
+
+  it("B1: missing repo fails verify with ENGINE_ERROR and ORIGINAL_OUTPUT", () => {
+    const db = getDb();
+    const runId = randomUUID();
+    const stepId = randomUUID();
+    const now = new Date().toISOString();
+    testRunIds.push(runId);
+    db.prepare(
+      `INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at)
+       VALUES (?, 'thecoach-dev', 'test task', 'running', ?, ?, ?)`,
+    ).run(runId, JSON.stringify({ branch: "feat", commit_sha: "abc123" }), now, now);
+    db.prepare(
+      `INSERT INTO steps (id, step_id, run_id, agent_id, step_index, input_template, expects, status, max_retries, created_at, updated_at, type)
+       VALUES (?, 'verify', ?, 'thecoach-dev_verifier', 0, 'test', 'GATE: STATUS:', 'running', 0, ?, ?, 'single')`,
+    ).run(stepId, runId, now, now);
+    const agentOutput = "GATE: pass\nSTATUS: pass";
+    const result = completeStep(stepId, agentOutput);
+    assert.equal(result.advanced, false);
+    const verify = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(stepId) as {
+      status: string;
+      output: string;
+    };
+    assert.equal(verify.status, "failed");
+    assert.ok(verify.output.includes("ENGINE_ERROR: protected_path_gate_missing_context: repo"));
+    assert.ok(verify.output.includes("ORIGINAL_OUTPUT:"));
+    assert.ok(verify.output.includes(agentOutput));
+    assert.equal(missingProtectedDiffField(undefined, "abc"), "repo");
+  });
+
+  it("B1: missing commit_sha fails verify with ENGINE_ERROR and ORIGINAL_OUTPUT", () => {
+    const db = getDb();
+    const runId = randomUUID();
+    const stepId = randomUUID();
+    const now = new Date().toISOString();
+    testRunIds.push(runId);
+    db.prepare(
+      `INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at)
+       VALUES (?, 'thecoach-dev', 'test task', 'running', ?, ?, ?)`,
+    ).run(runId, JSON.stringify({ repo: "/tmp/does-not-matter", branch: "feat" }), now, now);
+    db.prepare(
+      `INSERT INTO steps (id, step_id, run_id, agent_id, step_index, input_template, expects, status, max_retries, created_at, updated_at, type)
+       VALUES (?, 'verify', ?, 'thecoach-dev_verifier', 0, 'test', 'GATE: STATUS:', 'running', 0, ?, ?, 'single')`,
+    ).run(stepId, runId, now, now);
+    const agentOutput = "GATE: pass\nSTATUS: pass";
+    const result = completeStep(stepId, agentOutput);
+    assert.equal(result.advanced, false);
+    const verify = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(stepId) as {
+      status: string;
+      output: string;
+    };
+    assert.equal(verify.status, "failed");
+    assert.ok(verify.output.includes("ENGINE_ERROR: protected_path_gate_missing_context: commit_sha"));
+    assert.ok(verify.output.includes("ORIGINAL_OUTPUT:"));
+    assert.ok(verify.output.includes(agentOutput));
+    assert.equal(missingProtectedDiffField("/tmp/repo", ""), "commit_sha");
+  });
+
+  it("B1: both present and a clean apps-only diff passes verify", () => {
+    const { repo, sha } = makeRepoWithFile("apps/web/page.tsx");
+    assert.deepEqual(listProtectedDiffFiles(repo, sha), []);
+    const stepDbId = insertVerifyRun(repo, sha);
+    const result = completeStep(stepDbId, "GATE: pass\nSTATUS: pass");
+    assert.equal(result.advanced, true);
+    const db = getDb();
+    const verify = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepDbId) as { status: string };
+    assert.equal(verify.status, "done");
+  });
+
+  function makeThreeCommitRepo(): { repo: string; branch: string } {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), "antfarm-protected-branch-"));
+    dirs.push(repo);
+    git(repo, ["init"]);
+    git(repo, ["config", "user.email", "test@example.com"]);
+    git(repo, ["config", "user.name", "Test"]);
+    git(repo, ["checkout", "-b", "staging"]);
+    fs.writeFileSync(path.join(repo, "README.md"), "base\n");
+    git(repo, ["add", "README.md"]);
+    git(repo, ["commit", "-m", "base"]);
+    git(repo, ["checkout", "-b", "feat"]);
+    const protectedFile = path.join(repo, "supabase", "migrations", "001.sql");
+    fs.mkdirSync(path.dirname(protectedFile), { recursive: true });
+    fs.writeFileSync(protectedFile, "create table t (id int);\n");
+    git(repo, ["add", "supabase/migrations/001.sql"]);
+    git(repo, ["commit", "-m", "commit 1 protected"]);
+    fs.mkdirSync(path.join(repo, "apps", "web"), { recursive: true });
+    fs.writeFileSync(path.join(repo, "apps", "web", "a.ts"), "a\n");
+    git(repo, ["add", "apps/web/a.ts"]);
+    git(repo, ["commit", "-m", "commit 2 apps"]);
+    fs.writeFileSync(path.join(repo, "apps", "web", "b.ts"), "b\n");
+    git(repo, ["add", "apps/web/b.ts"]);
+    git(repo, ["commit", "-m", "commit 3 apps"]);
+    return { repo, branch: "feat" };
+  }
+
+  function insertNamedStep(repo: string, branch: string, stepId: string, status: string, maxRetries: number): string {
+    const db = getDb();
+    const runId = randomUUID();
+    const stepDbId = randomUUID();
+    const now = new Date().toISOString();
+    testRunIds.push(runId);
+    db.prepare(
+      `INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at)
+       VALUES (?, 'thecoach-dev', 'test task', 'running', ?, ?, ?)`,
+    ).run(runId, JSON.stringify({ repo, branch }), now, now);
+    db.prepare(
+      `INSERT INTO steps (id, step_id, run_id, agent_id, step_index, input_template, expects, status, max_retries, created_at, updated_at, type)
+       VALUES (?, ?, ?, ?, 0, 'test', 'STATUS:', ?, ?, ?, ?, 'single')`,
+    ).run(stepDbId, stepId, runId, `thecoach-dev_${stepId}`, status, maxRetries, now, now);
+    return stepDbId;
+  }
+
+  it("B2: a protected file added in commit 1 of 3, untouched after, is caught at pr", () => {
+    const { repo, branch } = makeThreeCommitRepo();
+    const stepDbId = insertNamedStep(repo, branch, "pr", "running", 0);
+    const result = completeStep(stepDbId, "STATUS: done\nPR_URL: https://github.com/o/r/pull/1");
+    assert.equal(result.advanced, false);
+    const db = getDb();
+    const pr = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(stepDbId) as {
+      status: string;
+      output: string;
+    };
+    assert.equal(pr.status, "failed");
+    assert.ok(pr.output.includes("supabase/migrations/001.sql"), pr.output);
+  });
+
+  it("B2: merge claim fails before the agent receives a prompt (pre-gh-pr-merge)", () => {
+    const { repo, branch } = makeThreeCommitRepo();
+    const agentId = `thecoach-dev_merge-${randomUUID().slice(0, 8)}`;
+    const db = getDb();
+    const runId = randomUUID();
+    const stepDbId = randomUUID();
+    const now = new Date().toISOString();
+    testRunIds.push(runId);
+    db.prepare(
+      `INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at)
+       VALUES (?, 'thecoach-dev', 'test task', 'running', ?, ?, ?)`,
+    ).run(runId, JSON.stringify({ repo, branch }), now, now);
+    db.prepare(
+      `INSERT INTO steps (id, step_id, run_id, agent_id, step_index, input_template, expects, status, max_retries, created_at, updated_at, type)
+       VALUES (?, 'merge', ?, ?, 0, 'gh pr merge {{pr_url}}', 'STATUS:', 'pending', 0, ?, ?, 'single')`,
+    ).run(stepDbId, runId, agentId, now, now);
+
+    const claimed = claimStep(agentId);
+    assert.equal(claimed.found, false, "merge must not be handed to an agent when the branch diff is dirty");
+    const merge = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(stepDbId) as {
+      status: string;
+      output: string;
+    };
+    assert.equal(merge.status, "failed");
+    assert.ok(merge.output.includes("supabase/migrations/001.sql"), merge.output);
+  });
 });
