@@ -50,7 +50,12 @@ or fix code.
       trust the raw output you ran.
 5. Report real output for both suite and build in your step reply — not a
    summary that implies success. Use the workflow step's STATUS /
-   INTEGRATION_RESULT / BUILD_RESULT / FAILURES labels.
+   INTEGRATION_RESULT / BUILD_RESULT / FAILURES labels. If
+   `{{expected_failures}}` is not `none`, a matching failure (same
+   command, listed signature still present in the real output) is
+   expected/non-blocking: report `STATUS: pass` and put that output in
+   BUILD_RESULT. Fail hard on a different error, an undeclared failure,
+   or a declared failure whose signature changed shape.
 
 ## What NOT to do
 

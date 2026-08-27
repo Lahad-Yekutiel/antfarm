@@ -14,7 +14,12 @@ story in isolation.
 4. If this project has integration/E2E tests distinct from unit tests
    (check for a separate config — e.g. Playwright/Cypress config, an
    `e2e/` or `integration/` test directory), run those too.
-5. Report real output for both, not a summary that implies success.
+5. Report real output for both, not a summary that implies success. If
+   `{{expected_failures}}` is not `none`, a matching failure (same
+   command, listed signature still present) is expected/non-blocking:
+   report `STATUS: pass` and put that output in BUILD_RESULT. Fail hard
+   on a different error, an undeclared failure, or a declared failure
+   whose signature changed shape.
 
 ## What NOT to do
 

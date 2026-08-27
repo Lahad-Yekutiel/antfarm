@@ -306,7 +306,14 @@ steps:
          `{{branch}}`. Confirm only hygiene files were touched.
       4. Run the build command yourself. Run the test command yourself.
          Report real results — don't take Cursor's word.
-      5. Report what you found.
+      5. Report what you found. If a command failed and that failure is a
+         known baseline (already broken on staging, and the task says not
+         to treat it as this task's bug), emit it as EXPECTED_FAILURES —
+         one `- <command> :: <verbatim error signature>` line per failure,
+         signature copied from the real output, not paraphrased. If nothing
+         failed, or a failure is NOT an accepted baseline, write
+         EXPECTED_FAILURES: none. BASELINE prose is not enough; the test
+         step only honours this structured field.
 
       Reply with:
       STATUS: done | blocked
@@ -314,7 +321,8 @@ steps:
       BUILD_CMD: (only if done)
       TEST_CMD: (only if done)
       BASELINE: build passes / tests pass, or describe what failed (only if done)
-    expects: "STATUS:"
+      EXPECTED_FAILURES: none | - <command> :: <signature> (only if done)
+    expects: "STATUS: EXPECTED_FAILURES:"
     max_retries: 2
     on_fail:
       on_exhausted:
@@ -452,11 +460,25 @@ steps:
       BUILD_CMD: {{build_cmd}}
       TEST_CMD: {{test_cmd}}
 
+      EXPECTED_FAILURES (from setup; host-normalized — `none` means fail
+      on any non-zero test or build exit; a listed command+signature is
+      the only carve-out, injected from setup's EXPECTED_FAILURES so this
+      cannot drift from what completeStep evaluates):
+      {{expected_failures}}
+
       All stories are implemented and individually verified. Run
       integration/E2E checks across the whole branch — not just the
       per-story unit tests already run. Run the full test suite and the
       build one more time against the final state of the branch. Report
       real results.
+
+      A failure that matches a declared EXPECTED_FAILURES entry (same
+      command AND the listed signature still present in the real output)
+      is expected/non-blocking — report STATUS: pass and record that
+      output in BUILD_RESULT, not FAILURES. Fail hard (STATUS: fail) if:
+      a different error, a failure that was not declared, or a declared
+      failure whose signature/shape changed. `none` means there is no
+      carve-out.
 
       Reply with:
       STATUS: pass | fail

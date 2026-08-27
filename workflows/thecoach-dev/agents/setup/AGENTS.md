@@ -72,8 +72,12 @@ delegate instead.
 
 ## Important notes
 
-- If the build or tests fail on `staging`, note it in BASELINE — downstream
-  agents need to know what's pre-existing versus what they broke.
+- If the build or tests fail on `staging`, note it in BASELINE **and**
+  in EXPECTED_FAILURES as one `- <command> :: <verbatim error signature>`
+  line per known/expected failure (signature copied from the real
+  output, not paraphrased). The test step only honours EXPECTED_FAILURES,
+  not BASELINE prose. If nothing failed, or a failure is not an accepted
+  baseline, write `EXPECTED_FAILURES: none`.
 - If there are no tests, say so clearly, don't imply there are.
 
 ## What NOT to do

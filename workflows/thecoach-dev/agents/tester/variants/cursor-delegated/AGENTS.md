@@ -25,7 +25,11 @@ reporting the real result.
    for. If Cursor's own summary and the raw output it captured disagree,
    trust the raw output.
 4. Report real output for both suite and build, not a summary that
-   implies success.
+   implies success. If `{{expected_failures}}` is not `none`, a matching
+   failure (same command, listed signature still present) is
+   expected/non-blocking: report `STATUS: pass` and put that output in
+   BUILD_RESULT. Fail hard on a different error, an undeclared failure,
+   or a declared failure whose signature changed shape.
 
 ## What NOT to do
 

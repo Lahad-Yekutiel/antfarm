@@ -14,6 +14,11 @@ import { getStepFailWhen, loadWorkflowSpec } from "./workflow-spec.js";
 import { resolveWorkflowDir } from "./paths.js";
 import { isFrontendChange } from "../lib/frontend-detect.js";
 import { findProtectedPaths, formatProtectedPathPatternsForPrompt } from "../lib/protected-paths.js";
+import {
+  formatExpectedFailuresForPrompt,
+  matchesExpectedFailureBaseline,
+  parseExpectedFailures,
+} from "../lib/expected-failures.js";
 import type { WorkflowStepFailure } from "./types.js";
 
 /**
@@ -183,6 +188,31 @@ export function matchOutputFailure(
     }
   }
   return null;
+}
+
+const TEST_STEP_ID = "test";
+
+/**
+ * Test-step STATUS: fail is non-blocking when it matches setup's declared
+ * EXPECTED_FAILURES baseline (same command + signature still present).
+ * Empty/missing baseline is never a match — default remains fail-hard.
+ */
+function testFailureMatchesExpectedBaseline(
+  stepId: string,
+  parsed: Record<string, string>,
+  runId: string,
+): boolean {
+  if (stepId !== TEST_STEP_ID) return false;
+  if (parsed.status?.toLowerCase() !== "fail") return false;
+  const db = getDb();
+  const runCtxRow = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string } | undefined;
+  const runCtx: Record<string, string> = runCtxRow ? JSON.parse(runCtxRow.context) : {};
+  return matchesExpectedFailureBaseline({
+    expected: parseExpectedFailures(runCtx.expected_failures),
+    failuresText: parsed.failures ?? "",
+    testCmd: runCtx.test_cmd,
+    buildCmd: runCtx.build_cmd,
+  }).matched;
 }
 
 function failureReason(parsed: Record<string, string>, key: string): string {
@@ -763,6 +793,12 @@ export function claimStep(agentId: string): ClaimResult {
   // Host-enforced protected paths — same list verify uses. Must not be a
   // hand-copied string in workflow.yml (TASK-037 planner blind spot).
   context["protected_paths"] = formatProtectedPathPatternsForPrompt();
+  // Setup's EXPECTED_FAILURES, normalized through the same parser the
+  // test-step host matcher uses. Missing/empty → "none" so {{expected_failures}}
+  // cannot silently omit (TASK-027 test-step baseline gap).
+  context["expected_failures"] = formatExpectedFailuresForPrompt(
+    parseExpectedFailures(context["expected_failures"]),
+  );
 
   // Compute has_frontend_changes from git diff when repo and branch are available
   if (context["repo"] && context["branch"]) {
@@ -943,7 +979,7 @@ export function completeStep(stepId: string, output: string): { advanced: boolea
     ? getStepFailWhen(runCheck.workflow_id, step.step_id)
     : undefined;
   const failure = matchOutputFailure(parsed, failWhen);
-  if (failure) {
+  if (failure && !testFailureMatchesExpectedBaseline(step.step_id, parsed, step.run_id)) {
     const reason = failureReason(parsed, failure.key);
     const message = `Agent reported ${failure.key.toUpperCase()}: ${failure.value}. REASON: ${reason}`;
     const failResult = failStepSync(stepId, message, { stdoutTail: tailOutput(output) });
