@@ -77,6 +77,16 @@ const SCAN_LOCK_TTL_MS = 5 * 60 * 1000;
 /** phase:<id> / oq:OQ-<n> / task:TASK-<n> / * — compared after canonicalizeScopeToken(). */
 const SCOPE_TOKEN_RE = /^(?:\*|phase:[a-z0-9]+|oq:oq-\d+|task:task-\d+)$/;
 const TASK_ID_RE = /TASK-(\d+)/i;
+/** Task files live here, read from COORDINATOR_THECOACH_REPO — same as ROADMAP.md. */
+const TASKS_RELATIVE_DIR = path.join("_SSoT", "tasks");
+/** The only Dev agent this coordinator can actually spawn today. */
+const DISPATCHABLE_TOOL = "Cursor";
+/**
+ * Conservative branch-name extract from a ## Branch section. Requires a
+ * feature/fix/feat/docs prefix so prose like "Never `main`" or a WSL path
+ * cannot be mistaken for the intended git branch.
+ */
+const TASK_BRANCH_NAME_RE = /\b((?:feature|fix|feat|docs)\/[A-Za-z0-9._-]+)/;
 const PHASE_HEADING_RE = /phase\s+(\d+[a-z]?)\b/i;
 /** `## Phase 9 — ...` / `## Phase 4B — ...` — ground truth for dispatch phase. */
 const PHASE_HEADING_LINE_RE = /^##\s+Phase\s+(\d+[a-z]?)\b/i;
@@ -498,6 +508,204 @@ function extractAllTaskIdsFromText(...parts) {
     }
   }
   return ids;
+}
+
+/**
+ * Body of a `## Heading` section, up to the next `## ` heading.
+ * headingRe matches the heading line (e.g. /^##\s+Branch\b/i).
+ */
+function extractMarkdownSection(markdown, headingRe) {
+  const lines = String(markdown || "").split(/\r?\n/);
+  let start = -1;
+  for (let i = 0; i < lines.length; i += 1) {
+    if (headingRe.test(lines[i])) {
+      start = i + 1;
+      break;
+    }
+  }
+  if (start < 0) return null;
+  const body = [];
+  for (let i = start; i < lines.length; i += 1) {
+    if (/^##\s+/.test(lines[i])) break;
+    body.push(lines[i]);
+  }
+  return body.join("\n").trim();
+}
+
+function firstNonEmptyLine(text) {
+  for (const line of String(text || "").split(/\n/)) {
+    const trimmed = line.trim();
+    if (trimmed) return trimmed;
+  }
+  return "";
+}
+
+/**
+ * Parse ## Branch. Ambiguous / missing / a request for main → not ok.
+ * Does not guess a default.
+ */
+function parseTaskBranch(sectionText) {
+  if (sectionText == null || !String(sectionText).trim()) {
+    return { ok: false, field: "Branch", reason: "missing-or-empty" };
+  }
+  const first = firstNonEmptyLine(sectionText).replace(/[`*_]/g, "").trim();
+  const firstToken = first.split(/\s+/)[0] || "";
+  if (/^(main|master)$/i.test(firstToken)) {
+    return { ok: false, field: "Branch", reason: "refused-main", value: firstToken };
+  }
+  const match = String(sectionText).match(TASK_BRANCH_NAME_RE);
+  if (!match) {
+    return { ok: false, field: "Branch", reason: "unparseable" };
+  }
+  const branch = match[1];
+  if (/^(main|master)$/i.test(branch)) {
+    return { ok: false, field: "Branch", reason: "refused-main", value: branch };
+  }
+  return { ok: true, field: "Branch", branch };
+}
+
+/**
+ * Parse ## Tool/model (also `## Tool/model if applicable`).
+ * Uses the first non-empty line only, so later prose mentioning the other
+ * tier cannot flip the routing. Known values: Cursor | Claude Code.
+ */
+function parseTaskToolModel(sectionText) {
+  if (sectionText == null || !String(sectionText).trim()) {
+    return { ok: false, field: "Tool/model", reason: "missing-or-empty" };
+  }
+  const first = firstNonEmptyLine(sectionText).replace(/[`*_]/g, " ").replace(/\s+/g, " ").trim();
+  if (/\bClaude Code\b/i.test(first)) {
+    return { ok: true, field: "Tool/model", tool: "Claude Code" };
+  }
+  if (/\bCursor\b/i.test(first)) {
+    return { ok: true, field: "Tool/model", tool: "Cursor" };
+  }
+  return { ok: false, field: "Tool/model", reason: "unparseable", value: first.slice(0, 80) };
+}
+
+/** Read both contract fields from a task-file body. Either field failing fails the whole parse. */
+function parseTaskContract(markdown) {
+  const branchSection = extractMarkdownSection(markdown, /^##\s+Branch\b/i);
+  const toolSection = extractMarkdownSection(markdown, /^##\s+Tool\/model\b/i);
+  const branch = parseTaskBranch(branchSection);
+  if (!branch.ok) return branch;
+  const tool = parseTaskToolModel(toolSection);
+  if (!tool.ok) return tool;
+  return { ok: true, branch: branch.branch, tool: tool.tool };
+}
+
+function listTaskFilenamesForId(tasksDir, taskId) {
+  if (!fs.existsSync(tasksDir)) return [];
+  const prefix = `${taskId}-`;
+  return fs.readdirSync(tasksDir).filter((name) => name.startsWith(prefix) && name.toLowerCase().endsWith(".md"));
+}
+
+/**
+ * Load the task file for TASK-NNN from COORDINATOR_THECOACH_REPO and parse
+ * ## Branch + ## Tool/model. missing:true means "no file to read" — caller
+ * falls back to the hardcoded coordinator branch pattern. Any other failure
+ * is a refusal (do not guess).
+ */
+function loadTaskContractForId(taskId, deps = {}) {
+  const repo = deps.thecoachRepo !== undefined ? deps.thecoachRepo : THECOACH_REPO;
+  if (!repo) return { ok: false, missing: true, reason: "no-thecoach-repo", taskId };
+  const tasksDir = path.join(repo, TASKS_RELATIVE_DIR);
+  let names;
+  try {
+    names = listTaskFilenamesForId(tasksDir, taskId);
+  } catch (err) {
+    return { ok: false, missing: true, reason: "tasks-dir-unreadable", taskId, error: err?.message || String(err) };
+  }
+  if (names.length === 0) {
+    return { ok: false, missing: true, reason: "task-file-missing", taskId };
+  }
+  if (names.length > 1) {
+    return {
+      ok: false,
+      missing: false,
+      field: "task-file",
+      reason: "ambiguous-task-file",
+      taskId,
+      files: names,
+    };
+  }
+  const filePath = path.join(tasksDir, names[0]);
+  let markdown;
+  try {
+    markdown = fs.readFileSync(filePath, "utf-8");
+  } catch (err) {
+    return { ok: false, missing: false, field: "task-file", reason: "task-file-unreadable", taskId, path: filePath, error: err?.message || String(err) };
+  }
+  const parsed = parseTaskContract(markdown);
+  if (!parsed.ok) return { ...parsed, missing: false, path: filePath, taskId };
+  return { ok: true, branch: parsed.branch, tool: parsed.tool, path: filePath, taskId };
+}
+
+function hardcodedCoordinatorBranch(queueItemId) {
+  return `feature/thecoach-dev-coordinator-${queueItemId}`;
+}
+
+/**
+ * Flag a pending item, surface the refusal on developer_todo (same route as
+ * unledgerable / ledger-failed items), then advance to the next pending item.
+ */
+async function flagTaskContractRefusal(queue, item, deps, details) {
+  const save = deps.save || saveQueue;
+  const taskId = details.taskId;
+  const field = details.field || "task-file";
+  const reason = details.reason || "refused";
+  const value = details.value;
+  const note =
+    details.note ||
+    `${taskId} ## ${field} refused (${reason}${value ? `: ${value}` : ""}). Will not dispatch.`;
+  item.status = "flagged";
+  item.resolvedAt = new Date().toISOString();
+  item.note = note;
+  save(queue);
+  try {
+    const appendTodo = deps.appendTodo || ((repo, draft) => appendDeveloperTodoEntry(repo, draft, deps));
+    const repo = deps.thecoachRepo !== undefined ? deps.thecoachRepo : THECOACH_REPO;
+    if (repo || deps.appendTodo) {
+      const written = appendTodo(repo, {
+        summary: `Dispatch of ${taskId} refused: ## ${field} ${reason}${value ? ` (${value})` : ""}`,
+        why:
+          details.why ||
+          `The task file's ## ${field} cannot be honoured, and substituting a coordinator default would silently ignore the contract.`,
+        source: taskId,
+        type: "blocked",
+        evidence: note,
+        reply_needed:
+          details.replyNeeded ||
+          `Resolve ## ${field} on ${taskId} (or run it by hand), then clear any matching developer_todo entry.`,
+        blocks: [`task:${taskId}`],
+      });
+      if (!written.appended) {
+        logDispatchNext(`todo writer skipped duplicate summary for task-contract refusal ${taskId}`);
+      }
+    }
+  } catch (err) {
+    logDispatchNextError(`todo writer failed for task-contract refusal ${taskId}: ${err?.message || String(err)}`);
+  }
+  const nextIdx = queue.findIndex((it) => it.status === "pending");
+  if (nextIdx >= 0) {
+    return spawnPendingQueueItem(queue, nextIdx, deps);
+  }
+  return {
+    status: 200,
+    body: withIdleTelemetry(
+      {
+        ok: true,
+        dispatched: false,
+        reason: "queue-item-rejected",
+        queueItemId: item.id,
+        ledger_key: taskId,
+        contract_field: field,
+        contract_reason: reason,
+        contract_value: value ?? null,
+      },
+      deps,
+    ),
+  };
 }
 
 /**
@@ -1659,6 +1867,36 @@ async function spawnPendingQueueItem(queue, idx, deps = {}) {
     };
   }
 
+  const loadContract = deps.loadTaskContract || ((id) => loadTaskContractForId(id, deps));
+  const contract = loadContract(ledgerKey);
+  let branch;
+  if (contract.ok) {
+    if (contract.tool !== DISPATCHABLE_TOOL) {
+      logDispatchNext(`task-contract-refused key=${ledgerKey} field=Tool/model value=${contract.tool}`);
+      return flagTaskContractRefusal(queue, item, deps, {
+        taskId: ledgerKey,
+        field: "Tool/model",
+        reason: "unsupported-tool",
+        value: contract.tool,
+        note: `${ledgerKey} ## Tool/model is ${contract.tool}; coordinator dispatches Cursor only and will not substitute. Run this task by hand with ${contract.tool}.`,
+        why: `The coordinator has no ${contract.tool} dispatch route. Silently substituting ${DISPATCHABLE_TOOL} would send this work to the wrong tool.`,
+        replyNeeded: `Run ${ledgerKey} by hand with ${contract.tool}, or change ## Tool/model if that routing was wrong.`,
+      });
+    }
+    branch = contract.branch;
+  } else if (contract.missing) {
+    branch = hardcodedCoordinatorBranch(item.id);
+  } else {
+    logDispatchNext(`task-contract-refused key=${ledgerKey} field=${contract.field} reason=${contract.reason}`);
+    return flagTaskContractRefusal(queue, item, deps, {
+      taskId: ledgerKey,
+      field: contract.field || "task-file",
+      reason: contract.reason,
+      value: contract.value || (Array.isArray(contract.files) ? contract.files.join(",") : undefined),
+      note: `${ledgerKey} ## ${contract.field || "task-file"} refused (${contract.reason}${contract.value ? `: ${contract.value}` : ""}). Will not dispatch.`,
+    });
+  }
+
   if (!repoExists(item.repoPath)) {
     return { status: 400, body: { ok: false, error: `repoPath does not exist: ${item.repoPath}` } };
   }
@@ -1670,7 +1908,6 @@ async function spawnPendingQueueItem(queue, idx, deps = {}) {
     return { status: 500, body: { ok: false, error: err?.message || String(err) } };
   }
 
-  const branch = `feature/thecoach-dev-coordinator-${item.id}`;
   const taskText = buildQueuedTaskText({
     repoPath: item.repoPath,
     branch,
@@ -4314,6 +4551,228 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     failed: failures.length,
     failures,
     cases: allCases,
+  };
+  origLog(JSON.stringify(report, null, 2));
+  process.exit(failures.length === 0 ? 0 : 1);
+}
+
+// Task-file contract — ## Branch is the git branch, ## Tool/model is a gate.
+// Does not bind the port, does not spawn workflows, does not touch the live
+// queue. Uses TASK-027 and TASK-029's real files as fixtures. Invoke:
+//   COORDINATOR_TOKEN=x node local-tools/coordinator-trigger.mjs --self-test-task-contract
+if (process.argv.includes("--self-test-task-contract")) {
+  const origLog = console.log;
+  console.log = (...args) => {
+    const line = args.map(String).join(" ");
+    if (line.startsWith("[queue/dispatch-next]")) return;
+    origLog(...args);
+  };
+  const failures = [];
+
+  function check(label, cond, detail) {
+    if (!cond) failures.push({ label, detail });
+    return { case: label, ok: Boolean(cond), detail: cond ? null : detail };
+  }
+
+  function memoryQueue(initial = []) {
+    let q = initial;
+    return {
+      load: () => q,
+      save: (next) => {
+        q = next;
+      },
+      get: () => q,
+    };
+  }
+
+  function memoryLedger(initial = {}) {
+    let l = JSON.parse(JSON.stringify(initial));
+    return {
+      loadLedger: () => JSON.parse(JSON.stringify(l)),
+      saveLedger: (next) => {
+        l = JSON.parse(JSON.stringify(next));
+      },
+      get: () => l,
+    };
+  }
+
+  const fixtureRepo =
+    (process.env.COORDINATOR_THECOACH_REPO || "").trim() || "/mnt/c/Users/lahad/Projects/TheCoach";
+  const task027Path = path.join(fixtureRepo, TASKS_RELATIVE_DIR, "TASK-027-root-verification-entrypoints.md");
+  const task029Path = path.join(fixtureRepo, TASKS_RELATIVE_DIR, "TASK-029-rls-negative-test-suite.md");
+  const markdown027 = fs.readFileSync(task027Path, "utf-8");
+  const markdown029 = fs.readFileSync(task029Path, "utf-8");
+  const parsed027 = parseTaskContract(markdown027);
+  const parsed029 = parseTaskContract(markdown029);
+  const loaded027 = loadTaskContractForId("TASK-027", { thecoachRepo: fixtureRepo });
+  const loaded029 = loadTaskContractForId("TASK-029", { thecoachRepo: fixtureRepo });
+  const loadedMissing = loadTaskContractForId("TASK-099", { thecoachRepo: fixtureRepo });
+  const loadedNoRepo = loadTaskContractForId("TASK-027", { thecoachRepo: "" });
+
+  const parseCases = [
+    check("027-parse-ok", parsed027.ok === true, parsed027),
+    check("027-branch", parsed027.branch === "fix/root-verification-entrypoints", parsed027),
+    check("027-tool", parsed027.tool === "Cursor", parsed027),
+    check("029-parse-ok", parsed029.ok === true, parsed029),
+    check("029-branch", parsed029.branch === "feature/rls-isolation-tests", parsed029),
+    check("029-tool", parsed029.tool === "Claude Code", parsed029),
+    check("027-load-ok", loaded027.ok === true && loaded027.branch === parsed027.branch, loaded027),
+    check("029-load-ok", loaded029.ok === true && loaded029.tool === "Claude Code", loaded029),
+    check("099-missing-fallback", loadedMissing.missing === true && loadedMissing.ok === false, loadedMissing),
+    check("no-repo-missing-fallback", loadedNoRepo.missing === true && loadedNoRepo.ok === false, loadedNoRepo),
+    check(
+      "unparseable-branch-refused",
+      parseTaskContract("## Branch\n**Not a TheCoach branch.**\n\n## Tool/model\nCursor\n").ok === false &&
+        parseTaskContract("## Branch\n**Not a TheCoach branch.**\n\n## Tool/model\nCursor\n").field === "Branch",
+    ),
+    check(
+      "main-branch-refused",
+      parseTaskBranch("main — never this").ok === false && parseTaskBranch("main — never this").reason === "refused-main",
+    ),
+    check(
+      "missing-tool-refused",
+      parseTaskContract("## Branch\n`fix/example`\n").ok === false &&
+        parseTaskContract("## Branch\n`fix/example`\n").field === "Tool/model",
+    ),
+  ];
+
+  function pendingItem(id, task) {
+    return {
+      id,
+      task,
+      repoPath: "/tmp/task-contract-repo",
+      status: "pending",
+      runId: null,
+      createdAt: new Date().toISOString(),
+      dispatchedAt: null,
+      resolvedAt: null,
+      note: null,
+    };
+  }
+
+  const mq027 = memoryQueue([pendingItem("q-027", "Add root verification entrypoints TASK-027")]);
+  const started027 = [];
+  const todos027 = [];
+  const http027 = await spawnPendingQueueItem(mq027.get(), 0, {
+    ...memoryLedger(),
+    thecoachRepo: fixtureRepo,
+    save: mq027.save,
+    appendTodo: (_repo, draft) => {
+      todos027.push(draft);
+      return { appended: true, entry: draft };
+    },
+    repoExists: () => true,
+    fetchStaging: async () => "tip-027",
+    startRun: ({ task }) => {
+      started027.push(task);
+      return { id: "spawn-027", pid: 1, logPath: "/tmp/spawn-027.log" };
+    },
+    waitRun: async () => ({ id: "run-027", status: "running", run_number: 27 }),
+  });
+
+  const mq029 = memoryQueue([pendingItem("q-029", "RLS isolation test suite TASK-029")]);
+  const started029 = [];
+  const todos029 = [];
+  const http029 = await spawnPendingQueueItem(mq029.get(), 0, {
+    ...memoryLedger(),
+    thecoachRepo: fixtureRepo,
+    save: mq029.save,
+    appendTodo: (_repo, draft) => {
+      todos029.push(draft);
+      return { appended: true, entry: draft };
+    },
+    repoExists: () => true,
+    fetchStaging: async () => {
+      throw new Error("fetchStaging must not run on a Tool/model refusal");
+    },
+    startRun: ({ task }) => {
+      started029.push(task);
+      throw new Error("startRun must not run on a Tool/model refusal");
+    },
+    waitRun: async () => {
+      throw new Error("waitRun must not run on a Tool/model refusal");
+    },
+  });
+
+  const mqAdHoc = memoryQueue([pendingItem("q-adhoc", "README comment proof TASK-099")]);
+  const startedAdHoc = [];
+  const httpAdHoc = await spawnPendingQueueItem(mqAdHoc.get(), 0, {
+    ...memoryLedger(),
+    thecoachRepo: fixtureRepo,
+    save: mqAdHoc.save,
+    appendTodo: () => ({ appended: false, reason: "unused" }),
+    repoExists: () => true,
+    fetchStaging: async () => "tip-adhoc",
+    startRun: ({ task }) => {
+      startedAdHoc.push(task);
+      return { id: "spawn-adhoc", pid: 2, logPath: "/tmp/spawn-adhoc.log" };
+    },
+    waitRun: async () => ({ id: "run-adhoc", status: "running", run_number: 99 }),
+  });
+
+  const dispatchCases = [
+    check("027-dispatched", http027.body.dispatched === true, http027.body),
+    check("027-branch-literal", http027.body.branch === "fix/root-verification-entrypoints", http027.body.branch),
+    check(
+      "027-task-text-branch",
+      started027[0]?.includes("BRANCH: fix/root-verification-entrypoints"),
+      started027[0],
+    ),
+    check(
+      "027-not-hardcoded",
+      !started027[0]?.includes("BRANCH: feature/thecoach-dev-coordinator-q-027"),
+      started027[0],
+    ),
+    check("027-no-todo", todos027.length === 0, todos027),
+    check("029-not-dispatched", http029.body.dispatched === false, http029.body),
+    check("029-reason-rejected", http029.body.reason === "queue-item-rejected", http029.body.reason),
+    check("029-field-tool", http029.body.contract_field === "Tool/model", http029.body),
+    check("029-reason-unsupported", http029.body.contract_reason === "unsupported-tool", http029.body),
+    check("029-value-claude", http029.body.contract_value === "Claude Code", http029.body),
+    check("029-item-flagged", mq029.get()[0]?.status === "flagged", mq029.get()[0]),
+    check(
+      "029-note-names-field",
+      typeof mq029.get()[0]?.note === "string" &&
+        mq029.get()[0].note.includes("TASK-029") &&
+        mq029.get()[0].note.includes("Tool/model") &&
+        mq029.get()[0].note.includes("Claude Code"),
+      mq029.get()[0]?.note,
+    ),
+    check("029-startRun-never", started029.length === 0, started029),
+    check("029-todo-written", todos029.length === 1, todos029),
+    check(
+      "029-todo-blocks-task",
+      Array.isArray(todos029[0]?.blocks) && todos029[0].blocks.includes("task:TASK-029"),
+      todos029[0],
+    ),
+    check(
+      "029-todo-summary-names-field",
+      typeof todos029[0]?.summary === "string" &&
+        todos029[0].summary.includes("TASK-029") &&
+        todos029[0].summary.includes("Tool/model") &&
+        todos029[0].summary.includes("Claude Code"),
+      todos029[0]?.summary,
+    ),
+    check("adhoc-dispatched", httpAdHoc.body.dispatched === true, httpAdHoc.body),
+    check(
+      "adhoc-hardcoded-branch",
+      httpAdHoc.body.branch === "feature/thecoach-dev-coordinator-q-adhoc",
+      httpAdHoc.body.branch,
+    ),
+    check(
+      "adhoc-task-text-hardcoded",
+      startedAdHoc[0]?.includes("BRANCH: feature/thecoach-dev-coordinator-q-adhoc"),
+      startedAdHoc[0],
+    ),
+  ];
+
+  const allCases = [...parseCases, ...dispatchCases];
+  const report = {
+    ok: failures.length === 0,
+    failed: failures.length,
+    failures,
+    cases: allCases,
+    fixtures: { task027Path, task029Path, fixtureRepo },
   };
   origLog(JSON.stringify(report, null, 2));
   process.exit(failures.length === 0 ? 0 : 1);
