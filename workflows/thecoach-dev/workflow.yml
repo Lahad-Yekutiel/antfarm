@@ -364,7 +364,7 @@ steps:
       CHANGES: what you did, file by file (only if done)
       TEST_RESULT: the real output of running TEST_CMD just now (only if done)
       COMMIT_SHA: the commit you just made (only if done)
-    expects: "STATUS:"
+    expects: "STATUS: COMMIT_SHA:"
     max_retries: 2
     on_fail:
       max_retries: 2

@@ -23,7 +23,7 @@ import { listBundledWorkflows } from "../installer/workflow-fetch.js";
 import { readRecentLogs } from "../lib/logger.js";
 import { getRecentEvents, getRunEvents, type AntfarmEvent } from "../installer/events.js";
 import { startDaemon, stopDaemon, getDaemonStatus, isRunning } from "../server/daemonctl.js";
-import { claimStep, completeStep, failStep, getStories, getStepStatus, peekStep } from "../installer/step-ops.js";
+import { claimStep, completeStep, failStep, getStories, getStepStatus, peekStep, FAILURE_CAUSE_OWN_OUTPUT, FAILURE_CAUSE_TERMINALIZED } from "../installer/step-ops.js";
 import { ensureCliSymlink } from "../installer/symlink.js";
 import { runMedicCheck, getMedicStatus, getRecentMedicChecks } from "../medic/medic.js";
 import { installMedicCron, uninstallMedicCron, isMedicCronInstalled } from "../medic/medic-cron.js";
@@ -562,7 +562,8 @@ async function main() {
     const runEvents = getRunEvents(run.id, 500);
     const stepLines: string[] = [];
     for (const s of steps) {
-      stepLines.push(`  [${s.status}] ${s.step_id} (${s.agent_id})`);
+      const causeNote = s.status === "failed" && s.failure_cause ? ` — ${s.failure_cause}` : "";
+      stepLines.push(`  [${s.status}] ${s.step_id} (${s.agent_id})${causeNote}`);
       const stepEvents = runEvents
         .filter((e) => e.stepId === s.step_id && e.event.startsWith("step."))
         .sort((a, b) => a.ts.localeCompare(b.ts));
@@ -585,6 +586,13 @@ async function main() {
       "Steps:",
       ...stepLines,
     ];
+    if (run.status === "failed") {
+      const killer = steps.find((s) => s.status === "failed" && s.failure_cause === FAILURE_CAUSE_OWN_OUTPUT)
+        ?? steps.find((s) => s.status === "failed" && s.failure_cause !== FAILURE_CAUSE_TERMINALIZED);
+      if (killer) {
+        lines.push("", `Failed at: ${killer.step_id} (${killer.failure_cause ?? FAILURE_CAUSE_OWN_OUTPUT})`);
+      }
+    }
     const stories = getStories(run.id);
     if (stories.length > 0) {
       const done = stories.filter((s) => s.status === "done").length;

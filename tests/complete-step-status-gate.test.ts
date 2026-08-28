@@ -324,7 +324,7 @@ describe("completeStep status and contract gates", () => {
     assert.equal(implement.status, "waiting");
   });
 
-  it("missing template key on claim routes through retry — pending, run stays running", () => {
+  it("missing template key on claim fails immediately without consuming retries", () => {
     const agentId = `thecoach-dev_developer-${randomUUID().slice(0, 8)}`;
     const { runId, stepDbIds } = insertRun([
       {
@@ -343,17 +343,25 @@ describe("completeStep status and contract gates", () => {
     assert.equal(result.found, false);
 
     const db = getDb();
-    const step = db.prepare("SELECT status, retry_count, output FROM steps WHERE id = ?").get(stepDbIds.implement) as {
+    const step = db.prepare("SELECT status, retry_count, output, failure_cause FROM steps WHERE id = ?").get(stepDbIds.implement) as {
       status: string;
       retry_count: number;
       output: string;
+      failure_cause: string | null;
     };
-    assert.equal(step.status, "pending");
-    assert.equal(step.retry_count, 1);
+    assert.equal(step.status, "failed");
+    assert.equal(step.retry_count, 0);
+    assert.equal(step.failure_cause, "own-output");
     assert.ok(step.output.includes("missing required template key(s) build_cmd, test_cmd"));
+    assert.ok(step.output.includes("ENGINE_ERROR: missing_template_keys: build_cmd, test_cmd"));
+
+    const again = claimStep(agentId);
+    assert.equal(again.found, false);
+    const stepAfter = db.prepare("SELECT retry_count FROM steps WHERE id = ?").get(stepDbIds.implement) as { retry_count: number };
+    assert.equal(stepAfter.retry_count, 0);
 
     const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
-    assert.equal(run.status, "running");
+    assert.equal(run.status, "failed");
   });
 
   it("implement STATUS: done without GATE completes the story and leaves verify pending", () => {
@@ -390,18 +398,21 @@ describe("completeStep status and contract gates", () => {
     assert.equal(result.advanced, false);
 
     const db = getDb();
-    const verify = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(stepDbIds.verify) as {
+    const verify = db.prepare("SELECT status, output, failure_cause FROM steps WHERE id = ?").get(stepDbIds.verify) as {
       status: string;
       output: string;
+      failure_cause: string | null;
     };
     assert.equal(verify.status, "failed");
     assert.ok(verify.output.startsWith("ENGINE_ERROR: missing_required_keys: gate"));
     assert.ok(verify.output.includes("ORIGINAL_OUTPUT:"));
     assert.ok(verify.output.includes(agentOutput));
     assert.notEqual(verify.output.trim(), "Step output missing required key(s): gate");
+    assert.equal(verify.failure_cause, "own-output");
 
-    const implement = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepDbIds.implement) as { status: string };
+    const implement = db.prepare("SELECT status, failure_cause FROM steps WHERE id = ?").get(stepDbIds.implement) as { status: string; failure_cause: string | null };
     assert.equal(implement.status, "failed");
+    assert.equal(implement.failure_cause, "terminalized-by-run-failure");
 
     const pr = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepDbIds.pr) as { status: string };
     assert.equal(pr.status, "cancelled");
@@ -463,6 +474,103 @@ describe("completeStep status and contract gates", () => {
 
     const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
     assert.equal(run.status, "running");
+  });
+
+  it("implement output without COMMIT_SHA fails at implement and preserves original output", () => {
+    const { runId, stepDbIds } = insertVerifyEachFixture();
+    const db = getDb();
+    db.prepare("UPDATE steps SET expects = 'STATUS: COMMIT_SHA:', max_retries = 0 WHERE id = ?").run(stepDbIds.implement);
+    db.prepare("UPDATE stories SET max_retries = 0 WHERE run_id = ?").run(runId);
+
+    const output = "STATUS: done\nCHANGES: touched tools/schema-drift/\nTESTS: 2 pass";
+    const result = completeStep(stepDbIds.implement, output);
+
+    assert.equal(result.advanced, false);
+
+    const implement = db.prepare("SELECT status, output, failure_cause FROM steps WHERE id = ?").get(stepDbIds.implement) as {
+      status: string;
+      output: string;
+      failure_cause: string | null;
+    };
+    assert.equal(implement.status, "failed");
+    assert.equal(implement.failure_cause, "own-output");
+    assert.ok(implement.output.startsWith("ENGINE_ERROR: missing_required_keys: commit_sha"));
+    assert.ok(implement.output.includes("ORIGINAL_OUTPUT:"));
+    assert.ok(implement.output.includes(output));
+
+    const verify = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepDbIds.verify) as { status: string };
+    assert.equal(verify.status, "cancelled");
+
+    const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    assert.equal(run.status, "failed");
+  });
+
+  it("implement mid-line COMMIT_SHA is recovered and verify template renders it", () => {
+    const verifierAgent = `thecoach-dev_verifier-${randomUUID().slice(0, 8)}`;
+    const { runId, stepDbIds } = insertVerifyEachFixture();
+    const db = getDb();
+    db.prepare("UPDATE steps SET expects = 'STATUS: COMMIT_SHA:' WHERE id = ?").run(stepDbIds.implement);
+    db.prepare("UPDATE steps SET agent_id = ?, input_template = ? WHERE id = ?").run(
+      verifierAgent,
+      "COMMIT: {{commit_sha}}\nCHANGES: {{changes}}",
+      stepDbIds.verify,
+    );
+    db.prepare("UPDATE runs SET context = ? WHERE id = ?").run(
+      JSON.stringify({ repo: "/tmp/repo", branch: "feat-x" }),
+      runId,
+    );
+
+    const output = [
+      "STATUS: done",
+      "CHANGES: added parser",
+      "TESTS: both tests passed (tests 2, pass 2, fail 0): \"parseMigrations ignores create index statements and comment-only lines\". COMMIT_SHA: 9e98c16",
+    ].join("\n");
+    completeStep(stepDbIds.implement, output);
+
+    const ctxRow = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string };
+    const ctx = JSON.parse(ctxRow.context) as Record<string, string>;
+    assert.equal(ctx.commit_sha, "9e98c16");
+
+    const claimed = claimStep(verifierAgent);
+    assert.equal(claimed.found, true);
+    assert.ok(claimed.resolvedInput?.includes("COMMIT: 9e98c16"));
+  });
+
+  it("verify claim with genuinely absent commit_sha fails once immediately", () => {
+    const agentId = `thecoach-dev_verifier-${randomUUID().slice(0, 8)}`;
+    const { runId, stepDbIds } = insertRun([
+      {
+        stepId: "verify",
+        agentId,
+        stepIndex: 0,
+        expects: "GATE: STATUS:",
+        status: "pending",
+        maxRetries: 1,
+        inputTemplate: "COMMIT: {{commit_sha}}\nREPO: {{repo}}",
+      },
+    ], { repo: "/tmp/repo" });
+
+    const first = claimStep(agentId);
+    assert.equal(first.found, false);
+
+    const db = getDb();
+    const step = db.prepare("SELECT status, retry_count, output FROM steps WHERE id = ?").get(stepDbIds.verify) as {
+      status: string;
+      retry_count: number;
+      output: string;
+    };
+    assert.equal(step.status, "failed");
+    assert.equal(step.retry_count, 0);
+    assert.ok(step.output.includes("missing required template key(s) commit_sha"));
+    assert.ok(step.output.includes("ENGINE_ERROR: missing_template_keys: commit_sha"));
+
+    const second = claimStep(agentId);
+    assert.equal(second.found, false);
+    const after = db.prepare("SELECT retry_count FROM steps WHERE id = ?").get(stepDbIds.verify) as { retry_count: number };
+    assert.equal(after.retry_count, 0);
+
+    const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    assert.equal(run.status, "failed");
   });
 });
 

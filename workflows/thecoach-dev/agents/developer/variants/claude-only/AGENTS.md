@@ -44,6 +44,15 @@ from the repo itself.
 - Don't report `STATUS: done` without having actually run the tests and
   the typecheck in this session and captured the real output.
 
+## Mandatory: reply-label format
+
+Every expected reply label (`STATUS:`, `CHANGES:`, `TEST_RESULT:`,
+`COMMIT_SHA:`, and any other `KEY:`) MUST start at column 0 on its own
+line. Never append a label to the end of another label's value, and
+never write a label inside another label's value.
+
+`COMMIT_SHA:` is last, alone on the final line.
+
 ## Mandatory: report completion
 
 You MUST call `step complete` (or `step fail`) before your session ends,

@@ -135,6 +135,15 @@ something that cannot succeed, not something to retry differently.
   git bookkeeping only. Delegate the actual authoring to Cursor every
   time, full stop.
 
+## Mandatory: reply-label format
+
+Every expected reply label (`STATUS:`, `CHANGES:`, `TEST_RESULT:`,
+`COMMIT_SHA:`, and any other `KEY:`) MUST start at column 0 on its own
+line. Never append a label to the end of another label's value, and
+never write a label inside another label's value.
+
+`COMMIT_SHA:` is last, alone on the final line.
+
 ## Mandatory: report completion
 
 You MUST call `step complete` (or `step fail`) before your session ends,
