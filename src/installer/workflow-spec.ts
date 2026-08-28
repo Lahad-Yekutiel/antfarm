@@ -87,12 +87,15 @@ function validateFailWhen(failWhen: WorkflowStepFailWhen, stepId: string, workfl
   }
 }
 
-/**
- * Look up a step's fail_when from workflow.yml. Prefers the bundled (git)
- * copy so host-side completeStep sees new declarations before `workflow sync`
- * copies files into agent workspaces. Falls back to the installed copy.
- */
-export function getStepFailWhen(workflowId: string, stepId: string): WorkflowStepFailWhen | undefined {
+function validateSkipUnlessDiffMatches(patterns: string[], stepId: string, workflowDir: string): void {
+  if (!Array.isArray(patterns) || patterns.length === 0 || patterns.some((p) => typeof p !== "string" || !p.trim())) {
+    throw new Error(
+      `workflow.yml step "${stepId}" skip_unless_diff_matches must be a non-empty list of glob strings in ${workflowDir}`,
+    );
+  }
+}
+
+function readWorkflowStep(workflowId: string, stepId: string): WorkflowStep | undefined {
   const dirs = [resolveBundledWorkflowDir(workflowId), resolveWorkflowDir(workflowId)];
   for (const dir of dirs) {
     try {
@@ -100,12 +103,31 @@ export function getStepFailWhen(workflowId: string, stepId: string): WorkflowSte
       const parsed = YAML.parse(raw) as WorkflowSpec;
       const step = parsed.steps?.find((s) => s.id === stepId);
       if (!step) continue;
-      return step.fail_when;
+      return step;
     } catch {
       continue;
     }
   }
   return undefined;
+}
+
+/**
+ * Look up a step's fail_when from workflow.yml. Prefers the bundled (git)
+ * copy so host-side completeStep sees new declarations before `workflow sync`
+ * copies files into agent workspaces. Falls back to the installed copy.
+ */
+export function getStepFailWhen(workflowId: string, stepId: string): WorkflowStepFailWhen | undefined {
+  return readWorkflowStep(workflowId, stepId)?.fail_when;
+}
+
+/**
+ * Look up skip_unless_diff_matches. Same bundled-then-installed preference
+ * as fail_when. Undefined = key absent = always run the agent.
+ */
+export function getStepSkipUnlessDiffMatches(workflowId: string, stepId: string): string[] | undefined {
+  const patterns = readWorkflowStep(workflowId, stepId)?.skip_unless_diff_matches;
+  if (!Array.isArray(patterns) || patterns.length === 0) return undefined;
+  return patterns.map((p) => p.trim()).filter((p) => p.length > 0);
 }
 
 function parseLoopConfig(raw: any): LoopConfig {
@@ -139,6 +161,9 @@ function validateSteps(steps: WorkflowStep[], workflowDir: string) {
     }
     if (step.fail_when !== undefined) {
       validateFailWhen(step.fail_when, step.id, workflowDir);
+    }
+    if (step.skip_unless_diff_matches !== undefined) {
+      validateSkipUnlessDiffMatches(step.skip_unless_diff_matches, step.id, workflowDir);
     }
   }
 

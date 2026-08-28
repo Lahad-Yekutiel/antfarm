@@ -58,6 +58,7 @@ function formatEventLabel(evt: AntfarmEvent): string {
     "step.pending": "Step pending",
     "step.running": "Claimed step",
     "step.done": "Step completed",
+    "step.skipped": "Step skipped",
     "step.failed": "Step failed",
     "step.timeout": "Step timed out",
     "story.started": "Story started",

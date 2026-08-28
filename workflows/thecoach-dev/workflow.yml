@@ -493,6 +493,10 @@ steps:
 
   - id: browser-qa
     agent: browser-qa
+    skip_unless_diff_matches:
+      - apps/web/**
+      - package.json
+      - package-lock.json
     input: |
       REPO: {{repo}}
       BRANCH: {{branch}}

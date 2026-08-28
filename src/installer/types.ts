@@ -63,6 +63,11 @@ export type WorkflowStep = {
   expects: string;
   max_retries?: number;
   fail_when?: WorkflowStepFailWhen;
+  /**
+   * If set, the host skips invoking the agent when `git diff --name-only
+   * staging...HEAD` matches none of these globs. Absent/empty = always run.
+   */
+  skip_unless_diff_matches?: string[];
   on_fail?: WorkflowStepFailure;
 };
 

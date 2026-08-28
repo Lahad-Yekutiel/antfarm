@@ -10,7 +10,7 @@ import { emitEvent } from "./events.js";
 import { logger } from "../lib/logger.js";
 import { sendSessionMessage } from "./gateway-api.js";
 import { getMaxRoleTimeoutSeconds } from "./install.js";
-import { getStepFailWhen, loadWorkflowSpec } from "./workflow-spec.js";
+import { getStepFailWhen, getStepSkipUnlessDiffMatches, loadWorkflowSpec } from "./workflow-spec.js";
 import { resolveWorkflowDir } from "./paths.js";
 import { isFrontendChange } from "../lib/frontend-detect.js";
 import {
@@ -19,6 +19,10 @@ import {
   missingProtectedDiffField,
   PROTECTED_PATH_DIFF_DEFAULT_BASE,
 } from "../lib/protected-paths.js";
+import {
+  decideSkipUnlessDiffMatches,
+  listBranchDiffNames,
+} from "../lib/skip-unless-diff.js";
 import {
   formatExpectedFailuresForPrompt,
   matchesExpectedFailureBaseline,
@@ -194,6 +198,7 @@ const STEP_STATUS_CANCELLED = "cancelled";
 const STEP_STATUS_RUNNING = "running";
 const STEP_STATUS_PENDING = "pending";
 const STEP_STATUS_WAITING = "waiting";
+const STEP_STATUS_SKIPPED = "skipped";
 
 /**
  * Engine parse/contract failures are stored under this prefix so they cannot
@@ -364,6 +369,55 @@ function getWorkflowId(runId: string): string | undefined {
     const row = db.prepare("SELECT workflow_id FROM runs WHERE id = ?").get(runId) as { workflow_id: string } | undefined;
     return row?.workflow_id;
   } catch { return undefined; }
+}
+
+/**
+ * Host-side skip_unless_diff_matches. Returns true if the step was marked
+ * skipped and the pipeline advanced (agent must not be invoked). Fail-closed:
+ * missing key, missing repo/branch, or git errors leave the step pending so
+ * claim continues.
+ */
+function trySkipUnlessDiffMatches(
+  step: { id: string; step_id: string; run_id: string },
+  context: Record<string, string>,
+  agentId: string,
+): boolean {
+  const workflowId = getWorkflowId(step.run_id);
+  const patterns = workflowId ? getStepSkipUnlessDiffMatches(workflowId, step.step_id) : undefined;
+  let files: string[] | undefined;
+  let gitError: string | undefined;
+  if (patterns && patterns.length > 0) {
+    const repo = (context["repo"] ?? "").trim();
+    const head = (context["branch"] || context["commit_sha"] || "").trim();
+    if (!repo) {
+      gitError = "missing repo in run context";
+    } else if (!head) {
+      gitError = "missing branch in run context";
+    } else {
+      const listed = listBranchDiffNames(repo, head);
+      if ("error" in listed) gitError = listed.error;
+      else files = listed.files;
+    }
+  }
+  const decision = decideSkipUnlessDiffMatches({ patterns, files, gitError });
+  logger.info(decision.log, { runId: step.run_id, stepId: step.step_id });
+  if (!decision.skip || !decision.output) return false;
+
+  const db = getDb();
+  db.prepare(
+    "UPDATE steps SET status = ?, output = ?, updated_at = datetime('now') WHERE id = ? AND status = 'pending'",
+  ).run(STEP_STATUS_SKIPPED, decision.output, step.id);
+  emitEvent({
+    ts: new Date().toISOString(),
+    event: "step.skipped",
+    runId: step.run_id,
+    workflowId,
+    stepId: step.step_id,
+    agentId,
+    detail: decision.output,
+  });
+  advancePipeline(step.run_id);
+  return true;
 }
 
 /**
@@ -1112,6 +1166,10 @@ export function claimStep(agentId: string): ClaimResult {
       failStepSync(step.id, mergeGate);
       return { found: false };
     }
+  }
+
+  if (trySkipUnlessDiffMatches(step, context, agentId)) {
+    return { found: false };
   }
 
   // Single step: existing logic

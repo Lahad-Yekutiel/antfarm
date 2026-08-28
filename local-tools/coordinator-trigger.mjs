@@ -5006,7 +5006,8 @@ if (process.argv.includes("--eval-dispatch-gates")) {
     process.env.COORDINATOR_EVAL_TASKS_REPO ||
     process.env.COORDINATOR_THECOACH_REPO ||
     DEFAULT_QUEUE_REPO_PATH;
-  const ids = ["TASK-033", "TASK-037", "TASK-038", "TASK-039"];
+  const ids = ["TASK-023", "TASK-033", "TASK-037", "TASK-038", "TASK-039"];
+  const ledger = loadLedger();
   const results = ids.map((id) => {
     const contract = loadTaskContractForId(id, { thecoachRepo: repo });
     const gates = evaluateHostDispatchGates(id, contract);
@@ -5019,6 +5020,8 @@ if (process.argv.includes("--eval-dispatch-gates")) {
       missing: Boolean(contract.missing),
       dispatch: contract.missing ? null : contract.dispatch,
       tool: contract.ok ? contract.tool : null,
+      ledger_blocked: ledgerBlocksKey(ledger, id),
+      ledger_cleared: ledger[id]?.cleared === true,
       scope_matches: scope.matches ?? [],
       scope_skipped: Boolean(scope.skipped),
       ...gates,
