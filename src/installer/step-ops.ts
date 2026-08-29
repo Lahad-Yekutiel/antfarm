@@ -305,21 +305,149 @@ export function resolveFailWhen(
 }
 
 /**
- * Fail when any key in the effective fail_when map (defaults ∪ declared)
- * has a parsed value in that key's failure list.
+ * Leading verdict words that read as "not a failure" when a fail_when value
+ * carries extra words after it. Only consulted for MULTI-WORD values: a
+ * single-token verdict is still judged by the deny-list alone, so an
+ * unlisted one-word status (e.g. `retry`) behaves exactly as before.
+ */
+const PASS_VERDICT_TOKENS = new Set([
+  "pass",
+  "passed",
+  "passing",
+  "done",
+  "ok",
+  "okay",
+  "success",
+  "succeeded",
+  "approved",
+  "complete",
+  "completed",
+  "clean",
+  "green",
+  "yes",
+  "none",
+  "skip",
+  "skipped",
+  "retry",
+  "n/a",
+  "na",
+]);
+
+/** So `fail,` / `fail.` / `(fail)` all read as the verdict `fail`. */
+function stripVerdictPunctuation(token: string): string {
+  return token.replace(/^[^a-z0-9_/]+/, "").replace(/[^a-z0-9_/]+$/, "");
+}
+
+export type VerdictClassification =
+  | { verdict: "pass" }
+  | { verdict: "fail"; value: string; reason: string };
+
+/**
+ * Classify one fail_when-checked verdict value (GATE:/STATUS:).
+ *
+ * fail_when used to compare by exact whole-value equality, so a verdict that
+ * carried its reason on the same line -- `GATE: fail (reason: ...)`, the shape
+ * mid-line key recovery (cec1ac8) started producing -- never matched the
+ * deny-list, and the step advanced as if the gate had passed. Classify
+ * instead of comparing, and err toward failing: a false fail blocks a good
+ * run loudly, a false pass ships a broken one silently.
+ *
+ * Only the verdict's own line is inspected; continuation lines below it are
+ * the agent's prose, not part of the verdict.
+ */
+export function classifyVerdictValue(
+  rawValue: string,
+  failureValues: string[],
+): VerdictClassification {
+  const firstLine = rawValue.split("\n")[0].toLowerCase().trim();
+  if (!firstLine) return { verdict: "pass" };
+
+  const tokens = firstLine.split(/\s+/).filter((token) => token.length > 0);
+  const lead = stripVerdictPunctuation(tokens[0] ?? "");
+
+  if (failureValues.includes(lead)) {
+    return { verdict: "fail", value: firstLine, reason: `verdict is "${lead}"` };
+  }
+  if (tokens.length === 1) return { verdict: "pass" };
+
+  for (const failureValue of failureValues) {
+    if (new RegExp(`\\b${escapeRegExp(failureValue)}\\b`).test(firstLine)) {
+      return {
+        verdict: "fail",
+        value: firstLine,
+        reason: `reason text on the verdict line contains "${failureValue}"`,
+      };
+    }
+  }
+  if (PASS_VERDICT_TOKENS.has(lead)) return { verdict: "pass" };
+
+  return {
+    verdict: "fail",
+    value: firstLine,
+    reason: `verdict "${lead}" is neither a recognized pass nor a clean fail - refusing to advance`,
+  };
+}
+
+/**
+ * A verdict key can appear more than once in one reply: the boilerplate
+ * `STATUS: done` line-anchored at the top, and the agent's real verdict
+ * written mid-line inside prose further down (run #18). Parsing keeps the
+ * line-anchored value, and mid-line recovery skips keys already present, so
+ * the real verdict never reaches fail_when at all.
+ *
+ * Scan every occurrence of a fail_when-checked label in the raw reply and
+ * fail on any failing one. Fail-only by construction: it can add a failure,
+ * never turn one into a pass.
+ */
+export function findContradictingVerdict(
+  output: string,
+  effective: Record<string, string[]>,
+): { key: string; value: string; reason: string } | null {
+  const terminatorAlts = WELL_KNOWN_OUTPUT_KEYS.map((key) =>
+    escapeRegExp(key.toUpperCase()),
+  ).join("|");
+  for (const [key, failureValues] of Object.entries(effective)) {
+    const upper = key.toUpperCase();
+    const re = new RegExp(
+      `\\b${escapeRegExp(upper)}:\\s*([^\\n]*?)(?=\\s+(?:${terminatorAlts}):\\s*|\\s*$)`,
+      "gm",
+    );
+    for (const match of output.matchAll(re)) {
+      const value = match[1]?.trim();
+      if (!value) continue;
+      const classified = classifyVerdictValue(value, failureValues);
+      if (classified.verdict === "fail") {
+        return {
+          key,
+          value: classified.value,
+          reason: `${classified.reason} (read from "${upper}:" in the reply body)`,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Fail when any key in the effective fail_when map (defaults + declared) has
+ * a verdict that classifies as a failure. When the raw reply is passed in, a
+ * failing verdict written anywhere in the body counts too.
  */
 export function matchOutputFailure(
   parsed: Record<string, string>,
   failWhen: Record<string, string[]> | undefined,
-): { key: string; value: string } | null {
+  rawOutput?: string,
+): { key: string; value: string; reason?: string } | null {
   const effective = resolveFailWhen(failWhen);
   for (const [key, failureValues] of Object.entries(effective)) {
-    const parsedValue = parsed[key]?.toLowerCase();
+    const parsedValue = parsed[key];
     if (!parsedValue) continue;
-    if (failureValues.includes(parsedValue)) {
-      return { key, value: parsedValue };
+    const classified = classifyVerdictValue(parsedValue, failureValues);
+    if (classified.verdict === "fail") {
+      return { key, value: classified.value, reason: classified.reason };
     }
   }
+  if (rawOutput) return findContradictingVerdict(rawOutput, effective);
   return null;
 }
 
@@ -1269,12 +1397,13 @@ export function completeStep(stepId: string, output: string): { advanced: boolea
   const failWhen = runCheck?.workflow_id
     ? getStepFailWhen(runCheck.workflow_id, step.step_id)
     : undefined;
-  const failure = matchOutputFailure(parsed, failWhen);
+  const failure = matchOutputFailure(parsed, failWhen, output);
   if (failure && !testFailureMatchesExpectedBaseline(step.step_id, parsed, step.run_id)) {
     const bounceToImplement = failure.key === "status" && findVerifyEachLoopForStep(step.run_id, step.step_id);
     if (!bounceToImplement) {
       const reason = failureReason(parsed, failure.key);
-      const message = `Agent reported ${failure.key.toUpperCase()}: ${failure.value}. REASON: ${reason}`;
+      const verdictNote = failure.reason ? ` (${failure.reason})` : "";
+      const message = `Agent reported ${failure.key.toUpperCase()}: ${failure.value}${verdictNote}. REASON: ${reason}`;
       const failResult = failStepSync(stepId, message, { stdoutTail: tailOutput(output) });
       if (failResult.runFailed) {
         notifyFailureExhausted(step.run_id, step.step_id, message).catch(() => {});

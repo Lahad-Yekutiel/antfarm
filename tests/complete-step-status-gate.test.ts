@@ -315,13 +315,20 @@ describe("completeStep status and contract gates", () => {
     const failWhen = getStepFailWhen("thecoach-dev", "verify");
     assert.deepEqual(failWhen, { gate: ["fail"], status: ["fail", "blocked", "failed", "error"] });
 
-    const blockedWithPassingGate = matchOutputFailure({ status: "blocked", gate: "pass" }, failWhen);
+    // matchOutputFailure also reports WHY a verdict failed (TASK-040); the
+    // hit itself is still key + value.
+    const hit = (parsed: Record<string, string>, fw: Record<string, string[]> | undefined) => {
+      const failure = matchOutputFailure(parsed, fw);
+      return failure && { key: failure.key, value: failure.value };
+    };
+
+    const blockedWithPassingGate = hit({ status: "blocked", gate: "pass" }, failWhen);
     assert.deepEqual(blockedWithPassingGate, { key: "status", value: "blocked" });
 
-    const blockedWithoutGate = matchOutputFailure({ status: "blocked" }, failWhen);
+    const blockedWithoutGate = hit({ status: "blocked" }, failWhen);
     assert.deepEqual(blockedWithoutGate, { key: "status", value: "blocked" });
 
-    const failHit = matchOutputFailure({ status: "fail", gate: "pass" }, failWhen);
+    const failHit = hit({ status: "fail", gate: "pass" }, failWhen);
     assert.deepEqual(failHit, { key: "status", value: "fail" });
 
     const ok = matchOutputFailure({ status: "pass", gate: "pass" }, failWhen);
@@ -335,11 +342,18 @@ describe("completeStep status and contract gates", () => {
 
     for (const status of ["blocked", "failed", "error", "fail"]) {
       const hit = matchOutputFailure({ status, gate: "pass" }, gateOnly);
-      assert.deepEqual(hit, { key: "status", value: status }, `STATUS: ${status} should still fail`);
+      assert.deepEqual(
+        hit && { key: hit.key, value: hit.value },
+        { key: "status", value: status },
+        `STATUS: ${status} should still fail`,
+      );
     }
 
     const gateHit = matchOutputFailure({ status: "pass", gate: "fail" }, gateOnly);
-    assert.deepEqual(gateHit, { key: "gate", value: "fail" });
+    assert.deepEqual(gateHit && { key: gateHit.key, value: gateHit.value }, {
+      key: "gate",
+      value: "fail",
+    });
 
     const ok = matchOutputFailure({ status: "pass", gate: "pass" }, gateOnly);
     assert.equal(ok, null);
