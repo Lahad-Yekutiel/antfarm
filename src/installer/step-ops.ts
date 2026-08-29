@@ -821,14 +821,31 @@ export function computeHasFrontendChanges(repo: string, branch: string): string 
   }
 }
 
+/** Did the diff actually run? `ran: false` is NOT "no violations". */
+export type ProtectedDiffResult =
+  | { ran: true; hits: string[] }
+  | { ran: false; hits: []; error: string };
+
 /**
  * Host-side protected-path gate for verify: list files in staging...commit
  * (falls back to main...commit) and return those matching PROTECTED_PATH_PATTERNS.
  * Callers must fail closed on missing repo/commit_sha via missingProtectedDiffField
- * before calling this. Returns [] if git is unavailable — never throws.
+ * before calling this.
+ *
+ * Never throws — but it reports whether the diff RAN. Until 2026-08-29 this
+ * returned a bare [] when both base refs failed, which every caller read as
+ * "no violations": a missing `staging`/`main` ref, a shallow clone or an
+ * unavailable git silently PASSED the story-level gate, while the
+ * branch-level twin (listProtectedDiffFilesVsBase) failed closed on the same
+ * condition. The two layers are symmetric now.
  */
-export function listProtectedDiffFiles(repo: string | undefined, commitSha: string | undefined): string[] {
-  if (missingProtectedDiffField(repo, commitSha)) return [];
+export function listProtectedDiffFilesChecked(
+  repo: string | undefined,
+  commitSha: string | undefined,
+): ProtectedDiffResult {
+  const missing = missingProtectedDiffField(repo, commitSha);
+  if (missing) return { ran: false, hits: [], error: `missing ${missing}` };
+  const errors: string[] = [];
   for (const base of [PROTECTED_PATH_DIFF_DEFAULT_BASE, "main"]) {
     try {
       const output = execFileSync("git", ["diff", "--name-only", `${base}...${commitSha}`], {
@@ -837,12 +854,21 @@ export function listProtectedDiffFiles(repo: string | undefined, commitSha: stri
         timeout: 10_000,
       });
       const files = output.trim().split("\n").filter((f) => f.length > 0);
-      return findProtectedPaths(files);
-    } catch {
+      return { ran: true, hits: findProtectedPaths(files) };
+    } catch (err) {
+      errors.push(`${base}...: ${err instanceof Error ? err.message : String(err)}`);
       continue;
     }
   }
-  return [];
+  return { ran: false, hits: [], error: errors.join(" | ") || "git diff failed" };
+}
+
+/**
+ * Hits only. Cannot distinguish "diff ran, nothing matched" from "diff never
+ * ran" — gate paths must use listProtectedDiffFilesChecked instead.
+ */
+export function listProtectedDiffFiles(repo: string | undefined, commitSha: string | undefined): string[] {
+  return listProtectedDiffFilesChecked(repo, commitSha).hits;
 }
 
 /**
@@ -865,8 +891,10 @@ function protectedPathStoryDiffFailure(
 ): string | null {
   const missing = missingProtectedDiffField(runCtx.repo, runCtx.commit_sha);
   if (missing) return formatProtectedPathGateMissingContextError(missing, originalOutput);
-  const hits = listProtectedDiffFiles(runCtx.repo, runCtx.commit_sha);
-  if (hits.length > 0) return formatProtectedPathHitsMessage(hits);
+  const diff = listProtectedDiffFilesChecked(runCtx.repo, runCtx.commit_sha);
+  // Fail CLOSED when the diff never ran — matches protectedPathBranchDiffFailure.
+  if (!diff.ran) return formatProtectedPathGateGitFailedError(diff.error, originalOutput);
+  if (diff.hits.length > 0) return formatProtectedPathHitsMessage(diff.hits);
   return null;
 }
 

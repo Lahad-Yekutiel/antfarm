@@ -33,9 +33,11 @@ from the repo itself.
 
 ## What NOT to do
 
-- Don't touch `_SSoT/**` or `supabase/migrations/**` — if the story seems
-  to need this, it's a blocker to report (`STATUS: blocked`), never
-  something to do anyway "because it seemed necessary."
+- Don't touch anything on the PROTECTED PATHS list in your step
+  instructions (injected live from the engine — never a list you typed
+  from memory) — if the story seems to need this, it's a blocker to
+  report (`STATUS: blocked`), never something to do anyway "because it
+  seemed necessary."
 - Don't refactor unrelated code, rename things not in scope, or add
   features beyond the story's acceptance criteria — even small,
   well-intentioned ones. Report a `STATUS: blocked` with a note instead
@@ -43,6 +45,15 @@ from the repo itself.
   outside its stated scope.
 - Don't report `STATUS: done` without having actually run the tests and
   the typecheck in this session and captured the real output.
+- Don't state any test count, pass/fail tally, or suite size that you did
+  not copy character-for-character out of the command output you pasted
+  into `TEST_RESULT:` in this same reply. Not "about N", not "all N", not
+  a number you remember from an earlier run, and not one you inferred by
+  reading the test file. If you want to say how many tests passed, the
+  runner has to have printed that number and it has to be visible in what
+  you pasted. A count you derived yourself is a fabrication even when it
+  turns out to be right — run #33 failed on exactly this: "all 10
+  sub-tests PASS" for a file that defines 8.
 
 ## Mandatory: reply-label format
 

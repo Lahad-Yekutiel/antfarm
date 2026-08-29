@@ -349,6 +349,12 @@ steps:
       VERIFY FEEDBACK (from the last per-story verify failure; empty if none):
       {{verify_feedback}}
 
+      PROTECTED PATHS (host-enforced, injected from the engine's live
+      PROTECTED_PATH_PATTERNS — this is the authoritative list, and it is
+      the same one the verify gate enforces. Never substitute a list you
+      remember, and never let Cursor touch anything matching it):
+      {{protected_paths}}
+
       Read _SSoT/DEV.md's Standards section (RTL/Hebrew, TypeScript strict,
       RLS on every trainer/trainee-scoped table, no magic values, shared
       logic in the shared package) before writing any code. Implement
@@ -365,7 +371,14 @@ steps:
       STATUS: done | blocked
       REASON: (only if blocked)
       CHANGES: what you did, file by file (only if done)
-      TEST_RESULT: the real output of running TEST_CMD just now (only if done)
+      TEST_RESULT: (only if done) the last 15 lines of TEST_CMD's own stdout,
+        copy-pasted verbatim from the run you just did in this session —
+        including the command line you ran and whatever summary/count line
+        the runner printed. Do not retype, round, total, or summarise
+        anything yourself. If the runner printed no count line, write
+        `<no count line printed>` and paste the verbatim tail anyway. Any
+        number in this field that does not appear character-for-character
+        in that pasted output is a contract violation, not an approximation.
       COMMIT_SHA: the commit you just made (only if done)
     expects: "STATUS: COMMIT_SHA:"
     max_retries: 2

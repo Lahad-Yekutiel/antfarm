@@ -29,7 +29,7 @@ import http from "node:http";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn, execFile } from "node:child_process";
+import { spawn, execFile, execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { PROTECTED_PATH_PATTERNS } from "../dist/lib/protected-paths.js";
@@ -81,6 +81,27 @@ const LEDGER_PATH =
  *   TTL 300s → 135s headroom (was 40s at the 120s fetch cap).
  */
 const SCAN_LOCK_TTL_MS = 5 * 60 * 1000;
+
+// ─── Item 8: automatic diagnose-and-retry of a failed run ───────────────────
+/** Automatic retries per queue item. Cap 2 → at most 3 runs (1 original + 2). */
+const AUTO_RETRY_CAP = 2;
+/**
+ * A `diagnosis-pending` ledger entry older than this is treated as a failed
+ * diagnosis and parked. Without it, a coordinator killed mid-diagnosis would
+ * leave the key in a non-blocking state forever. Same shape as SCAN_LOCK_TTL_MS.
+ */
+const DIAGNOSIS_TTL_MS = 10 * 60 * 1000;
+const DIAGNOSIS_AGENT_ID = "thecoach-dev_verifier";
+const DIAGNOSIS_MODEL = "anthropic/claude-sonnet-5";
+const LEDGER_OUTCOME_FAILED = "failed";
+const LEDGER_OUTCOME_DIAGNOSIS_PENDING = "diagnosis-pending";
+const LEDGER_OUTCOME_RETRY_PENDING = "retry-pending";
+const AUTO_RETRY_SOURCE = "coordinator:auto-retry";
+const AUTO_RETRY_FEEDBACK_HEADER = "PRIOR ATTEMPT FEEDBACK (attempt ";
+const FAILURE_CLASSES = new Set(["transient", "fixable", "structural"]);
+/** Sorted-key join the diagnosis reply must match exactly (parseAgentDecision style). */
+const DIAGNOSIS_REPLY_KEYS = "class,evidence,reason,retry_guidance";
+const AUTO_RETRY_HISTORY_LIMIT = 20;
 /** phase:<id> / oq:OQ-<n> / task:TASK-<n> / * — compared after canonicalizeScopeToken(). */
 const SCOPE_TOKEN_RE = /^(?:\*|phase:[a-z0-9]+|oq:oq-\d+|task:task-\d+)$/;
 const TASK_ID_RE = /TASK-(\d+)/i;
@@ -752,6 +773,74 @@ async function refuseProtectedPathScope(queue, item, deps, taskId, matches) {
 }
 
 /**
+ * Item 7: the target branch's diff vs staging is empty AND a previous attempt
+ * on this task was empty too. Nothing is changing between runs, so a third
+ * run reproduces the second. Same refusal shape as refuseProtectedPathScope —
+ * ledger failure entry, task-scoped TODO, item flagged, queue advances — and
+ * it spends no retry attempt.
+ */
+async function parkRepeatedEmptyDiff(queue, item, deps, taskId, branch, autoRetry) {
+  const save = deps.save || saveQueue;
+  const note = `${taskId} branch ${branch} has an empty diff vs ${EXPECTED_PR_BASE}, and a previous attempt did too. Parked without spending a run.`;
+  item.status = "flagged";
+  item.resolvedAt = new Date().toISOString();
+  item.note = note;
+  save(queue);
+  const next = {
+    ...autoRetry,
+    parked: true,
+    parkedReason: "structural",
+    lastDiagnosis: {
+      class: "structural",
+      reason: "repeated empty diff — the branch changes no files and a previous attempt did not either",
+      evidence: note,
+      retry_guidance: "",
+      at: new Date(nowMs(deps)).toISOString(),
+    },
+  };
+  recordLedgerAttempt(
+    taskId,
+    {
+      lastDispatchedAt: new Date().toISOString(),
+      queueItemId: item.id,
+      outcome: LEDGER_OUTCOME_FAILED,
+      reason: "repeated-empty-diff",
+      roadmap_ref: item.roadmap_ref ?? null,
+      autoRetry: next,
+    },
+    deps,
+  );
+  writeParkTodo(
+    {
+      ledgerKey: taskId,
+      item,
+      autoRetry: next,
+      diagnosis: next.lastDiagnosis,
+      attempt: null,
+      parkedReason: "structural",
+    },
+    deps,
+  );
+  const nextIdx = queue.findIndex((it) => it.status === "pending");
+  if (nextIdx >= 0) {
+    return spawnPendingQueueItem(queue, nextIdx, deps);
+  }
+  return {
+    status: 200,
+    body: withIdleTelemetry(
+      {
+        ok: true,
+        dispatched: false,
+        reason: "repeated-empty-diff",
+        task: taskId,
+        branch,
+      },
+      deps,
+    ),
+  };
+}
+
+/**
  * Host-side gates only: Dispatch -> Tool/model -> Branch (via contract parse) -> A2.
  * No agent, no startRun. Used by spawnPendingQueueItem and --eval-dispatch-gates.
  */
@@ -1118,6 +1207,584 @@ function recordLedgerAttempt(key, fields, deps = {}) {
   saveLedger(ledger, deps);
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Item 8 — auto-diagnose-and-retry. A failed RUN no longer parks straight to
+// outcome:"failed" (which required a human to hand-edit the ledger before any
+// retry). It is classified first — deterministically where possible, by an
+// automated agent turn where not — and then either retried with feedback
+// (capped) or parked through the same scoped-blocker route as before.
+//
+// Invariant every path must preserve: whatever breaks, the key ends terminal
+// (`failed` + a task-scoped TODO) and the queue advances. Degrading to the
+// pre-2026-08-29 behaviour is always the safe fallback.
+// ───────────────────────────────────────────────────────────────────────────
+
+/** sha256 of an empty diff — the digest a no-op branch produces. */
+const EMPTY_DIFF_DIGEST = crypto.createHash("sha256").update("").digest("hex");
+
+const PROTECTED_PATH_GATE_SIGNATURES = [
+  "protected-path gate:",
+  "protected_path_gate_missing_context",
+  "protected_path_gate_git_failed",
+];
+
+/** Host dispatch-gate refusals: these never reach a run, so no run can fix them. */
+const HOST_GATE_REFUSAL_REASONS = new Set([
+  "unsupported-tool",
+  "ambiguous-task-file",
+  "protected-path-scope",
+  "not-dispatchable-manual",
+  "task-file-unreadable",
+  "refused",
+]);
+
+/** Engine/infra signatures — safe to retry unchanged, no feedback needed. */
+const TRANSIENT_SIGNATURES = [
+  "spawn-timeout-504",
+  "antfarm run id not observed",
+  "out of memory",
+  "oom-kill",
+  "oom killed",
+  "killed by signal",
+  "econnreset",
+  "etimedout",
+  "socket hang up",
+  "error 530",
+  "error 502",
+  "error 503",
+  "openclaw agent failed",
+  "antfarm.db not found",
+  "no space left on device",
+];
+
+function defaultAutoRetry() {
+  return {
+    attempts: 0,
+    cap: AUTO_RETRY_CAP,
+    parked: false,
+    parkedReason: null,
+    lastDiagnosis: null,
+    history: [],
+  };
+}
+
+/** Tolerant read of a ledger entry's autoRetry block; never throws. */
+function normaliseAutoRetry(entry) {
+  const raw = entry && typeof entry.autoRetry === "object" && entry.autoRetry ? entry.autoRetry : null;
+  if (!raw) return defaultAutoRetry();
+  return {
+    attempts: Number.isFinite(raw.attempts) ? Math.max(0, Math.trunc(raw.attempts)) : 0,
+    cap: Number.isFinite(raw.cap) ? Math.max(0, Math.trunc(raw.cap)) : AUTO_RETRY_CAP,
+    parked: raw.parked === true,
+    parkedReason: raw.parkedReason ?? null,
+    lastDiagnosis: raw.lastDiagnosis ?? null,
+    history: Array.isArray(raw.history) ? raw.history.slice(-AUTO_RETRY_HISTORY_LIMIT) : [],
+  };
+}
+
+/** Comparable form of a failure reason — shas and whitespace normalised out. */
+function normaliseFailureReason(text) {
+  return String(text || "")
+    .toLowerCase()
+    .replace(/\b[0-9a-f]{7,40}\b/g, "<sha>")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 400);
+}
+
+/**
+ * Content digest of `git diff staging...<branch>`. `ran:false` is NOT "empty" —
+ * a branch that does not exist yet, or a git failure, must never be mistaken
+ * for a no-op branch (Item 7 would otherwise park a first dispatch).
+ */
+function branchDiffDigest(repoPath, branch, deps = {}) {
+  if (deps.branchDiff) return deps.branchDiff(repoPath, branch);
+  if (!repoPath || !branch) {
+    return { ran: false, digest: null, files: [], error: "missing repoPath or branch" };
+  }
+  try {
+    const opts = { cwd: repoPath, encoding: "utf-8", timeout: 15_000, maxBuffer: 32 * 1024 * 1024 };
+    const names = execFileSync("git", ["diff", "--name-only", `${EXPECTED_PR_BASE}...${branch}`], opts);
+    const content = execFileSync("git", ["diff", `${EXPECTED_PR_BASE}...${branch}`], opts);
+    return {
+      ran: true,
+      digest: crypto.createHash("sha256").update(content).digest("hex"),
+      files: names.trim() ? names.trim().split("\n") : [],
+    };
+  } catch (err) {
+    return { ran: false, digest: null, files: [], error: err?.message || String(err) };
+  }
+}
+
+/** One-line reason + evidence for this attempt, from the run's own steps. */
+function summariseRunFailure({ stepsResult, runStatus, queueStatus, note }) {
+  const steps = Array.isArray(stepsResult?.steps) ? stepsResult.steps : [];
+  const failed = steps.filter((st) => st.status === "failed");
+  const target = failed[0] || null;
+  const output = String(target?.output || "");
+  const firstLine = output.split("\n").map((l) => l.trim()).find((l) => l.length > 0) || "";
+  const reason = target
+    ? `step ${target.stepId} failed: ${firstLine || "(no output)"}`
+    : `run ended runStatus=${runStatus} queueStatus=${queueStatus}${note ? ` — ${note}` : ""}`;
+  return {
+    reason: reason.slice(0, 500),
+    evidence: target ? `${target.stepId}: ${output.slice(0, 600)}` : String(note || "").slice(0, 600),
+    failedStepIds: failed.map((st) => st.stepId),
+    outputs: steps.map((st) => ({
+      stepId: st.stepId,
+      status: st.status,
+      retryCount: st.retryCount,
+      maxRetries: st.maxRetries,
+      output: String(st.output || "").slice(-2000),
+    })),
+  };
+}
+
+function unknownDiagnosis(detail) {
+  return {
+    class: "unknown",
+    reason: `diagnosis step unavailable: ${String(detail || "").slice(0, 300)}`,
+    evidence: "",
+    retry_guidance: "",
+  };
+}
+
+/**
+ * Deterministic pre-classification. Runs BEFORE any agent turn is spent, and
+ * owns every case where model judgment would be a liability:
+ *   1. a host dispatch-gate refusal — no run can fix it
+ *   2. the protected-path gate signature — retrying repeats it identically
+ *   3. a reason or diff digest already in history — same wall, second time
+ *   4. an empty diff when a prior attempt was also empty (Item 7)
+ *   5. a known engine/infra signature → transient, retry as-is
+ * Returns null when the failure is genuinely ambiguous — only then is an
+ * agent turn spent.
+ */
+function preClassifyRunFailure({ entry, autoRetry, attempt, diff }) {
+  const ledgerReason = String(entry?.reason || "");
+  if (ledgerReason && HOST_GATE_REFUSAL_REASONS.has(ledgerReason)) {
+    return {
+      class: "structural",
+      reason: `host dispatch gate refused this task (${ledgerReason}); no run can change that`,
+      evidence: `ledger reason=${ledgerReason}`,
+      retry_guidance: "",
+    };
+  }
+
+  const haystack = [attempt.reason, ...attempt.outputs.map((o) => o.output)].join("\n").toLowerCase();
+  const gateHit = PROTECTED_PATH_GATE_SIGNATURES.find((sig) => haystack.includes(sig));
+  if (gateHit) {
+    return {
+      class: "structural",
+      reason: "the protected-path gate blocked this run; the task's own deliverable is on the host-enforced list",
+      evidence: `protected-path gate signature "${gateHit}" in step output`,
+      retry_guidance: "",
+    };
+  }
+
+  const thisReason = normaliseFailureReason(attempt.reason);
+  const repeatedReason = autoRetry.history.find((h) => h.reason && h.reason === thisReason);
+  if (repeatedReason) {
+    return {
+      class: "structural",
+      reason: `identical failure to a previous attempt (${thisReason.slice(0, 160)}); retrying reproduces it`,
+      evidence: `prior attempt at ${repeatedReason.at} had the same normalised reason`,
+      retry_guidance: "",
+    };
+  }
+
+  if (diff.ran && diff.digest) {
+    const repeatedDiff = autoRetry.history.find((h) => h.diffHash && h.diffHash === diff.digest);
+    if (repeatedDiff) {
+      const empty = diff.digest === EMPTY_DIFF_DIGEST;
+      return {
+        class: "structural",
+        reason: empty
+          ? "this attempt produced an empty diff and a previous attempt did too — nothing is changing between runs"
+          : "this attempt produced a byte-identical diff to a previous attempt — nothing is changing between runs",
+        evidence: `diff digest ${diff.digest.slice(0, 12)} also recorded at ${repeatedDiff.at}`,
+        retry_guidance: "",
+      };
+    }
+  }
+
+  if (TRANSIENT_SIGNATURES.some((sig) => haystack.includes(sig))) {
+    return {
+      class: "transient",
+      reason: `environmental failure (${attempt.reason.slice(0, 200)})`,
+      evidence: attempt.evidence,
+      retry_guidance: "",
+    };
+  }
+
+  return null;
+}
+
+/** Strict parse of the diagnosis reply — same all-keys-must-match strictness as parseAgentDecision. */
+function parseDiagnosisReply(text) {
+  let parsed;
+  try {
+    parsed = JSON.parse(String(text).trim());
+  } catch (err) {
+    return { ok: false, error: `diagnosis reply is not JSON: ${err.message}` };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: false, error: "diagnosis reply is not a JSON object" };
+  }
+  const keyStr = Object.keys(parsed).sort().join(",");
+  if (keyStr !== DIAGNOSIS_REPLY_KEYS) {
+    return { ok: false, error: `diagnosis object has unexpected keys: ${keyStr}` };
+  }
+  if (!FAILURE_CLASSES.has(parsed.class)) {
+    return { ok: false, error: `diagnosis class is not allowed: ${JSON.stringify(parsed.class)}` };
+  }
+  if (!isNonEmptyString(parsed.reason) || !isNonEmptyString(parsed.evidence)) {
+    return { ok: false, error: "diagnosis is missing a required non-empty string field" };
+  }
+  if (typeof parsed.retry_guidance !== "string") {
+    return { ok: false, error: "diagnosis retry_guidance must be a string" };
+  }
+  if (parsed.class !== "structural" && !parsed.retry_guidance.trim()) {
+    return { ok: false, error: "diagnosis retry_guidance is required unless class is structural" };
+  }
+  return { ok: true, diagnosis: parsed };
+}
+
+function buildFailureDiagnosisPrompt({ ledgerKey, item, attempt, diff, branch, autoRetry, taskMarkdown }) {
+  const steps = attempt.outputs
+    .map((o) => `--- step ${o.stepId} (status=${o.status}, retries=${o.retryCount}/${o.maxRetries}) ---\n${o.output || "(no output)"}`)
+    .join("\n\n");
+  const history = autoRetry.history.length
+    ? autoRetry.history
+        .map((h, i) => `${i + 1}. ${h.at} class=${h.class} diffHash=${h.diffHash ? h.diffHash.slice(0, 12) : "(not computed)"} reason=${h.reason}`)
+        .join("\n")
+    : "(none — this is the first failure for this task)";
+  return `You are diagnosing why one automated workflow run failed, so the coordinator can decide whether retrying it is worth a run.
+
+Reply with ONLY one JSON object, nothing else — no prose before or after, no markdown fences.
+
+{"class":"transient|fixable|structural","reason":"<one line: what actually failed>","evidence":"<step id + the verbatim line that proves it>","retry_guidance":"<what the next run must do differently; empty string ONLY when class is structural>"}
+
+Class definitions — pick exactly one:
+- "transient": an environmental/infrastructure failure (VM freeze, OOM, tunnel drop, timeout, engine error). Retrying the same work unchanged is likely to succeed. retry_guidance must still be a short non-empty note.
+- "fixable": a real implementation problem with an actionable cause (wrong approach, missing test, bad branch state, a step's own reported reason). Retrying WITH specific guidance is likely to succeed. retry_guidance must say concretely what to do differently.
+- "structural": no retry can fix this — a policy wall, a contradiction in the task itself, or work that is already done. retry_guidance must be the empty string.
+
+Choose "structural" rather than burning a retry whenever the same attempt would hit the same wall: the deliverable is on a protected path, the task contradicts a host gate, prior attempts already failed identically, or the branch diff shows nothing is changing between runs.
+
+TASK: ${ledgerKey}
+BRANCH: ${branch || "(unknown)"}
+QUEUE ITEM NOTE: ${item?.note || "(none)"}
+BRANCH DIFF vs ${EXPECTED_PR_BASE}: ${diff.ran ? (diff.files.length ? diff.files.join(", ") : "EMPTY — the branch changes no files") : `could not be computed (${diff.error || "unknown"})`}
+
+PRIOR AUTOMATIC ATTEMPTS FOR THIS TASK:
+${history}
+
+TASK FILE:
+${(taskMarkdown || "(task file unavailable)").slice(0, 8000)}
+
+RUN STEPS (full step outputs, most recent run):
+${steps.slice(0, 40000)}
+`;
+}
+
+/**
+ * Terminal handling for one classified failure. Either enqueues a capped
+ * auto-retry or parks the task for the developer through the existing
+ * scoped-blocker route. `ctx.queue`, when an array, is the live queue the
+ * caller will save; otherwise the queue is loaded and saved here.
+ */
+function finishFailureHandling(ctx, deps = {}) {
+  const { ledgerKey, item, queue, base, autoRetry, attempt, diff, branch, diagnosis } = ctx;
+  const at = new Date(nowMs(deps)).toISOString();
+  const next = {
+    ...autoRetry,
+    lastDiagnosis: { ...diagnosis, at },
+    history: [
+      ...autoRetry.history,
+      {
+        at,
+        runId: item?.runId ?? null,
+        branch: branch ?? null,
+        class: diagnosis.class,
+        reason: normaliseFailureReason(diagnosis.reason || attempt?.reason),
+        diffHash: diff && diff.ran ? diff.digest : null,
+      },
+    ].slice(-AUTO_RETRY_HISTORY_LIMIT),
+  };
+
+  const structural = diagnosis.class === "structural";
+  const unknown = diagnosis.class === "unknown";
+  const capReached = next.attempts >= next.cap;
+
+  if (structural || unknown || capReached) {
+    const parkedReason = structural ? "structural" : unknown ? "diagnosis-unavailable" : "cap-reached";
+    next.parked = true;
+    next.parkedReason = parkedReason;
+    recordLedgerAttempt(
+      ledgerKey,
+      { ...base, outcome: LEDGER_OUTCOME_FAILED, autoRetry: next, diagnosisStartedAt: null },
+      deps,
+    );
+    writeParkTodo({ ledgerKey, item, autoRetry: next, diagnosis, attempt, parkedReason }, deps);
+    logDispatchNext(
+      `auto-retry parked key=${ledgerKey} class=${diagnosis.class} parked=${parkedReason} attempts=${next.attempts}/${next.cap}`,
+    );
+    return { outcome: LEDGER_OUTCOME_FAILED, parkedReason, autoRetry: next };
+  }
+
+  // Attempts increment when the retry is ENQUEUED, not when it finishes — a
+  // crash between here and dispatch cannot produce an extra attempt.
+  next.attempts += 1;
+  next.parked = false;
+  next.parkedReason = null;
+  recordLedgerAttempt(
+    ledgerKey,
+    { ...base, outcome: LEDGER_OUTCOME_RETRY_PENDING, autoRetry: next, diagnosisStartedAt: null },
+    deps,
+  );
+  const retryItem = buildAutoRetryQueueItem({
+    item,
+    diagnosis,
+    attemptNumber: next.attempts,
+    cap: next.cap,
+  });
+  pushQueueItem(retryItem, queue, deps);
+  logDispatchNext(
+    `auto-retry queued key=${ledgerKey} class=${diagnosis.class} attempt=${next.attempts}/${next.cap} item=${retryItem.id}`,
+  );
+  return { outcome: LEDGER_OUTCOME_RETRY_PENDING, queueItemId: retryItem.id, autoRetry: next, retryItem };
+}
+
+function pushQueueItem(newItem, queue, deps = {}) {
+  if (Array.isArray(queue)) {
+    queue.push(newItem);
+    return;
+  }
+  const load = deps.load || loadQueue;
+  const save = deps.save || saveQueue;
+  const current = load();
+  current.push(newItem);
+  save(current);
+}
+
+/** Drop any feedback block a previous auto-retry appended, so they don't stack. */
+function stripPriorFeedback(taskText) {
+  const idx = String(taskText || "").indexOf(AUTO_RETRY_FEEDBACK_HEADER);
+  if (idx < 0) return String(taskText || "");
+  return String(taskText).slice(0, idx).replace(/\s+$/, "");
+}
+
+/**
+ * The run-granularity analogue of {{verify_feedback}}: the diagnosis rides in
+ * the queue item's own task text, which `plan` reads in full. No workflow
+ * change and no conditional step branching — advancePipeline() is strictly
+ * linear by step_index and cannot express one.
+ */
+function buildAutoRetryQueueItem({ item, diagnosis, attemptNumber, cap }) {
+  const baseTask = stripPriorFeedback(item?.task);
+  const feedback =
+    diagnosis.class === "transient"
+      ? ""
+      : [
+          "",
+          "",
+          `${AUTO_RETRY_FEEDBACK_HEADER}${attemptNumber + 1} of ${cap + 1} — automatic diagnosis, not a human):`,
+          `CLASS: ${diagnosis.class}`,
+          `WHAT FAILED: ${diagnosis.reason}`,
+          `EVIDENCE: ${diagnosis.evidence}`,
+          `DO DIFFERENTLY: ${diagnosis.retry_guidance}`,
+        ].join("\n");
+  return buildQueueItem({
+    task: `${baseTask}${feedback}`,
+    repoPath: item?.repoPath,
+    source: AUTO_RETRY_SOURCE,
+    roadmap_ref: item?.roadmap_ref ?? null,
+  });
+}
+
+/**
+ * Park for the developer — same scoped-blocker route refuseProtectedPathScope
+ * already uses, so the rest of the queue is provably unaffected. The summary
+ * carries the attempt count and class so a second park for the same task is
+ * not swallowed by appendDeveloperTodoEntry's open-summary dedup.
+ */
+function writeParkTodo({ ledgerKey, item, autoRetry, diagnosis, attempt, parkedReason }, deps = {}) {
+  try {
+    const appendTodo = deps.appendTodo || ((repo, draft) => appendDeveloperTodoEntry(repo, draft, deps));
+    const repo = deps.thecoachRepo !== undefined ? deps.thecoachRepo : THECOACH_REPO;
+    if (!repo && !deps.appendTodo) return { appended: false, reason: "no-thecoach-repo" };
+    const runs = autoRetry.attempts + 1;
+    const priors = autoRetry.history
+      .map((h) => `${h.class}: ${String(h.reason || "").slice(0, 120)}`)
+      .join(" | ");
+    const why =
+      parkedReason === "structural"
+        ? `Auto-diagnosis classified this as structural: ${diagnosis.reason} No retry can change that, so no retry attempts were spent.`
+        : parkedReason === "cap-reached"
+          ? `Auto-diagnosis classified the last attempt as ${diagnosis.class}: ${diagnosis.reason} ${autoRetry.attempts} automatic retries did not change the outcome.`
+          : `The automatic diagnosis step could not produce a usable classification (${diagnosis.reason}). The coordinator parked rather than retrying blind.`;
+    const written = appendTodo(repo, {
+      summary: `Dispatch of ${ledgerKey} failed ${runs}x (1 original + ${autoRetry.attempts} auto-${autoRetry.attempts === 1 ? "retry" : "retries"}); parked — class: ${diagnosis.class} (${parkedReason})`,
+      why,
+      source: ledgerKey,
+      type: "blocked",
+      evidence: `run ${item?.runId || "(none)"}; ${diagnosis.evidence || attempt?.evidence || item?.note || "(no evidence captured)"}${priors ? `; prior attempts: ${priors}` : ""}`.slice(0, 1200),
+      reply_needed: `Re-scope ${ledgerKey}, or clear coordinator-dispatch-ledger.json[${ledgerKey}] (including autoRetry.attempts) to allow a fresh automatic cycle.`,
+      blocks: [`task:${ledgerKey}`],
+    });
+    if (!written.appended) {
+      logDispatchNext(`todo writer skipped duplicate summary for parked ${ledgerKey}`);
+    }
+    return written;
+  } catch (err) {
+    logDispatchNextError(`todo writer failed for parked ${ledgerKey}: ${err?.message || String(err)}`);
+    return { appended: false, reason: "error" };
+  }
+}
+
+/**
+ * Any `diagnosis-pending` key older than DIAGNOSIS_TTL_MS is treated as a
+ * failed diagnosis and parked. This is what stops a killed coordinator from
+ * leaving a key wedged in a non-blocking state.
+ */
+function sweepStaleDiagnoses(deps = {}) {
+  const ledger = loadLedger(deps);
+  const now = nowMs(deps);
+  const swept = [];
+  for (const [key, entry] of Object.entries(ledger)) {
+    if (!entry || entry.outcome !== LEDGER_OUTCOME_DIAGNOSIS_PENDING) continue;
+    const started = Date.parse(entry.diagnosisStartedAt || "");
+    if (Number.isFinite(started) && now - started < DIAGNOSIS_TTL_MS) continue;
+    const autoRetry = normaliseAutoRetry(entry);
+    autoRetry.parked = true;
+    autoRetry.parkedReason = "diagnosis-unavailable";
+    const diagnosis = unknownDiagnosis(
+      `diagnosis did not finish within ${Math.round(DIAGNOSIS_TTL_MS / 60000)} minutes`,
+    );
+    recordLedgerAttempt(
+      key,
+      {
+        outcome: LEDGER_OUTCOME_FAILED,
+        autoRetry,
+        diagnosisStartedAt: null,
+        cleared: entry.cleared === true,
+      },
+      deps,
+    );
+    writeParkTodo(
+      {
+        ledgerKey: key,
+        item: { runId: entry.runId ?? null, note: null },
+        autoRetry,
+        diagnosis,
+        attempt: null,
+        parkedReason: "diagnosis-unavailable",
+      },
+      deps,
+    );
+    swept.push(key);
+    logDispatchNext(`diagnosis-stale-swept key=${key} startedAt=${entry.diagnosisStartedAt ?? "(missing)"}`);
+  }
+  return swept;
+}
+
+/** Background diagnosis. Every failure path here degrades to the park route. */
+async function runFailureDiagnosis(ctx, deps = {}) {
+  const { ledgerKey } = ctx;
+  let diagnosis;
+  try {
+    const runAgent = deps.runDiagnosisAgent || runDiagnosisAgentTurn;
+    const stdout = await runAgent(buildFailureDiagnosisPrompt(ctx));
+    const parsed = parseDiagnosisReply(extractAgentReplyText(stdout));
+    if (parsed.ok) {
+      diagnosis = parsed.diagnosis;
+    } else {
+      logDispatchNextError(`diagnosis-failed key=${ledgerKey} reason=${parsed.error}`);
+      diagnosis = unknownDiagnosis(parsed.error);
+    }
+  } catch (err) {
+    logDispatchNextError(`diagnosis-failed key=${ledgerKey} reason=${err?.message || String(err)}`);
+    diagnosis = unknownDiagnosis(err?.message || String(err));
+  }
+  try {
+    return finishFailureHandling({ ...ctx, queue: null, diagnosis }, deps);
+  } catch (err) {
+    logDispatchNextError(`diagnosis finish failed key=${ledgerKey}: ${err?.message || String(err)}`);
+    try {
+      const autoRetry = normaliseAutoRetry(loadLedger(deps)[ledgerKey]);
+      autoRetry.parked = true;
+      autoRetry.parkedReason = "diagnosis-unavailable";
+      recordLedgerAttempt(
+        ledgerKey,
+        { ...(ctx.base || {}), outcome: LEDGER_OUTCOME_FAILED, autoRetry, diagnosisStartedAt: null },
+        deps,
+      );
+    } catch {
+      // ledger unavailable — the TTL sweep is the remaining backstop
+    }
+    return { outcome: LEDGER_OUTCOME_FAILED, parkedReason: "diagnosis-unavailable" };
+  }
+}
+
+/**
+ * Entry point from /queue/check when a run ends failed. Deterministic classes
+ * resolve inline; anything ambiguous records a non-blocking
+ * `diagnosis-pending` and hands off to a background agent turn — /queue/check
+ * loops over every dispatched item and a 105s agent call per failure would
+ * blow the ~125s Cloudflare cutoff.
+ */
+function handleFailedRunOutcome(ctx, deps = {}) {
+  const { ledgerKey, item, queue, runStatus, queueStatus, stepsResult } = ctx;
+  const ledger = loadLedger(deps);
+  const entry = ledger[ledgerKey] || {};
+  const autoRetry = normaliseAutoRetry(entry);
+  const branch = item?.branch || null;
+  const diff = branchDiffDigest(item?.repoPath, branch, deps);
+  const attempt = summariseRunFailure({ stepsResult, runStatus, queueStatus, note: item?.note });
+  const base = {
+    runStatus,
+    queueStatus,
+    runId: item?.runId ?? null,
+    queueItemId: item?.id ?? null,
+    outcomeAt: item?.resolvedAt || new Date(nowMs(deps)).toISOString(),
+    roadmap_ref: item?.roadmap_ref ?? null,
+  };
+
+  const pre = preClassifyRunFailure({ entry, autoRetry, attempt, diff });
+  if (pre) {
+    logDispatchNext(`auto-retry pre-classified key=${ledgerKey} class=${pre.class} (no agent turn)`);
+    return finishFailureHandling(
+      { ledgerKey, item, queue, base, autoRetry, attempt, diff, branch, diagnosis: pre },
+      deps,
+    );
+  }
+
+  recordLedgerAttempt(
+    ledgerKey,
+    {
+      ...base,
+      outcome: LEDGER_OUTCOME_DIAGNOSIS_PENDING,
+      diagnosisStartedAt: new Date(nowMs(deps)).toISOString(),
+      autoRetry,
+    },
+    deps,
+  );
+  const loadContract = deps.loadTaskContract || ((id) => loadTaskContractForId(id, deps));
+  let taskMarkdown = null;
+  try {
+    taskMarkdown = loadContract(ledgerKey)?.markdown ?? null;
+  } catch {
+    taskMarkdown = null;
+  }
+  const enqueueBackground = deps.enqueueBackground || defaultEnqueueBackground;
+  enqueueBackground(() =>
+    runFailureDiagnosis({ ledgerKey, item, base, autoRetry, attempt, diff, branch, taskMarkdown }, deps),
+  );
+  logDispatchNext(`diagnosis-started key=${ledgerKey} run=${item?.runId ?? "(none)"}`);
+  return { outcome: LEDGER_OUTCOME_DIAGNOSIS_PENDING };
+}
+
 function normaliseBlocks(entry) {
   if (!Array.isArray(entry?.blocks)) {
     logDispatchNext(`schema-violation todo_id=${entry?.id} reason="missing blocks"`);
@@ -1139,10 +1806,18 @@ function normaliseBlocks(entry) {
 
 function summarizeOpenTodos(entries) {
   const open = entries.filter((e) => isOpenTodoStatus(e.status));
-  const blockedScopes = new Set(open.flatMap((e) => normaliseBlocks(e)));
+  // normaliseBlocks logs on schema violations — resolve each entry once.
+  const scoped = open.map((e) => ({ entry: e, blocks: normaliseBlocks(e) }));
+  const blockedScopes = new Set(scoped.flatMap((x) => x.blocks));
   return {
     open,
     open_count: open.length,
+    // Only `*`-blocking TODOs count toward OPEN_QUESTION_CEILING (2026-08-29).
+    // Task-scoped ones are already provably non-blocking via the scope
+    // machinery, and letting them accumulate toward a global stop meant five
+    // auto-written per-task failure notes could halt the whole coordinator.
+    // A malformed `blocks` normalises to ["*"] and still counts — fail safe.
+    global_open_count: scoped.filter((x) => x.blocks.includes(SCOPE_GLOBAL)).length,
     todo_ids: open.map((e) => e.id).filter((id) => id != null),
     blockedScopes,
   };
@@ -1241,7 +1916,15 @@ function applyIdleTelemetry({ dispatched, reason }, deps = {}) {
       save(repo, state);
       return { escalated: false, idle_state: state };
     }
-    if (reason === "nothing-dispatchable" || reason === "scan-errored" || reason === "queue-item-rejected") {
+    if (
+      reason === "nothing-dispatchable" ||
+      reason === "scan-errored" ||
+      reason === "queue-item-rejected" ||
+      // 8-P1: a ledger-blocked stall used to be invisible to the idle
+      // escalator, so the one stall mode that most needed surfacing never
+      // incremented consecutive_idle and never hit IDLE_ESCALATION_EVERY.
+      reason === "ledger-blocked"
+    ) {
       const now = new Date().toISOString();
       const consecutive_idle = (state.consecutive_idle || 0) + 1;
       state = { ...state, consecutive_idle, last_idle_at: now };
@@ -1702,11 +2385,35 @@ function extractAgentReplyText(stdout) {
 }
 
 function runPlannerAgentTurn(prompt) {
+  return runOpenClawAgentTurn({
+    prompt,
+    agentId: PLANNER_AGENT_ID,
+    model: PLANNER_MODEL,
+    filePrefix: "coordinator-roadmap-scan",
+    sessionPrefix: "roadmap-scan",
+  });
+}
+
+/**
+ * Item 8's diagnosis turn — the same fully-automated primitive the roadmap
+ * scan uses (`openclaw agent --json`), no human in the loop.
+ */
+function runDiagnosisAgentTurn(prompt) {
+  return runOpenClawAgentTurn({
+    prompt,
+    agentId: DIAGNOSIS_AGENT_ID,
+    model: DIAGNOSIS_MODEL,
+    filePrefix: "coordinator-failure-diagnosis",
+    sessionPrefix: "failure-diagnosis",
+  });
+}
+
+function runOpenClawAgentTurn({ prompt, agentId, model, filePrefix, sessionPrefix }) {
   const tmpFile = path.join(
     os.tmpdir(),
-    `coordinator-roadmap-scan-${process.pid}-${crypto.randomBytes(4).toString("hex")}.txt`,
+    `${filePrefix}-${process.pid}-${crypto.randomBytes(4).toString("hex")}.txt`,
   );
-  const sessionKey = `roadmap-scan-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+  const sessionKey = `${sessionPrefix}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
   fs.writeFileSync(tmpFile, prompt, "utf-8");
   return new Promise((resolve, reject) => {
     execFile(
@@ -1714,11 +2421,11 @@ function runPlannerAgentTurn(prompt) {
       [
         "agent",
         "--agent",
-        PLANNER_AGENT_ID,
+        agentId,
         "--session-key",
         sessionKey,
         "--model",
-        PLANNER_MODEL,
+        model,
         "--message-file",
         tmpFile,
         "--timeout",
@@ -1775,7 +2482,7 @@ async function scanRoadmapForWork(deps = {}) {
     blockedScopes: [...snapshot.blockedScopes],
   };
 
-  if (snapshot.open_count >= OPEN_QUESTION_CEILING) {
+  if ((snapshot.global_open_count ?? snapshot.open_count) >= OPEN_QUESTION_CEILING) {
     return { outcome: "developer-attention-required", ...snapshotFields };
   }
 
@@ -1917,7 +2624,7 @@ function snapshotTodosBestEffort(deps = {}) {
     return readRequiredTodoSnapshot(deps);
   } catch (err) {
     logDispatchNextError(`todo snapshot failed (swallowed): ${err?.message || String(err)}`);
-    return { open_count: 0, todo_ids: [], blockedScopes: new Set() };
+    return { open_count: 0, global_open_count: 0, todo_ids: [], blockedScopes: new Set() };
   }
 }
 
@@ -2046,6 +2753,22 @@ async function spawnPendingQueueItem(queue, idx, deps = {}) {
   }
   if (ledgerBlocksKey(loadLedger(deps), ledgerKey)) {
     logDispatchNext(`ledger-blocked-redispatch key=${ledgerKey} path=queue`);
+    // 8-P1 (2026-08-29): this used to return with the item still `pending`,
+    // unlike every sibling refusal path in this function. handleDispatchNext
+    // only reaches the roadmap scan when NO pending item exists, so one
+    // ledger-blocked item halted the entire coordinator — every other queue
+    // item and the scan with it — and applyIdleTelemetry did not count the
+    // reason, so the stall was silent. Park it and advance, like the
+    // unledgerable branch above. No TODO: the failure that set
+    // outcome:"failed" already wrote one for this key by construction.
+    item.status = "flagged";
+    item.resolvedAt = new Date().toISOString();
+    item.note = "ledger-blocked; parked so the queue can advance";
+    save(queue);
+    const blockedNextIdx = queue.findIndex((it) => it.status === "pending");
+    if (blockedNextIdx >= 0) {
+      return spawnPendingQueueItem(queue, blockedNextIdx, deps);
+    }
     return {
       status: 200,
       body: withIdleTelemetry(
@@ -2054,6 +2777,7 @@ async function spawnPendingQueueItem(queue, idx, deps = {}) {
           dispatched: false,
           reason: "ledger-blocked",
           ledger_blocked: ledgerKey,
+          queueItemId: item.id,
         },
         deps,
       ),
@@ -2096,6 +2820,22 @@ async function spawnPendingQueueItem(queue, idx, deps = {}) {
   }
 
   const branch = contract.ok ? contract.branch : hardcodedCoordinatorBranch(item.id);
+
+  // Item 7 (2026-08-29): catch the repeated-empty-diff pattern on attempt 2
+  // rather than waiting for Item 8's post-run classifier to catch attempt 3.
+  // Only fires on a CONFIRMED empty diff plus a prior empty-diff attempt —
+  // an empty diff on its own is a legitimate outcome for a review task, and a
+  // diff that could not be computed (branch not cut yet) is never "empty".
+  {
+    const priorAuto = normaliseAutoRetry(loadLedger(deps)[ledgerKey]);
+    if (priorAuto.history.some((h) => h.diffHash === EMPTY_DIFF_DIGEST)) {
+      const priorDiff = branchDiffDigest(item.repoPath, branch, deps);
+      if (priorDiff.ran && priorDiff.digest === EMPTY_DIFF_DIGEST) {
+        logDispatchNext(`repeated-empty-diff key=${ledgerKey} branch=${branch}`);
+        return parkRepeatedEmptyDiff(queue, item, deps, ledgerKey, branch, priorAuto);
+      }
+    }
+  }
 
   if (!repoExists(item.repoPath)) {
     return { status: 400, body: { ok: false, error: `repoPath does not exist: ${item.repoPath}` } };
@@ -2395,7 +3135,16 @@ async function handleDispatchNext(deps = {}) {
     return { status: 500, body: { ok: false, error: err?.message || String(err) } };
   }
 
-  if (snapshot.open_count >= OPEN_QUESTION_CEILING) {
+  // A `diagnosis-pending` key that outlived its TTL is parked here too, not
+  // only in /queue/check, so a wedged key cannot survive on the dispatch path.
+  try {
+    sweepStaleDiagnoses(deps);
+  } catch (err) {
+    logDispatchNextError(`stale-diagnosis sweep failed (swallowed): ${err?.message || String(err)}`);
+  }
+
+  // Only `*`-blocking TODOs count toward the global stop (2026-08-29).
+  if ((snapshot.global_open_count ?? snapshot.open_count) >= OPEN_QUESTION_CEILING) {
     return {
       status: 200,
       body: attachOpenSnapshot(
@@ -2816,6 +3565,12 @@ const server = http.createServer(async (req, res) => {
   if (p === "/queue/check" && req.method === "GET") {
     if (!requireAuth(req, res, "GET", "/queue/check")) return;
 
+    try {
+      sweepStaleDiagnoses();
+    } catch (err) {
+      logDispatchNextError(`stale-diagnosis sweep failed (swallowed): ${err?.message || String(err)}`);
+    }
+
     const queue = loadQueue();
     const changed = [];
 
@@ -2865,31 +3620,63 @@ const server = http.createServer(async (req, res) => {
       const ledgerKey = extractTaskIdFromText(item.task, item.roadmap_ref);
       const ledgerOutcome =
         run.status === "failed" || outcome.status === "flagged" ? "failed" : "completed";
-      recordLedgerAttempt(ledgerKey, {
-        outcome: ledgerOutcome,
-        runStatus: run.status,
-        queueStatus: outcome.status,
-        runId: item.runId,
-        queueItemId: item.id,
-        outcomeAt: item.resolvedAt,
-        roadmap_ref: item.roadmap_ref ?? null,
-      });
+      let failureHandling = null;
       if (ledgerOutcome === "failed" && ledgerKey) {
+        // Item 8 (2026-08-29): a failed run no longer parks straight to
+        // outcome:"failed" with a "clear the ledger by hand" TODO. It is
+        // classified, then either auto-retried (capped at AUTO_RETRY_CAP) or
+        // parked through the same task-scoped blocker route as before.
+        // handleFailedRunOutcome owns the recordLedgerAttempt for this branch.
         try {
-          appendDeveloperTodoEntry(THECOACH_REPO, {
-            summary: `Dispatch of ${ledgerKey} failed (run ${item.runId}); do not retry until the ledger entry is cleared`,
-            why: `The last antfarm run for this item ended runStatus=${run.status} queueStatus=${outcome.status}. Re-dispatching it unattended would repeat the failure.`,
-            source: ledgerKey,
-            type: "blocked",
-            evidence: item.note || `run ${item.runId}`,
-            reply_needed: `Diagnose ${ledgerKey}, then clear coordinator-dispatch-ledger.json[${ledgerKey}] to allow a retry.`,
-            blocks: [`task:${ledgerKey}`],
+          failureHandling = handleFailedRunOutcome({
+            ledgerKey,
+            item,
+            queue,
+            runStatus: run.status,
+            queueStatus: outcome.status,
+            stepsResult,
           });
         } catch (err) {
-          logDispatchNextError(`ledger failure-question write failed: ${err?.message || String(err)}`);
+          logDispatchNextError(`auto-retry handling failed for ${ledgerKey}: ${err?.message || String(err)}`);
+          // Degrade to the pre-2026-08-29 behaviour: park it for the developer.
+          recordLedgerAttempt(ledgerKey, {
+            outcome: LEDGER_OUTCOME_FAILED,
+            runStatus: run.status,
+            queueStatus: outcome.status,
+            runId: item.runId,
+            queueItemId: item.id,
+            outcomeAt: item.resolvedAt,
+            roadmap_ref: item.roadmap_ref ?? null,
+          });
+          try {
+            appendDeveloperTodoEntry(THECOACH_REPO, {
+              summary: `Dispatch of ${ledgerKey} failed (run ${item.runId}); auto-retry handling errored, do not retry until the ledger entry is cleared`,
+              why: `The last antfarm run ended runStatus=${run.status} queueStatus=${outcome.status}, and the automatic diagnose-and-retry path itself threw. Re-dispatching unattended would repeat the failure.`,
+              source: ledgerKey,
+              type: "blocked",
+              evidence: item.note || `run ${item.runId}`,
+              reply_needed: `Diagnose ${ledgerKey}, then clear coordinator-dispatch-ledger.json[${ledgerKey}] to allow a retry.`,
+              blocks: [`task:${ledgerKey}`],
+            });
+          } catch (todoErr) {
+            logDispatchNextError(`ledger failure-question write failed: ${todoErr?.message || String(todoErr)}`);
+          }
         }
+      } else {
+        recordLedgerAttempt(ledgerKey, {
+          outcome: ledgerOutcome,
+          runStatus: run.status,
+          queueStatus: outcome.status,
+          runId: item.runId,
+          queueItemId: item.id,
+          outcomeAt: item.resolvedAt,
+          roadmap_ref: item.roadmap_ref ?? null,
+        });
       }
       changed.push({
+        autoRetry: failureHandling
+          ? { outcome: failureHandling.outcome, parkedReason: failureHandling.parkedReason ?? null }
+          : null,
         id: item.id,
         runId: item.runId,
         change: outcome.status,
@@ -5142,7 +5929,7 @@ if (process.argv.includes("--self-test-dispatch-scope-gate")) {
       "033-match-ci-yml",
       Array.isArray(r033.http.body.matches) &&
         r033.http.body.matches.some(
-          (m) => m.path.includes(".github/workflows/ci.yml") && m.pattern === ".github/workflows/**",
+          (m) => m.path.includes(".github/workflows/ci.yml") && m.pattern === ".github/**",
         ),
       r033.http.body.matches,
     ),
@@ -5182,7 +5969,7 @@ if (process.argv.includes("--self-test-dispatch-scope-gate")) {
     check(
       "038-match-workflows",
       Array.isArray(r038.http.body.matches) &&
-        r038.http.body.matches.some((m) => m.pattern === ".github/workflows/**"),
+        r038.http.body.matches.some((m) => m.pattern === ".github/**"),
       r038.http.body.matches,
     ),
   );
@@ -5219,6 +6006,520 @@ if (process.argv.includes("--self-test-dispatch-scope-gate")) {
     failures,
     cases,
     patterns: [...PROTECTED_PATH_PATTERNS],
+  };
+  origLog(JSON.stringify(report, null, 2));
+  process.exit(failures.length === 0 ? 0 : 1);
+}
+
+// Item 8 / Item 7 / 8-P1 / 8-P2 mechanical self-check. No port, no network,
+// no real ledger/queue/TODO file — every dependency is injected. Invoke:
+//   COORDINATOR_TOKEN=x node local-tools/coordinator-trigger.mjs --self-test-auto-retry
+if (process.argv.includes("--self-test-auto-retry")) {
+  const origLog = console.log;
+  const captured = [];
+  console.log = (...args) => {
+    const line = args.map(String).join(" ");
+    captured.push(line);
+    if (line.startsWith("[queue/dispatch-next]")) return;
+    origLog(...args);
+  };
+
+  const failures = [];
+  const cases = [];
+  function check(label, cond, detail) {
+    if (!cond) failures.push({ label, detail });
+    cases.push({ case: label, ok: Boolean(cond), detail: cond ? null : detail });
+  }
+
+  function memoryQueue(initial = []) {
+    let q = initial;
+    return { load: () => q, save: (next) => { q = next; }, get: () => q };
+  }
+  function memoryLedger(initial = {}) {
+    let l = JSON.parse(JSON.stringify(initial));
+    return {
+      loadLedger: () => JSON.parse(JSON.stringify(l)),
+      saveLedger: (next) => { l = JSON.parse(JSON.stringify(next)); },
+      get: () => l,
+    };
+  }
+  function memoryIdle(initial = defaultIdleState()) {
+    let state = { ...initial };
+    return {
+      loadIdle: () => ({ ...state }),
+      saveIdle: (_repo, next) => { state = { ...next }; },
+      get: () => state,
+    };
+  }
+  function failedItem(id, taskId, extra = {}) {
+    return {
+      id,
+      task: `${taskId}: do the thing`,
+      repoPath: "/tmp/auto-retry-repo",
+      branch: "fix/auto-retry",
+      status: "failed",
+      runId: `run-${id}`,
+      createdAt: "2026-08-29T00:00:00.000Z",
+      dispatchedAt: "2026-08-29T00:01:00.000Z",
+      resolvedAt: "2026-08-29T00:02:00.000Z",
+      note: 'run status is "failed" — not a successful completion',
+      roadmap_ref: null,
+      ...extra,
+    };
+  }
+  function pendingItem(id, task) {
+    return {
+      id,
+      task,
+      repoPath: "/tmp/auto-retry-repo",
+      status: "pending",
+      runId: null,
+      createdAt: "2026-08-29T00:00:00.000Z",
+      dispatchedAt: null,
+      resolvedAt: null,
+      note: null,
+    };
+  }
+  function stepsFixture(output, stepId = "implement") {
+    return {
+      found: true,
+      run: { id: "run-x", workflowId: DEFAULT_WORKFLOW, status: "failed", runNumber: 99 },
+      steps: [
+        { stepId: "plan", status: "done", output: "ok", retryCount: 0, maxRetries: 1 },
+        { stepId, status: "failed", output, retryCount: 2, maxRetries: 2 },
+      ],
+    };
+  }
+  const agentReply = (obj) => JSON.stringify({ ok: true, final: JSON.stringify(obj) });
+  const FIXABLE = {
+    class: "fixable",
+    reason: "the story's tests were never written",
+    evidence: "implement: STATUS: blocked",
+    retry_guidance: "write the test file named in the story before committing",
+  };
+  const STRUCTURAL = {
+    class: "structural",
+    reason: "the task's deliverable is a policy contradiction",
+    evidence: "implement: cannot proceed",
+    retry_guidance: "",
+  };
+
+  // Shared harness: run handleFailedRunOutcome, then drain the background job.
+  async function runFailure(opts) {
+    const ledger = memoryLedger(opts.ledger || {});
+    const mq = memoryQueue(opts.queue || []);
+    const todos = [];
+    const jobs = [];
+    let agentCalls = 0;
+    const deps = {
+      ...ledger,
+      load: mq.load,
+      save: mq.save,
+      thecoachRepo: "/tmp/thecoach",
+      appendTodo: (_repo, draft) => { todos.push(draft); return { appended: true, entry: draft }; },
+      branchDiff: () => opts.diff || { ran: false, digest: null, files: [], error: "no repo" },
+      enqueueBackground: (job) => { jobs.push(job); },
+      loadTaskContract: () => ({ ok: true, branch: "fix/auto-retry", tool: "Cursor", markdown: "# task" }),
+      runDiagnosisAgent: async (prompt) => {
+        agentCalls += 1;
+        if (opts.agentThrows) throw new Error("openclaw agent failed: boom");
+        if (opts.agentGarbage) return JSON.stringify({ ok: true, final: "not json at all" });
+        return agentReply(opts.agentReply || FIXABLE);
+      },
+      now: () => Date.parse("2026-08-29T12:00:00.000Z"),
+    };
+    const liveQueue = opts.liveQueue === false ? null : mq.get();
+    const result = handleFailedRunOutcome(
+      {
+        ledgerKey: opts.taskId,
+        item: opts.item,
+        queue: liveQueue,
+        runStatus: "failed",
+        queueStatus: "failed",
+        stepsResult: opts.steps || stepsFixture("STATUS: blocked\nREASON: something specific and new"),
+      },
+      deps,
+    );
+    for (const job of jobs) await job();
+    return { result, ledger, mq, todos, agentCalls, deps };
+  }
+
+  // 1. fixable + attempts 0 -> retry-pending, item pushed with feedback, NO todo
+  {
+    const item = failedItem("q1", "TASK-901");
+    const r = await runFailure({ taskId: "TASK-901", item, queue: [item] });
+    const entry = r.ledger.get()["TASK-901"];
+    const pushed = r.mq.get().filter((i) => i.source === AUTO_RETRY_SOURCE);
+    check("1a-retry-pending", entry?.outcome === LEDGER_OUTCOME_RETRY_PENDING, entry);
+    check("1b-not-blocking", ledgerBlocksKey(r.ledger.get(), "TASK-901") === false, entry);
+    check("1c-attempts-1", entry?.autoRetry?.attempts === 1, entry?.autoRetry);
+    check("1d-item-pushed", pushed.length === 1, r.mq.get().length);
+    check("1e-feedback", pushed[0] && pushed[0].task.includes("DO DIFFERENTLY: write the test file"), pushed[0]?.task);
+    check("1f-class-in-feedback", pushed[0] && pushed[0].task.includes("CLASS: fixable"), pushed[0]?.task);
+    check("1g-no-todo", r.todos.length === 0, r.todos);
+    check("1h-agent-called", r.agentCalls === 1, r.agentCalls);
+    check("1i-history", entry?.autoRetry?.history?.length === 1, entry?.autoRetry?.history);
+  }
+
+  // 2. transient (deterministic signature) -> retry with NO feedback block, no agent turn
+  {
+    const item = failedItem("q2", "TASK-902");
+    const r = await runFailure({
+      taskId: "TASK-902",
+      item,
+      queue: [item],
+      steps: stepsFixture("ENGINE_ERROR: openclaw agent failed: gateway unreachable"),
+    });
+    const entry = r.ledger.get()["TASK-902"];
+    const pushed = r.mq.get().filter((i) => i.source === AUTO_RETRY_SOURCE);
+    check("2a-retry-pending", entry?.outcome === LEDGER_OUTCOME_RETRY_PENDING, entry);
+    check("2b-transient-class", entry?.autoRetry?.lastDiagnosis?.class === "transient", entry?.autoRetry?.lastDiagnosis);
+    check("2c-no-feedback", pushed[0] && !pushed[0].task.includes(AUTO_RETRY_FEEDBACK_HEADER), pushed[0]?.task);
+    check("2d-no-agent-turn", r.agentCalls === 0, r.agentCalls);
+    check("2e-attempts-1", entry?.autoRetry?.attempts === 1, entry?.autoRetry);
+  }
+
+  // 3. attempts already at cap -> park, todo written, no retry pushed
+  {
+    const item = failedItem("q3", "TASK-903");
+    const r = await runFailure({
+      taskId: "TASK-903",
+      item,
+      queue: [item],
+      ledger: {
+        "TASK-903": {
+          key: "TASK-903",
+          outcome: "retry-pending",
+          autoRetry: { attempts: 2, cap: 2, parked: false, parkedReason: null, lastDiagnosis: null, history: [
+            { at: "2026-08-29T10:00:00.000Z", class: "fixable", reason: "older reason one", diffHash: null },
+            { at: "2026-08-29T11:00:00.000Z", class: "fixable", reason: "older reason two", diffHash: null },
+          ] },
+        },
+      },
+    });
+    const entry = r.ledger.get()["TASK-903"];
+    check("3a-failed", entry?.outcome === LEDGER_OUTCOME_FAILED, entry);
+    check("3b-blocking", ledgerBlocksKey(r.ledger.get(), "TASK-903") === true, entry);
+    check("3c-cap-reached", entry?.autoRetry?.parkedReason === "cap-reached", entry?.autoRetry);
+    check("3d-no-retry", r.mq.get().filter((i) => i.source === AUTO_RETRY_SOURCE).length === 0, r.mq.get());
+    check("3e-todo", r.todos.length === 1, r.todos);
+    check("3f-todo-scoped", r.todos[0]?.blocks?.length === 1 && r.todos[0].blocks[0] === "task:TASK-903", r.todos[0]?.blocks);
+    check("3g-todo-summary-has-count", /failed 3x/.test(r.todos[0]?.summary || ""), r.todos[0]?.summary);
+    check("3h-todo-summary-has-class", /class: fixable/.test(r.todos[0]?.summary || ""), r.todos[0]?.summary);
+  }
+
+  // 4. structural at attempts 0 -> park immediately, attempts untouched
+  {
+    const item = failedItem("q4", "TASK-904");
+    const r = await runFailure({ taskId: "TASK-904", item, queue: [item], agentReply: STRUCTURAL });
+    const entry = r.ledger.get()["TASK-904"];
+    check("4a-failed", entry?.outcome === LEDGER_OUTCOME_FAILED, entry);
+    check("4b-structural", entry?.autoRetry?.parkedReason === "structural", entry?.autoRetry);
+    check("4c-attempts-0", entry?.autoRetry?.attempts === 0, entry?.autoRetry);
+    check("4d-no-retry", r.mq.get().filter((i) => i.source === AUTO_RETRY_SOURCE).length === 0, r.mq.get());
+    check("4e-todo", r.todos.length === 1, r.todos);
+  }
+
+  // 5. repeated diff digest -> structural, no agent turn, no attempt spent
+  {
+    const item = failedItem("q5", "TASK-905");
+    const digest = "a".repeat(64);
+    const r = await runFailure({
+      taskId: "TASK-905",
+      item,
+      queue: [item],
+      diff: { ran: true, digest, files: ["apps/web/page.tsx"] },
+      ledger: {
+        "TASK-905": {
+          key: "TASK-905",
+          outcome: "retry-pending",
+          autoRetry: { attempts: 1, cap: 2, parked: false, parkedReason: null, lastDiagnosis: null, history: [
+            { at: "2026-08-29T10:00:00.000Z", class: "fixable", reason: "an unrelated earlier reason", diffHash: digest },
+          ] },
+        },
+      },
+    });
+    const entry = r.ledger.get()["TASK-905"];
+    check("5a-structural", entry?.autoRetry?.parkedReason === "structural", entry?.autoRetry);
+    check("5b-no-agent-turn", r.agentCalls === 0, r.agentCalls);
+    check("5c-attempts-unchanged", entry?.autoRetry?.attempts === 1, entry?.autoRetry);
+    check("5d-failed", entry?.outcome === LEDGER_OUTCOME_FAILED, entry);
+  }
+
+  // 6. protected-path gate signature -> structural, no agent turn
+  {
+    const item = failedItem("q6", "TASK-906");
+    const r = await runFailure({
+      taskId: "TASK-906",
+      item,
+      queue: [item],
+      steps: stepsFixture("Protected-path gate: diff touches supabase/migrations/001.sql", "pr"),
+    });
+    const entry = r.ledger.get()["TASK-906"];
+    check("6a-structural", entry?.autoRetry?.parkedReason === "structural", entry?.autoRetry);
+    check("6b-no-agent-turn", r.agentCalls === 0, r.agentCalls);
+    check("6c-attempts-0", entry?.autoRetry?.attempts === 0, entry?.autoRetry);
+    check("6d-todo", r.todos.length === 1, r.todos);
+  }
+
+  // 7. diagnosis agent throws -> park (today's behaviour), no retry
+  {
+    const item = failedItem("q7", "TASK-907");
+    const r = await runFailure({ taskId: "TASK-907", item, queue: [item], agentThrows: true, liveQueue: false });
+    const entry = r.ledger.get()["TASK-907"];
+    check("7a-failed", entry?.outcome === LEDGER_OUTCOME_FAILED, entry);
+    check("7b-diagnosis-unavailable", entry?.autoRetry?.parkedReason === "diagnosis-unavailable", entry?.autoRetry);
+    check("7c-no-retry", r.mq.get().filter((i) => i.source === AUTO_RETRY_SOURCE).length === 0, r.mq.get());
+    check("7d-todo", r.todos.length === 1, r.todos);
+    check("7e-blocking", ledgerBlocksKey(r.ledger.get(), "TASK-907") === true, entry);
+  }
+
+  // 8. unparseable diagnosis reply -> park
+  {
+    const item = failedItem("q8", "TASK-908");
+    const r = await runFailure({ taskId: "TASK-908", item, queue: [item], agentGarbage: true, liveQueue: false });
+    const entry = r.ledger.get()["TASK-908"];
+    check("8a-failed", entry?.outcome === LEDGER_OUTCOME_FAILED, entry);
+    check("8b-diagnosis-unavailable", entry?.autoRetry?.parkedReason === "diagnosis-unavailable", entry?.autoRetry);
+    check("8c-no-retry", r.mq.get().filter((i) => i.source === AUTO_RETRY_SOURCE).length === 0, r.mq.get());
+  }
+
+  // 8b. strict reply parsing rejects the shapes it must
+  {
+    const good = parseDiagnosisReply(JSON.stringify(FIXABLE));
+    const extraKey = parseDiagnosisReply(JSON.stringify({ ...FIXABLE, extra: 1 }));
+    const badClass = parseDiagnosisReply(JSON.stringify({ ...FIXABLE, class: "weird" }));
+    const noGuidance = parseDiagnosisReply(JSON.stringify({ ...FIXABLE, retry_guidance: "" }));
+    const structuralOk = parseDiagnosisReply(JSON.stringify(STRUCTURAL));
+    check("8d-parse-good", good.ok === true, good);
+    check("8e-parse-extra-key", extraKey.ok === false, extraKey);
+    check("8f-parse-bad-class", badClass.ok === false, badClass);
+    check("8g-parse-guidance-required", noGuidance.ok === false, noGuidance);
+    check("8h-parse-structural-empty-guidance", structuralOk.ok === true, structuralOk);
+  }
+
+  // 9. diagnosis-pending older than TTL -> parked by the sweep
+  {
+    const ledger = memoryLedger({
+      "TASK-909": {
+        key: "TASK-909",
+        outcome: LEDGER_OUTCOME_DIAGNOSIS_PENDING,
+        diagnosisStartedAt: "2026-08-29T11:00:00.000Z",
+        runId: "run-909",
+        autoRetry: { attempts: 0, cap: 2, parked: false, parkedReason: null, lastDiagnosis: null, history: [] },
+      },
+      "TASK-910": {
+        key: "TASK-910",
+        outcome: LEDGER_OUTCOME_DIAGNOSIS_PENDING,
+        diagnosisStartedAt: "2026-08-29T11:55:00.000Z",
+        runId: "run-910",
+      },
+    });
+    const todos = [];
+    const deps = {
+      ...ledger,
+      thecoachRepo: "/tmp/thecoach",
+      appendTodo: (_repo, draft) => { todos.push(draft); return { appended: true, entry: draft }; },
+      now: () => Date.parse("2026-08-29T12:00:00.000Z"),
+    };
+    const swept = sweepStaleDiagnoses(deps);
+    check("9a-swept-stale", swept.length === 1 && swept[0] === "TASK-909", swept);
+    check("9b-stale-parked", ledger.get()["TASK-909"]?.outcome === LEDGER_OUTCOME_FAILED, ledger.get()["TASK-909"]);
+    check("9c-fresh-untouched", ledger.get()["TASK-910"]?.outcome === LEDGER_OUTCOME_DIAGNOSIS_PENDING, ledger.get()["TASK-910"]);
+    check("9d-stale-todo", todos.length === 1 && todos[0].blocks[0] === "task:TASK-909", todos);
+    check("9e-stale-blocking", ledgerBlocksKey(ledger.get(), "TASK-909") === true, ledger.get()["TASK-909"]);
+  }
+
+  // ---- 8-P1: a ledger-blocked pending item must not halt the queue --------
+  async function spawnHarness(queueItems, ledgerInit, extraDeps = {}) {
+    const mq = memoryQueue(queueItems);
+    const ledger = memoryLedger(ledgerInit);
+    const idle = memoryIdle();
+    const started = [];
+    const todos = [];
+    const http = await spawnPendingQueueItem(mq.get(), 0, {
+      ...ledger,
+      ...idle,
+      thecoachRepo: "/tmp/thecoach",
+      save: mq.save,
+      load: mq.load,
+      appendTodo: (_repo, draft) => { todos.push(draft); return { appended: true, entry: draft }; },
+      repoExists: () => true,
+      fetchStaging: async () => "tip",
+      loadTaskContract: (id) => ({ ok: true, branch: `fix/${id.toLowerCase()}`, tool: "Cursor", markdown: `# ${id}` }),
+      branchDiff: () => ({ ran: false, digest: null, files: [], error: "not computed" }),
+      startRun: ({ task }) => { started.push(task); return { id: "spawn-1", pid: 1, logPath: "/tmp/s.log" }; },
+      waitRun: async () => ({ id: "run-new", status: "running", run_number: 100 }),
+      ...extraDeps,
+    });
+    return { http, mq, ledger, idle, started, todos };
+  }
+
+  // 10. blocked head-of-queue item is flagged and the NEXT item dispatches
+  {
+    const r = await spawnHarness(
+      [pendingItem("blocked-1", "TASK-911 blocked work"), pendingItem("ok-1", "TASK-912 good work")],
+      { "TASK-911": { key: "TASK-911", outcome: "failed", cleared: false } },
+    );
+    const q = r.mq.get();
+    check("10a-blocked-flagged", q[0].status === "flagged", q[0]);
+    check("10b-blocked-note", /parked so the queue can advance/.test(q[0].note || ""), q[0].note);
+    check("10c-second-dispatched", q[1].status === "dispatched", q[1]);
+    check("10d-startRun-called", r.started.length === 1 && r.started[0].includes("TASK-912"), r.started);
+    check("10e-response-dispatched", r.http.body.dispatched === true, r.http.body);
+    check("10f-no-todo", r.todos.length === 0, r.todos);
+  }
+
+  // 10b. blocked item alone -> flagged, reason ledger-blocked, queue advances to empty
+  {
+    const r = await spawnHarness(
+      [pendingItem("blocked-2", "TASK-913 blocked work")],
+      { "TASK-913": { key: "TASK-913", outcome: "failed", cleared: false } },
+    );
+    check("10g-flagged", r.mq.get()[0].status === "flagged", r.mq.get()[0]);
+    check("10h-reason", r.http.body.reason === "ledger-blocked", r.http.body);
+    check("10i-no-pending-left", r.mq.get().every((i) => i.status !== "pending"), r.mq.get());
+    check("10j-idle-incremented", r.idle.get().consecutive_idle === 1, r.idle.get());
+  }
+
+  // 11. applyIdleTelemetry counts ledger-blocked as idle
+  {
+    const idle = memoryIdle({ consecutive_idle: 4, last_idle_at: null, last_escalated_at: null });
+    const out = applyIdleTelemetry(
+      { dispatched: false, reason: "ledger-blocked" },
+      { ...idle, thecoachRepo: "/tmp/thecoach" },
+    );
+    check("11a-idle-counted", idle.get().consecutive_idle === 5, idle.get());
+    check("11b-not-escalated-yet", out.escalated === false, out);
+    const idle2 = memoryIdle({ consecutive_idle: 11, last_idle_at: null, last_escalated_at: null });
+    const out2 = applyIdleTelemetry(
+      { dispatched: false, reason: "ledger-blocked" },
+      { ...idle2, thecoachRepo: "/tmp/thecoach" },
+    );
+    check("11c-escalates-at-12", out2.escalated === true && idle2.get().consecutive_idle === 12, idle2.get());
+  }
+
+  // 12. a parked task blocks only its own scope; ceiling counts * only (8-P2)
+  {
+    const entries = [
+      { id: "TODO-1", status: "open", blocks: ["task:TASK-901"] },
+      { id: "TODO-2", status: "open", blocks: ["task:TASK-902"] },
+      { id: "TODO-3", status: "open", blocks: ["task:TASK-903"] },
+      { id: "TODO-4", status: "open", blocks: [] },
+      { id: "TODO-5", status: "open", blocks: ["*"] },
+      { id: "TODO-6", status: "resolved", blocks: ["*"] },
+    ];
+    const sum = summarizeOpenTodos(entries);
+    check("12a-open-count", sum.open_count === 5, sum.open_count);
+    check("12b-global-count", sum.global_open_count === 1, sum.global_open_count);
+    check("12c-scopes", sum.blockedScopes.has("task:task-901") && !sum.blockedScopes.has("task:task-999"), [...sum.blockedScopes]);
+    check("12d-star-present", sum.blockedScopes.has(SCOPE_GLOBAL), [...sum.blockedScopes]);
+    // 15 task-scoped parks must NOT reach the ceiling
+    const many = Array.from({ length: 15 }, (_, i) => ({ id: `T-${i}`, status: "open", blocks: [`task:TASK-${900 + i}`] }));
+    const manySum = summarizeOpenTodos(many);
+    check("12e-many-scoped-below-ceiling", manySum.global_open_count < OPEN_QUESTION_CEILING, manySum.global_open_count);
+    check("12f-many-scoped-open-count", manySum.open_count === 15, manySum.open_count);
+    // a malformed blocks array still counts as global (fail safe)
+    const malformed = summarizeOpenTodos([{ id: "T-x", status: "open" }]);
+    check("12g-malformed-counts-global", malformed.global_open_count === 1, malformed);
+  }
+
+  // 17. Item 7: repeated empty diff parks on attempt 2 without dispatching
+  {
+    const r = await spawnHarness(
+      [pendingItem("empty-1", "TASK-914 review only"), pendingItem("next-1", "TASK-915 real work")],
+      {
+        "TASK-914": {
+          key: "TASK-914",
+          outcome: "retry-pending",
+          cleared: false,
+          autoRetry: {
+            attempts: 1, cap: 2, parked: false, parkedReason: null, lastDiagnosis: null,
+            history: [{ at: "2026-08-29T10:00:00.000Z", class: "fixable", reason: "r", diffHash: EMPTY_DIFF_DIGEST }],
+          },
+        },
+      },
+      { branchDiff: (_repo, branch) => (branch === "fix/task-914" ? { ran: true, digest: EMPTY_DIFF_DIGEST, files: [] } : { ran: false, digest: null, files: [], error: "n/a" }) },
+    );
+    const q = r.mq.get();
+    check("17a-parked", q[0].status === "flagged", q[0]);
+    check("17b-note", /empty diff/.test(q[0].note || ""), q[0].note);
+    check("17c-ledger-failed", r.ledger.get()["TASK-914"]?.outcome === LEDGER_OUTCOME_FAILED, r.ledger.get()["TASK-914"]);
+    check("17d-reason", r.ledger.get()["TASK-914"]?.reason === "repeated-empty-diff", r.ledger.get()["TASK-914"]);
+    check("17e-attempt-not-spent", r.ledger.get()["TASK-914"]?.autoRetry?.attempts === 1, r.ledger.get()["TASK-914"]?.autoRetry);
+    check("17f-todo-scoped", r.todos.length === 1 && r.todos[0].blocks[0] === "task:TASK-914", r.todos);
+    check("17g-queue-advanced", q[1].status === "dispatched", q[1]);
+    check("17h-only-next-started", r.started.length === 1 && r.started[0].includes("TASK-915"), r.started);
+  }
+
+  // 17b. a FIRST empty diff (no prior empty attempt) still dispatches
+  {
+    const r = await spawnHarness(
+      [pendingItem("empty-2", "TASK-916 review only")],
+      {},
+      { branchDiff: () => ({ ran: true, digest: EMPTY_DIFF_DIGEST, files: [] }) },
+    );
+    check("17i-first-empty-dispatches", r.mq.get()[0].status === "dispatched", r.mq.get()[0]);
+    check("17j-startRun-called", r.started.length === 1, r.started);
+  }
+
+  // 17c. a diff that could not be COMPUTED is never treated as empty
+  {
+    const r = await spawnHarness(
+      [pendingItem("nodiff-1", "TASK-917 new branch")],
+      {
+        "TASK-917": {
+          key: "TASK-917", outcome: "retry-pending", cleared: false,
+          autoRetry: { attempts: 1, cap: 2, parked: false, parkedReason: null, lastDiagnosis: null,
+            history: [{ at: "2026-08-29T10:00:00.000Z", class: "fixable", reason: "r", diffHash: EMPTY_DIFF_DIGEST }] },
+        },
+      },
+      { branchDiff: () => ({ ran: false, digest: null, files: [], error: "unknown revision" }) },
+    );
+    check("17k-uncomputable-dispatches", r.mq.get()[0].status === "dispatched", r.mq.get()[0]);
+  }
+
+  // JC7. a `## Dispatch: manual` task never enters the retry cycle at all
+  {
+    const r = await spawnHarness(
+      [pendingItem("manual-1", "TASK-918 manual work")],
+      {},
+      { loadTaskContract: () => ({ ok: true, branch: "fix/task-918", tool: "Cursor", markdown: "# t", dispatch: "manual", dispatchUnknown: false }) },
+    );
+    check("jc7a-manual-skipped", r.http.body.reason === "not-dispatchable-manual", r.http.body);
+    check("jc7b-no-ledger-entry", Object.keys(r.ledger.get()).length === 0, r.ledger.get());
+    check("jc7c-no-autoretry", r.ledger.get()["TASK-918"] === undefined, r.ledger.get());
+    check("jc7d-no-startRun", r.started.length === 0, r.started);
+  }
+
+  // feedback blocks must not stack across attempts
+  {
+    const withFeedback = `TASK-919: do it\n\n${AUTO_RETRY_FEEDBACK_HEADER}2 of 3 — automatic diagnosis, not a human):\nCLASS: fixable\nWHAT FAILED: old\nEVIDENCE: old\nDO DIFFERENTLY: old`;
+    const rebuilt = buildAutoRetryQueueItem({
+      item: { task: withFeedback, repoPath: "/tmp/r", roadmap_ref: null },
+      diagnosis: FIXABLE,
+      attemptNumber: 2,
+      cap: 2,
+    });
+    const occurrences = rebuilt.task.split(AUTO_RETRY_FEEDBACK_HEADER).length - 1;
+    check("fb-single-block", occurrences === 1, rebuilt.task);
+    check("fb-new-guidance", rebuilt.task.includes("write the test file"), rebuilt.task);
+    check("fb-old-guidance-gone", !rebuilt.task.includes("DO DIFFERENTLY: old"), rebuilt.task);
+    check("fb-source", rebuilt.source === AUTO_RETRY_SOURCE, rebuilt.source);
+  }
+
+  const report = {
+    ok: failures.length === 0,
+    failed: failures.length,
+    total: cases.length,
+    failures,
+    cases,
+    config: {
+      autoRetryCap: AUTO_RETRY_CAP,
+      diagnosisTtlMs: DIAGNOSIS_TTL_MS,
+      openQuestionCeiling: OPEN_QUESTION_CEILING,
+      emptyDiffDigest: EMPTY_DIFF_DIGEST,
+    },
   };
   origLog(JSON.stringify(report, null, 2));
   process.exit(failures.length === 0 ? 0 : 1);

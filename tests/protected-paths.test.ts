@@ -5,9 +5,19 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { isProtectedPath, findProtectedPaths, missingProtectedDiffField } from "../src/lib/protected-paths.ts";
+import {
+  isProtectedPath,
+  findProtectedPaths,
+  missingProtectedDiffField,
+  matchingProtectedPattern,
+} from "../src/lib/protected-paths.ts";
 import { getDb } from "../dist/db.js";
-import { claimStep, completeStep, listProtectedDiffFiles } from "../dist/installer/step-ops.js";
+import {
+  claimStep,
+  completeStep,
+  listProtectedDiffFiles,
+  listProtectedDiffFilesChecked,
+} from "../dist/installer/step-ops.js";
 
 describe("isProtectedPath / findProtectedPaths", () => {
   it("still catches _SSoT/**", () => {
@@ -21,10 +31,33 @@ describe("isProtectedPath / findProtectedPaths", () => {
     assert.equal(isProtectedPath("supabase/migrations/001_init.sql"), true);
   });
 
-  it("catches .github/workflows/** and .gitignore", () => {
+  it("catches the whole of .github/** and .gitignore", () => {
     assert.equal(isProtectedPath(".github/workflows/ci.yml"), true);
     assert.equal(isProtectedPath(".github/workflows/anything.yml"), true);
     assert.equal(isProtectedPath(".gitignore"), true);
+  });
+
+  // Widened 2026-08-29: `.github/workflows/**` left a composite action, the
+  // dependabot config and CODEOWNERS unguarded while every agent's gh token
+  // carries `workflow` scope.
+  it("closes the .github gaps the workflows-only pattern left open", () => {
+    assert.equal(isProtectedPath(".github/actions/build/action.yml"), true);
+    assert.equal(isProtectedPath(".github/dependabot.yml"), true);
+    assert.equal(isProtectedPath(".github/CODEOWNERS"), true);
+    assert.equal(isProtectedPath(".github/ISSUE_TEMPLATE/bug.md"), true);
+    assert.equal(matchingProtectedPattern(".github/dependabot.yml"), ".github/**");
+  });
+
+  it("catches the agent self-modification surface: CLAUDE.md and .claude/**", () => {
+    assert.equal(isProtectedPath("CLAUDE.md"), true);
+    assert.equal(isProtectedPath("apps/web/CLAUDE.md"), true);
+    assert.equal(isProtectedPath(".claude/settings.json"), true);
+    assert.equal(isProtectedPath(".claude/agents/dev.md"), true);
+    assert.equal(matchingProtectedPattern(".claude/settings.json"), ".claude/**");
+    assert.equal(matchingProtectedPattern("CLAUDE.md"), "CLAUDE.md");
+    // Not a false positive on ordinary docs that merely mention Claude
+    assert.equal(isProtectedPath("docs/claude-notes.md"), false);
+    assert.equal(isProtectedPath("apps/web/lib/claude.ts"), false);
   });
 
   it("does not catch ordinary application files", () => {
@@ -171,6 +204,31 @@ describe("listProtectedDiffFiles + completeStep host-side gate", () => {
     assert.ok(verify.output.includes("ORIGINAL_OUTPUT:"));
     assert.ok(verify.output.includes(agentOutput));
     assert.equal(missingProtectedDiffField("/tmp/repo", ""), "commit_sha");
+  });
+
+  // Until 2026-08-29 this returned a bare [] when both base refs failed,
+  // which every caller read as "no violations" — a missing staging/main ref
+  // or an unavailable git silently PASSED the story-level gate while the
+  // branch-level twin failed closed on the same condition.
+  it("B0: a diff that never ran is not 'no violations' — the gate fails closed", () => {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), "antfarm-nodiff-"));
+    dirs.push(repo);
+    // A directory that is not a git repo at all: both `staging...` and
+    // `main...` invocations throw.
+    const checked = listProtectedDiffFilesChecked(repo, "deadbeef");
+    assert.equal(checked.ran, false);
+    assert.deepEqual(checked.hits, []);
+    assert.ok(checked.ran === false && checked.error.length > 0, JSON.stringify(checked));
+    // The legacy hits-only wrapper still returns [] — that is exactly why
+    // gate paths must use the checked variant.
+    assert.deepEqual(listProtectedDiffFiles(repo, "deadbeef"), []);
+  });
+
+  it("B0b: a real repo with a clean diff reports ran:true and no hits", () => {
+    const { repo, sha } = makeRepoWithFile("apps/web/page.tsx");
+    const checked = listProtectedDiffFilesChecked(repo, sha);
+    assert.equal(checked.ran, true);
+    assert.deepEqual(checked.hits, []);
   });
 
   it("B1: both present and a clean apps-only diff passes verify", () => {

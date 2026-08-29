@@ -22,12 +22,12 @@ function readFixture(name: string): string {
 }
 
 describe("dispatch scope gate A2 against real TASK fixtures", () => {
-  it("TASK-033 is refused with ci.yml -> .github/workflows/**", () => {
+  it("TASK-033 is refused with ci.yml -> .github/**", () => {
     const gate = evaluateTaskScopeGate(readFixture("TASK-033-ci-typecheck-and-tests.md"));
     assert.equal(gate.skipped, false);
     assert.ok(
       gate.matches.some(
-        (m) => m.path.includes(".github/workflows/ci.yml") && m.pattern === ".github/workflows/**",
+        (m) => m.path.includes(".github/workflows/ci.yml") && m.pattern === ".github/**",
       ),
       JSON.stringify(gate.matches),
     );
@@ -44,18 +44,18 @@ describe("dispatch scope gate A2 against real TASK fixtures", () => {
     );
   });
 
-  it("TASK-038 is refused with workflows -> .github/workflows/**", () => {
+  it("TASK-038 is refused with workflows -> .github/**", () => {
     const gate = evaluateTaskScopeGate(readFixture("TASK-038-ci-dependency-secret-scanning.md"));
     assert.equal(gate.skipped, false);
     assert.ok(
-      gate.matches.some((m) => m.pattern === ".github/workflows/**"),
+      gate.matches.some((m) => m.pattern === ".github/**"),
       JSON.stringify(gate.matches),
     );
     assert.ok(
       gate.matches.some(
         (m) =>
           (m.path.includes(".github/workflows/ci.yml") || m.path.includes(".github/workflows/secret-scan.yml")) &&
-          m.pattern === ".github/workflows/**",
+          m.pattern === ".github/**",
       ),
       JSON.stringify(gate.matches),
     );

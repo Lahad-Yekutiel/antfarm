@@ -1,10 +1,25 @@
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import { getDb } from "../db.js";
+import { resolveAntfarmRoot } from "./paths.js";
 
-const EVENTS_DIR = path.join(os.homedir(), ".openclaw", "antfarm");
-const EVENTS_FILE = path.join(EVENTS_DIR, "events.jsonl");
+/**
+ * Resolved at CALL time, never at module load. resolveAntfarmRoot() reads
+ * OPENCLAW_STATE_DIR from the environment, and several tests mutate that env
+ * var inside before/after hooks (install-overwrite-files, workflow-sync,
+ * workflow-drift) — i.e. after this module is imported. A module-level const
+ * would freeze the wrong path for those and, worse, send every `npm test`
+ * event into the developer's real ~/.openclaw/antfarm/events.jsonl, which is
+ * the primary evidence source for run diagnosis.
+ */
+function eventsDir(): string {
+  return resolveAntfarmRoot();
+}
+
+function eventsFile(): string {
+  return path.join(eventsDir(), "events.jsonl");
+}
+
 const MAX_EVENTS_SIZE = 10 * 1024 * 1024; // 10MB
 
 export type EventType =
@@ -35,17 +50,19 @@ export interface AntfarmEvent {
 
 export function emitEvent(evt: AntfarmEvent): void {
   try {
-    fs.mkdirSync(EVENTS_DIR, { recursive: true });
+    const dir = eventsDir();
+    const file = eventsFile();
+    fs.mkdirSync(dir, { recursive: true });
     // Rotate if too large
     try {
-      const stats = fs.statSync(EVENTS_FILE);
+      const stats = fs.statSync(file);
       if (stats.size > MAX_EVENTS_SIZE) {
-        const rotated = EVENTS_FILE + ".1";
+        const rotated = file + ".1";
         try { fs.unlinkSync(rotated); } catch {}
-        fs.renameSync(EVENTS_FILE, rotated);
+        fs.renameSync(file, rotated);
       }
     } catch {}
-    fs.appendFileSync(EVENTS_FILE, JSON.stringify(evt) + "\n");
+    fs.appendFileSync(file, JSON.stringify(evt) + "\n");
   } catch {
     // best-effort, never throw
   }
@@ -93,7 +110,7 @@ function fireWebhook(evt: AntfarmEvent): void {
 // Read recent events (last N)
 export function getRecentEvents(limit = 50): AntfarmEvent[] {
   try {
-    const content = fs.readFileSync(EVENTS_FILE, "utf-8");
+    const content = fs.readFileSync(eventsFile(), "utf-8");
     const lines = content.trim().split("\n").filter(Boolean);
     const events: AntfarmEvent[] = [];
     for (const line of lines) {
@@ -108,7 +125,7 @@ export function getRecentEvents(limit = 50): AntfarmEvent[] {
 // Read events for a specific run (supports prefix match)
 export function getRunEvents(runId: string, limit = 200): AntfarmEvent[] {
   try {
-    const content = fs.readFileSync(EVENTS_FILE, "utf-8");
+    const content = fs.readFileSync(eventsFile(), "utf-8");
     const lines = content.trim().split("\n").filter(Boolean);
     const events: AntfarmEvent[] = [];
     for (const line of lines) {

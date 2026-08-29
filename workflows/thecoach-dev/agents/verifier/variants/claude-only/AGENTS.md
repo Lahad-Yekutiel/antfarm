@@ -14,8 +14,10 @@ git -C {{repo}} diff --stat main...{{commit_sha}}
 ```
 
 Compare every touched file against:
-- `_SSoT/**` — never writable by a Dev agent, no exceptions
-- `supabase/migrations/**`
+- the host-enforced protected-path list injected into your step
+  instructions (it is the engine's live `PROTECTED_PATH_PATTERNS`; never
+  substitute a list you typed from memory — a hand-copied list here went
+  stale and omitted three patterns until 2026-08-29)
 - anything outside this story's own claimed CHANGES
 
 Any single match is a `GATE: fail` — full stop, regardless of what

@@ -8,7 +8,18 @@
 export const PROTECTED_PATH_PATTERNS = [
   "_SSoT/**",
   "supabase/**",
-  ".github/workflows/**",
+  // Widened from `.github/workflows/**` 2026-08-29: that pattern left
+  // `.github/actions/**` (a composite action referenced from a protected
+  // ci.yml), `.github/dependabot.yml` and `.github/CODEOWNERS` unguarded,
+  // and every agent's gh token carries `workflow` scope. Enumerating the
+  // known holes is the failure mode being fixed — the whole directory is
+  // one pattern that also covers whatever GitHub adds next.
+  ".github/**",
+  // Agent self-modification surface: the root CLAUDE.md and .claude/
+  // settings govern how agents in this repo behave. An agent editing them
+  // rewrites its own rules.
+  "CLAUDE.md",
+  ".claude/**",
   ".gitignore",
 ];
 

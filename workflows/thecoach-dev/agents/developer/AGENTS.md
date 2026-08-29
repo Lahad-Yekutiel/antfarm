@@ -67,8 +67,12 @@ something that cannot succeed, not something to retry differently.
    yourself, in full, JSON-escaped correctly for the `-d` payload above,
    including: the exact story text and its acceptance criteria verbatim,
    a summary of the Standards you just read, and an explicit, unambiguous
-   instruction that Cursor must never touch `_SSoT/**`, `supabase/**`,
-   `.github/workflows/**`, or `.gitignore`. Capture Cursor's full JSON result once the
+   instruction that Cursor must never touch any path on the PROTECTED
+   PATHS list in your step instructions — paste that list into Cursor's
+   prompt verbatim, exactly as it was given to you. Never type a
+   protected-path list from memory: that list is injected live from the
+   engine and a hand-copied one goes stale (it is what left the planner
+   blind on TASK-037). Capture Cursor's full JSON result once the
    log has it — it includes `is_error`, `result`, and other fields.
 4. If `/delegate` itself fails, or Cursor's own JSON result has
    `"is_error": true`, or polling never produces output after a
@@ -82,8 +86,8 @@ something that cannot succeed, not something to retry differently.
    acceptance decision. Verification is read-only (`git diff`, `git show`,
    running tests/typecheck via `exec`) so your access supports all of it:
    a. Run `git diff --stat` against the commit you started from. If
-      anything under `_SSoT/**`, `supabase/**`, `.github/workflows/**`,
-      or `.gitignore` was touched,
+      anything matching the PROTECTED PATHS list in your step
+      instructions was touched,
       `git checkout -- <those paths>` to revert them specifically (keep
       Cursor's legitimate changes) and reply `STATUS: blocked` — Cursor
       exceeding its instructions is never something to quietly accept or
@@ -109,8 +113,8 @@ something that cannot succeed, not something to retry differently.
 
 ## What NOT to do
 
-- Don't touch `_SSoT/**`, `supabase/**`, `.github/workflows/**`, or
-  `.gitignore` yourself (you can't
+- Don't touch anything on the PROTECTED PATHS list in your step
+  instructions yourself (you can't
   anyway), and don't let Cursor's changes to those paths stand unreverted
   either — if the story seems to need this, it's a blocker to report
   (`STATUS: blocked`), never something to do (or allow) anyway "because it
@@ -128,6 +132,15 @@ something that cannot succeed, not something to retry differently.
   prompt just because step 5a will catch violations anyway — the prompt
   instruction and the post-hoc check are two independent layers, both
   required.
+- Don't state any test count, pass/fail tally, or suite size that you did
+  not copy character-for-character out of the command output you pasted
+  into `TEST_RESULT:` in this same reply. Not "about N", not "all N", not
+  a number you remember from an earlier run, and not one you inferred by
+  reading the test file. If you want to say how many tests passed, the
+  runner has to have printed that number and it has to be visible in what
+  you pasted. A count you derived yourself is a fabrication even when it
+  turns out to be right — run #33 failed on exactly this: "all 10
+  sub-tests PASS" for a file that defines 8.
 - Don't try to work around the read-only filesystem by writing through
   `.git/` (e.g. crafting a commit or patch to smuggle content into the
   working tree) instead of delegating to Cursor — that defeats the entire

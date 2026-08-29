@@ -4,9 +4,48 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { getDb } from "../dist/db.js";
 import { claimStep, completeStep, matchOutputFailure } from "../dist/installer/step-ops.js";
 import { getStepFailWhen } from "../dist/installer/workflow-spec.js";
+import { resolveAntfarmRoot } from "../dist/installer/paths.js";
+
+/**
+ * A real, throwaway git repo with a `staging` base and one commit touching an
+ * ordinary application file. The host protected-path gate fails CLOSED when
+ * its `git diff` cannot run at all (2026-08-29), so fixtures that expect the
+ * gate to PASS must give it a diff it can actually compute — a fake
+ * "/tmp/repo" now reads as "the gate could not run", not "nothing matched".
+ */
+let cleanRepoCache: { repo: string; sha: string } | null = null;
+function cleanFixtureRepo(): { repo: string; sha: string } {
+  if (cleanRepoCache) return cleanRepoCache;
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "antfarm-clean-fixture-"));
+  const git = (args: string[]) =>
+    execFileSync("git", args, {
+      cwd: repo,
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: "t",
+        GIT_AUTHOR_EMAIL: "t@example.com",
+        GIT_COMMITTER_NAME: "t",
+        GIT_COMMITTER_EMAIL: "t@example.com",
+      },
+    });
+  git(["init", "-q", "-b", "staging"]);
+  fs.writeFileSync(path.join(repo, "README.md"), "base\n");
+  git(["add", "-A"]);
+  git(["commit", "-qm", "base"]);
+  git(["checkout", "-qb", "feat-x"]);
+  fs.mkdirSync(path.join(repo, "apps", "web"), { recursive: true });
+  fs.writeFileSync(path.join(repo, "apps", "web", "page.tsx"), "export default () => null;\n");
+  git(["add", "-A"]);
+  git(["commit", "-qm", "story"]);
+  const sha = git(["rev-parse", "HEAD"]).trim();
+  cleanRepoCache = { repo, sha };
+  return cleanRepoCache;
+}
 
 describe("completeStep status and contract gates", () => {
   const testRunIds: string[] = [];
@@ -74,8 +113,12 @@ describe("completeStep status and contract gates", () => {
     return { runId, stepDbIds };
   }
 
+  // COMMIT_SHA must be the fixture repo's real head: completeStep copies it
+  // into run context, and the host protected-path gate now fails CLOSED when
+  // its `git diff` cannot run against that sha (2026-08-29). A placeholder sha
+  // used to read as "nothing matched"; it now reads as "the gate could not run".
   const IMPLEMENT_OUTPUT_WITHOUT_GATE =
-    "STATUS: done\nCHANGES: touched packages/check-types/src/type-aliases.ts\nCOMMIT_SHA: abc123def\nTEST_RESULT: 1 pass";
+    `STATUS: done\nCHANGES: touched packages/check-types/src/type-aliases.ts\nCOMMIT_SHA: ${cleanFixtureRepo().sha}\nTEST_RESULT: 1 pass`;
 
   function insertVerifyEachFixture(opts: { verifyMaxRetries?: number } = {}) {
     const storyPk = randomUUID();
@@ -108,7 +151,7 @@ describe("completeStep status and contract gates", () => {
           status: "waiting",
         },
       ],
-      { repo: "/tmp/repo", branch: "feat-x", commit_sha: "abc123def" },
+      { repo: cleanFixtureRepo().repo, branch: "feat-x", commit_sha: cleanFixtureRepo().sha },
     );
     const db = getDb();
     db.prepare(
@@ -439,8 +482,8 @@ describe("completeStep status and contract gates", () => {
     const implement = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepDbIds.implement) as { status: string };
     assert.equal(implement.status, "done");
 
-    const verify = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepDbIds.verify) as { status: string };
-    assert.equal(verify.status, "done");
+    const verify = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(stepDbIds.verify) as { status: string; output: string };
+    assert.equal(verify.status, "done", verify.output);
 
     const pr = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepDbIds.pr) as { status: string };
     assert.equal(pr.status, "pending");
@@ -842,7 +885,9 @@ function dbSetVerifyRunning(verifyDbId: string): void {
 }
 
 function lastRunFailedDetail(runId: string): string | undefined {
-  const eventsFile = path.join(os.homedir(), ".openclaw", "antfarm", "events.jsonl");
+  // Same resolution events.ts uses — under `npm test` this is the per-worker
+  // OPENCLAW_STATE_DIR temp dir, not the developer's real events.jsonl.
+  const eventsFile = path.join(resolveAntfarmRoot(), "events.jsonl");
   if (!fs.existsSync(eventsFile)) return undefined;
   let detail: string | undefined;
   for (const line of fs.readFileSync(eventsFile, "utf8").split("\n")) {
