@@ -1,6 +1,9 @@
 import { describe, it, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { getDb } from "../dist/db.js";
 import { claimStep, completeStep, matchOutputFailure } from "../dist/installer/step-ops.js";
 import { getStepFailWhen } from "../dist/installer/workflow-spec.js";
@@ -572,9 +575,286 @@ describe("completeStep status and contract gates", () => {
     const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
     assert.equal(run.status, "failed");
   });
+
+  it("verifyEach STATUS: fail bounces to implement with STATUS_REASON as verify_feedback, then a corrected attempt completes", () => {
+    const developerAgent = `thecoach-dev_developer-${randomUUID().slice(0, 8)}`;
+    const { runId, stepDbIds } = insertVerifyEachFixture();
+    const db = getDb();
+    db.prepare("UPDATE steps SET agent_id = ?, input_template = ?, max_retries = 2 WHERE id = ?").run(
+      developerAgent,
+      "STORY:\n{{current_story}}\nVERIFY FEEDBACK:\n{{verify_feedback}}\n",
+      stepDbIds.implement,
+    );
+
+    completeStep(stepDbIds.implement, IMPLEMENT_OUTPUT_WITHOUT_GATE);
+    dbSetVerifyRunning(stepDbIds.verify);
+
+    const failOutput = [
+      "GATE: pass",
+      "STATUS: fail",
+      "STATUS_REASON: claimed 10 sub-tests but the file has 8",
+    ].join("\n");
+    const bounce = completeStep(stepDbIds.verify, failOutput);
+
+    assert.equal(bounce.advanced, false);
+    assert.equal(bounce.runCompleted, false);
+
+    const verifyAfterFail = db.prepare("SELECT status, retry_count, output FROM steps WHERE id = ?").get(stepDbIds.verify) as {
+      status: string;
+      retry_count: number;
+      output: string;
+    };
+    assert.equal(verifyAfterFail.status, "waiting");
+    assert.equal(verifyAfterFail.retry_count, 0);
+    assert.equal(verifyAfterFail.output, failOutput);
+
+    const implementAfterFail = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepDbIds.implement) as { status: string };
+    assert.equal(implementAfterFail.status, "pending");
+
+    const storyAfterFail = db.prepare("SELECT status, retry_count FROM stories WHERE run_id = ?").get(runId) as {
+      status: string;
+      retry_count: number;
+    };
+    assert.equal(storyAfterFail.status, "pending");
+    assert.equal(storyAfterFail.retry_count, 1);
+
+    const runAfterFail = db.prepare("SELECT status, context FROM runs WHERE id = ?").get(runId) as {
+      status: string;
+      context: string;
+    };
+    assert.equal(runAfterFail.status, "running");
+    const ctx = JSON.parse(runAfterFail.context) as Record<string, string>;
+    assert.equal(ctx.verify_feedback, "claimed 10 sub-tests but the file has 8");
+
+    const claimed = claimStep(developerAgent);
+    assert.equal(claimed.found, true);
+    assert.ok(claimed.resolvedInput?.includes("claimed 10 sub-tests but the file has 8"));
+
+    completeStep(stepDbIds.implement, IMPLEMENT_OUTPUT_WITHOUT_GATE);
+    dbSetVerifyRunning(stepDbIds.verify);
+    const passed = completeStep(stepDbIds.verify, "GATE: pass\nSTATUS: pass");
+
+    assert.equal(passed.advanced, true);
+    assert.equal(passed.runCompleted, false);
+
+    const runAfterPass = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    assert.equal(runAfterPass.status, "running");
+    const implementDone = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepDbIds.implement) as { status: string };
+    assert.equal(implementDone.status, "done");
+    const pr = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepDbIds.pr) as { status: string };
+    assert.equal(pr.status, "pending");
+  });
+
+  it("verifyEach GATE: fail + STATUS: fail together bounces to implement with both reasons in verify_feedback", () => {
+    const developerAgent = `thecoach-dev_developer-${randomUUID().slice(0, 8)}`;
+    const { runId, stepDbIds } = insertVerifyEachFixture();
+    const db = getDb();
+    db.prepare("UPDATE steps SET agent_id = ?, input_template = ?, max_retries = 2 WHERE id = ?").run(
+      developerAgent,
+      "STORY:\n{{current_story}}\nVERIFY FEEDBACK:\n{{verify_feedback}}\n",
+      stepDbIds.implement,
+    );
+
+    completeStep(stepDbIds.implement, IMPLEMENT_OUTPUT_WITHOUT_GATE);
+    dbSetVerifyRunning(stepDbIds.verify);
+
+    const gateReason = "packages/foo.ts is outside claimed CHANGES";
+    const statusReason = "claimed 10 sub-tests but the file has 8";
+    const failOutput = [
+      "GATE: fail",
+      `GATE_REASON: ${gateReason}`,
+      "STATUS: fail",
+      `STATUS_REASON: ${statusReason}`,
+    ].join("\n");
+    const bounce = completeStep(stepDbIds.verify, failOutput);
+
+    assert.equal(bounce.advanced, false);
+    assert.equal(bounce.runCompleted, false);
+
+    const verifyAfterFail = db.prepare("SELECT status, retry_count FROM steps WHERE id = ?").get(stepDbIds.verify) as {
+      status: string;
+      retry_count: number;
+    };
+    assert.equal(verifyAfterFail.status, "waiting");
+    assert.equal(verifyAfterFail.retry_count, 0);
+
+    const implementAfterFail = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepDbIds.implement) as { status: string };
+    assert.equal(implementAfterFail.status, "pending");
+
+    const storyAfterFail = db.prepare("SELECT status, retry_count FROM stories WHERE run_id = ?").get(runId) as {
+      status: string;
+      retry_count: number;
+    };
+    assert.equal(storyAfterFail.status, "pending");
+    assert.equal(storyAfterFail.retry_count, 1);
+
+    const runAfterFail = db.prepare("SELECT status, context FROM runs WHERE id = ?").get(runId) as {
+      status: string;
+      context: string;
+    };
+    assert.equal(runAfterFail.status, "running");
+    const ctx = JSON.parse(runAfterFail.context) as Record<string, string>;
+    assert.equal(ctx.verify_feedback, `${gateReason}\n${statusReason}`);
+
+    const claimed = claimStep(developerAgent);
+    assert.equal(claimed.found, true);
+    assert.ok(claimed.resolvedInput?.includes(gateReason));
+    assert.ok(claimed.resolvedInput?.includes(statusReason));
+  });
+
+  it("verifyEach does not bleed a stale GATE_REASON into a later GATE: pass bounce", () => {
+    const { runId, stepDbIds, storyPk } = insertVerifyEachFixture();
+    const db = getDb();
+    db.prepare("UPDATE steps SET max_retries = 2 WHERE id = ?").run(stepDbIds.implement);
+
+    completeStep(stepDbIds.implement, IMPLEMENT_OUTPUT_WITHOUT_GATE);
+    dbSetVerifyRunning(stepDbIds.verify);
+    completeStep(
+      stepDbIds.verify,
+      [
+        "GATE: fail",
+        "GATE_REASON: touched packages/unrelated.ts",
+        "STATUS: fail",
+        "STATUS_REASON: test count wrong",
+      ].join("\n"),
+    );
+
+    const afterFirst = JSON.parse(
+      (db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string }).context,
+    ) as Record<string, string>;
+    assert.equal(afterFirst.verify_feedback, "touched packages/unrelated.ts\ntest count wrong");
+
+    db.prepare("UPDATE steps SET current_story_id = ?, status = 'running' WHERE id = ?").run(
+      storyPk,
+      stepDbIds.implement,
+    );
+    completeStep(stepDbIds.implement, IMPLEMENT_OUTPUT_WITHOUT_GATE);
+    dbSetVerifyRunning(stepDbIds.verify);
+    completeStep(
+      stepDbIds.verify,
+      "GATE: pass\nSTATUS: fail\nSTATUS_REASON: still off by one",
+    );
+
+    const afterSecond = JSON.parse(
+      (db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string }).context,
+    ) as Record<string, string>;
+    assert.equal(afterSecond.gate_reason, "touched packages/unrelated.ts");
+    assert.equal(afterSecond.gate, "pass");
+    assert.equal(afterSecond.verify_feedback, "still off by one");
+    assert.equal(afterSecond.verify_feedback.includes("touched packages/unrelated.ts"), false);
+  });
+
+  it("verifyEach empty STATUS_REASON falls through to ISSUES in verify_feedback", () => {
+    const { runId, stepDbIds } = insertVerifyEachFixture();
+    completeStep(stepDbIds.implement, IMPLEMENT_OUTPUT_WITHOUT_GATE);
+    dbSetVerifyRunning(stepDbIds.verify);
+
+    const bounce = completeStep(
+      stepDbIds.verify,
+      "GATE: pass\nSTATUS: fail\nSTATUS_REASON:\nISSUES: tests were not actually run",
+    );
+    assert.equal(bounce.runCompleted, false);
+
+    const db = getDb();
+    const verify = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepDbIds.verify) as { status: string };
+    assert.equal(verify.status, "waiting");
+    const ctxRow = db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string };
+    const ctx = JSON.parse(ctxRow.context) as Record<string, string>;
+    assert.equal(ctx.verify_feedback, "tests were not actually run");
+  });
+
+  it("verifyEach STATUS: fail is capped by implement.max_retries and does not retry verify forever", () => {
+    const { runId, stepDbIds, storyPk } = insertVerifyEachFixture();
+    const db = getDb();
+    db.prepare("UPDATE steps SET max_retries = 2 WHERE id = ?").run(stepDbIds.implement);
+
+    const failOutput = "GATE: pass\nSTATUS: fail\nSTATUS_REASON: still wrong";
+    function completeImplementForStory(): void {
+      db.prepare("UPDATE steps SET current_story_id = ?, status = 'running' WHERE id = ?").run(
+        storyPk,
+        stepDbIds.implement,
+      );
+      completeStep(stepDbIds.implement, IMPLEMENT_OUTPUT_WITHOUT_GATE);
+      dbSetVerifyRunning(stepDbIds.verify);
+    }
+
+    for (let i = 0; i < 2; i++) {
+      completeImplementForStory();
+      const bounce = completeStep(stepDbIds.verify, failOutput);
+      assert.equal(bounce.runCompleted, false, `bounce ${i}`);
+      const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+      assert.equal(run.status, "running", `bounce ${i}`);
+      const verify = db.prepare("SELECT retry_count, status FROM steps WHERE id = ?").get(stepDbIds.verify) as {
+        retry_count: number;
+        status: string;
+      };
+      assert.equal(verify.retry_count, 0, `bounce ${i}`);
+      assert.equal(verify.status, "waiting", `bounce ${i}`);
+    }
+
+    completeImplementForStory();
+    const exhausted = completeStep(stepDbIds.verify, failOutput);
+    assert.equal(exhausted.runCompleted, false);
+
+    const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    assert.equal(run.status, "failed");
+    const story = db.prepare("SELECT status, retry_count FROM stories WHERE run_id = ?").get(runId) as {
+      status: string;
+      retry_count: number;
+    };
+    assert.equal(story.status, "failed");
+    assert.equal(story.retry_count, 3);
+    const verify = db.prepare("SELECT retry_count FROM steps WHERE id = ?").get(stepDbIds.verify) as { retry_count: number };
+    assert.equal(verify.retry_count, 0);
+    assert.equal(lastRunFailedDetail(runId), "Verification retries exhausted: still wrong");
+  });
+
+  it("verifyEach GATE: fail still fails verify itself and does not bounce to implement", () => {
+    const { runId, stepDbIds } = insertVerifyEachFixture({ verifyMaxRetries: 1 });
+    completeStep(stepDbIds.implement, IMPLEMENT_OUTPUT_WITHOUT_GATE);
+    dbSetVerifyRunning(stepDbIds.verify);
+
+    const result = completeStep(
+      stepDbIds.verify,
+      "GATE: fail\nGATE_REASON: _SSoT/CORE.md\nSTATUS: pass",
+    );
+    assert.equal(result.advanced, false);
+
+    const db = getDb();
+    const verify = db.prepare("SELECT status, retry_count FROM steps WHERE id = ?").get(stepDbIds.verify) as {
+      status: string;
+      retry_count: number;
+    };
+    assert.equal(verify.status, "pending");
+    assert.equal(verify.retry_count, 1);
+
+    const implement = db.prepare("SELECT status FROM steps WHERE id = ?").get(stepDbIds.implement) as { status: string };
+    assert.equal(implement.status, "running");
+
+    const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string };
+    assert.equal(run.status, "running");
+  });
 });
 
 function dbSetVerifyRunning(verifyDbId: string): void {
   const db = getDb();
   db.prepare("UPDATE steps SET status = 'running', updated_at = datetime('now') WHERE id = ?").run(verifyDbId);
+}
+
+function lastRunFailedDetail(runId: string): string | undefined {
+  const eventsFile = path.join(os.homedir(), ".openclaw", "antfarm", "events.jsonl");
+  if (!fs.existsSync(eventsFile)) return undefined;
+  let detail: string | undefined;
+  for (const line of fs.readFileSync(eventsFile, "utf8").split("\n")) {
+    if (!line) continue;
+    try {
+      const evt = JSON.parse(line) as { event?: string; runId?: string; detail?: string };
+      if (evt.event === "run.failed" && evt.runId === runId) {
+        detail = evt.detail;
+      }
+    } catch {
+      // skip malformed lines
+    }
+  }
+  return detail;
 }

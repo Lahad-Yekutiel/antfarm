@@ -415,21 +415,49 @@ export async function sendSessionMessage(params: { sessionKey: string; message: 
     // fallback to CLI
   }
 
-  // --- Fallback to CLI ---
+  // --- Fallback to CLI: OpenClaw has no `tool` subcommand. The working
+  // surface is `gateway call sessions.send` (RPC), same family as
+  // `openclaw cron list` / `gateway call cron.list`. ---
   try {
-    await runCli([
-      "tool",
-      "run",
-      "--tool",
-      "sessions_send",
-      "--session",
-      params.sessionKey,
-      "--json",
-      "--message",
-      params.message,
-    ]);
-    return { ok: true };
+    const stdout = await runCli(buildSessionsSendCliArgs(params.sessionKey, params.message));
+    return interpretSessionsSendCliResult(stdout);
   } catch (err) {
     return { ok: false, error: `CLI fallback failed: ${err}. ${UPDATE_HINT}` };
+  }
+}
+
+/** CLI argv for injecting a message into a session via the Gateway RPC. */
+export function buildSessionsSendCliArgs(sessionKey: string, message: string): string[] {
+  return [
+    "gateway",
+    "call",
+    "sessions.send",
+    "--json",
+    "--params",
+    JSON.stringify({ key: sessionKey, message }),
+  ];
+}
+
+export function interpretSessionsSendCliResult(stdout: string): { ok: boolean; error?: string } {
+  const text = (stdout ?? "").trim();
+  if (!text) {
+    return { ok: false, error: "CLI fallback returned empty output" };
+  }
+  try {
+    const parsed = JSON.parse(text) as {
+      ok?: boolean;
+      status?: string;
+      runId?: string;
+      error?: { message?: string; code?: string };
+    };
+    if (parsed.ok === false || parsed.error) {
+      return { ok: false, error: parsed.error?.message ?? "sessions.send returned ok:false" };
+    }
+    if (parsed.ok === true || parsed.runId || parsed.status === "started" || parsed.status === "ok") {
+      return { ok: true };
+    }
+    return { ok: false, error: `sessions.send returned an unrecognized payload: ${text.slice(0, 200)}` };
+  } catch {
+    return { ok: false, error: `CLI fallback returned non-JSON: ${text.slice(0, 200)}` };
   }
 }

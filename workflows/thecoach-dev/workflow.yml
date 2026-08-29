@@ -346,6 +346,9 @@ steps:
       STORY:
       {{current_story}}
 
+      VERIFY FEEDBACK (from the last per-story verify failure; empty if none):
+      {{verify_feedback}}
+
       Read _SSoT/DEV.md's Standards section (RTL/Hebrew, TypeScript strict,
       RLS on every trainer/trainee-scoped table, no magic values, shared
       logic in the shared package) before writing any code. Implement

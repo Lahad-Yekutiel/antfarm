@@ -174,9 +174,17 @@ const DEFAULT_FAIL_WHEN: Record<string, string[]> = {
 /**
  * fail_when (and this default status deny-list) fail the *current* step via
  * failStepSync. That retries THIS step up to max_retries, then fails the run
- * with on_fail.on_exhausted.escalate_to. A real retry-to-earlier-step loop
- * (on_fail.retry_step) is future work — retry_step is declared on
- * WorkflowStepFailure but never implemented.
+ * with on_fail.on_exhausted.escalate_to.
+ *
+ * Exception: a per-story verifyEach verify step whose fail_when hit is a
+ * STATUS verdict (fail/blocked/failed/error) does NOT consume verify retries.
+ * completeStep routes that back to the implement loop (same path as the
+ * historical STATUS: retry bounce) so the developer is re-invoked with
+ * {{verify_feedback}}. GATE: fail + STATUS: pass still fails verify itself
+ * (failure.key === "gate"). GATE: fail + STATUS: fail bounces (status is
+ * first in the effective fail_when map); real protected-path hits are still
+ * hard-blocked by protectedPathStoryDiffFailure. Generic on_fail.retry_step
+ * (retry an arbitrary earlier step) is still unimplemented.
  */
 
 /**
@@ -1235,13 +1243,16 @@ export function completeStep(stepId: string, output: string): { advanced: boolea
     : undefined;
   const failure = matchOutputFailure(parsed, failWhen);
   if (failure && !testFailureMatchesExpectedBaseline(step.step_id, parsed, step.run_id)) {
-    const reason = failureReason(parsed, failure.key);
-    const message = `Agent reported ${failure.key.toUpperCase()}: ${failure.value}. REASON: ${reason}`;
-    const failResult = failStepSync(stepId, message, { stdoutTail: tailOutput(output) });
-    if (failResult.runFailed) {
-      notifyFailureExhausted(step.run_id, step.step_id, message).catch(() => {});
+    const bounceToImplement = failure.key === "status" && findVerifyEachLoopForStep(step.run_id, step.step_id);
+    if (!bounceToImplement) {
+      const reason = failureReason(parsed, failure.key);
+      const message = `Agent reported ${failure.key.toUpperCase()}: ${failure.value}. REASON: ${reason}`;
+      const failResult = failStepSync(stepId, message, { stdoutTail: tailOutput(output) });
+      if (failResult.runFailed) {
+        notifyFailureExhausted(step.run_id, step.step_id, message).catch(() => {});
+      }
+      return { advanced: false, runCompleted: false };
     }
-    return { advanced: false, runCompleted: false };
   }
 
   if (step.step_id === "verify") {
@@ -1357,8 +1368,65 @@ export function completeStep(stepId: string, output: string): { advanced: boolea
   return advancePipeline(step.run_id);
 }
 
+/** STATUS values that bounce a verifyEach verify step back to implement. */
+const VERIFY_EACH_BOUNCE_STATUSES = new Set(["retry", "fail", "failed", "blocked", "error"]);
+
+const VERIFY_EACH_EXHAUSTED_PREFIX = "Verification retries exhausted";
+
+function nonEmptyContextValue(context: Record<string, string>, key: string): string {
+  return context[key]?.trim() || "";
+}
+
 /**
- * Handle verify-each completion: pass or fail the story.
+ * Verifier-stated objection for a bounce or exhaust. Concatenates
+ * gate_reason and status_reason when both are present. gate_reason is
+ * included only when the current attempt's GATE is fail — run context
+ * keys are never cleared, so a prior GATE_REASON would otherwise leak
+ * into a later GATE: pass bounce. Empty strings do not win over later
+ * fallbacks. Does not include raw step output.
+ */
+function verifyEachObjection(context: Record<string, string>): string {
+  const gateFailed = context["gate"]?.toLowerCase() === "fail";
+  const gateReason = gateFailed ? nonEmptyContextValue(context, "gate_reason") : "";
+  const statusReason = nonEmptyContextValue(context, "status_reason");
+  const combined = [gateReason, statusReason].filter((part) => part.length > 0).join("\n");
+  if (combined) return combined;
+  return nonEmptyContextValue(context, "issues") || nonEmptyContextValue(context, "reason");
+}
+
+function verifyEachFeedback(context: Record<string, string>, output: string): string {
+  return verifyEachObjection(context) || output;
+}
+
+function verifyEachExhaustDetail(context: Record<string, string>): string {
+  const objection = verifyEachObjection(context);
+  if (!objection) return VERIFY_EACH_EXHAUSTED_PREFIX;
+  return `${VERIFY_EACH_EXHAUSTED_PREFIX}: ${objection}`;
+}
+
+/**
+ * If `stepId` is the verifyStep of a verifyEach loop on this run, return that
+ * loop step. Used to intercept STATUS: fail before failStepSync retries verify.
+ */
+function findVerifyEachLoopForStep(runId: string, stepId: string): { id: string; max_retries: number } | undefined {
+  const db = getDb();
+  const loopStep = db.prepare(
+    "SELECT id, loop_config, max_retries FROM steps WHERE run_id = ? AND type = 'loop' LIMIT 1"
+  ).get(runId) as { id: string; loop_config: string | null; max_retries: number } | undefined;
+  if (!loopStep?.loop_config) return undefined;
+  try {
+    const lc: LoopConfig = JSON.parse(loopStep.loop_config);
+    if (lc.verifyEach && lc.verifyStep === stepId) {
+      return { id: loopStep.id, max_retries: loopStep.max_retries };
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Handle verify-each completion: pass or bounce the story back to implement.
  */
 function handleVerifyEachCompletion(
   verifyStep: { id: string; run_id: string; step_id: string; step_index: number },
@@ -1369,50 +1437,48 @@ function handleVerifyEachCompletion(
   const db = getDb();
   const status = context["status"]?.toLowerCase();
 
-  // Reset verify step to waiting for next use
+  // Reset verify step to waiting for next use — do not consume verify retries
   db.prepare(
     "UPDATE steps SET status = 'waiting', output = ?, updated_at = datetime('now') WHERE id = ?"
   ).run(output, verifyStep.id);
 
-  if (status !== "retry") {
-    // Verify passed
-    emitEvent({ ts: new Date().toISOString(), event: "story.verified", runId: verifyStep.run_id, workflowId: getWorkflowId(verifyStep.run_id), stepId: verifyStep.step_id });
-  }
-
-  if (status === "retry") {
-    // Verify failed — retry the story
+  if (status && VERIFY_EACH_BOUNCE_STATUSES.has(status)) {
     const lastDoneStory = db.prepare(
       "SELECT id, retry_count, max_retries FROM stories WHERE run_id = ? AND status = 'done' ORDER BY updated_at DESC LIMIT 1"
     ).get(verifyStep.run_id) as { id: string; retry_count: number; max_retries: number } | undefined;
 
     if (lastDoneStory) {
+      const loopMeta = db.prepare(
+        "SELECT max_retries FROM steps WHERE id = ?"
+      ).get(loopStepId) as { max_retries: number } | undefined;
+      const retryCap = loopMeta?.max_retries ?? lastDoneStory.max_retries;
       const newRetry = lastDoneStory.retry_count + 1;
-      if (newRetry > lastDoneStory.max_retries) {
-        // Story retries exhausted — fail everything
+      if (newRetry > retryCap) {
         db.prepare("UPDATE stories SET status = 'failed', retry_count = ?, updated_at = datetime('now') WHERE id = ?").run(newRetry, lastDoneStory.id);
         db.prepare("UPDATE steps SET status = 'failed', failure_cause = ?, updated_at = datetime('now') WHERE id = ?").run(FAILURE_CAUSE_OWN_OUTPUT, loopStepId);
         markRunFailedAndTerminalizeOpenSteps(verifyStep.run_id, loopStepId);
         const wfId = getWorkflowId(verifyStep.run_id);
+        const exhaustDetail = verifyEachExhaustDetail(context);
         emitEvent({ ts: new Date().toISOString(), event: "story.failed", runId: verifyStep.run_id, workflowId: wfId, stepId: verifyStep.step_id });
-        emitEvent({ ts: new Date().toISOString(), event: "run.failed", runId: verifyStep.run_id, workflowId: wfId, detail: "Verification retries exhausted" });
+        emitEvent({ ts: new Date().toISOString(), event: "run.failed", runId: verifyStep.run_id, workflowId: wfId, detail: exhaustDetail });
         scheduleRunCronTeardown(verifyStep.run_id);
+        notifyFailureExhausted(verifyStep.run_id, verifyStep.step_id, exhaustDetail).catch(() => {});
         return { advanced: false, runCompleted: false };
       }
 
-      // Set story back to pending for retry
       db.prepare("UPDATE stories SET status = 'pending', retry_count = ?, updated_at = datetime('now') WHERE id = ?").run(newRetry, lastDoneStory.id);
 
-      // Store verify feedback
-      const issues = context["issues"] ?? output;
+      const issues = verifyEachFeedback(context, output);
       context["verify_feedback"] = issues;
       emitEvent({ ts: new Date().toISOString(), event: "story.retry", runId: verifyStep.run_id, workflowId: getWorkflowId(verifyStep.run_id), stepId: verifyStep.step_id, detail: issues });
       db.prepare("UPDATE runs SET context = ?, updated_at = datetime('now') WHERE id = ?").run(JSON.stringify(context), verifyStep.run_id);
     }
 
-    // Set loop step back to pending for retry
     db.prepare("UPDATE steps SET status = 'pending', updated_at = datetime('now') WHERE id = ?").run(loopStepId);
     return { advanced: false, runCompleted: false };
   }
+
+  emitEvent({ ts: new Date().toISOString(), event: "story.verified", runId: verifyStep.run_id, workflowId: getWorkflowId(verifyStep.run_id), stepId: verifyStep.step_id });
 
   // Verify passed — clear feedback and continue
   delete context["verify_feedback"];
