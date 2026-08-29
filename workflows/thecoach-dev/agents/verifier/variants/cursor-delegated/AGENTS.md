@@ -25,7 +25,8 @@ the call.
 ### 1. Protected-path gate (unconditional, always runs first, always you)
 
 ```
-git -C {{repo}} diff --stat main...{{commit_sha}}
+# staging is what dispatch actually cuts from and merges to in this workflow — never main.
+git -C {{repo}} diff --stat staging...{{commit_sha}}
 ```
 
 Run this yourself and read the actual output yourself — do not delegate

@@ -10,7 +10,8 @@ fixes it next doesn't have to re-derive what's wrong.
 ### 1. Protected-path gate (unconditional, always runs first)
 
 ```
-git -C {{repo}} diff --stat main...{{commit_sha}}
+# staging is what dispatch actually cuts from and merges to in this workflow — never main.
+git -C {{repo}} diff --stat staging...{{commit_sha}}
 ```
 
 Compare every touched file against:
