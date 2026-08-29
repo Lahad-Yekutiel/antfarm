@@ -12,7 +12,8 @@ and establish a baseline.
    `STATUS: blocked` — do not fall back to any other directory, including
    your own agent workspace or Antfarm's own install location. Those are
    never the target repo.
-2. `git fetch origin && git checkout main && git pull`
+2. `git fetch origin && git checkout staging && git pull` — `staging`
+   is what this workflow cuts from and merges back to, never `main`.
 3. `git checkout -b {{branch}}`
 4. Discover build/test commands:
    - Read `package.json` → identify `build`, `test`, `typecheck`, `lint` scripts
@@ -27,7 +28,7 @@ and establish a baseline.
 
 ## Important notes
 
-- If the build or tests fail on `main`, note it in BASELINE **and**
+- If the build or tests fail on `staging`, note it in BASELINE **and**
   in EXPECTED_FAILURES as one `- <command> :: <verbatim error signature>`
   line per known/expected failure (signature copied from the real
   output, not paraphrased). The test step only honours EXPECTED_FAILURES,
