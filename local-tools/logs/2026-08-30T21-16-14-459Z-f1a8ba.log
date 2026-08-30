@@ -1,0 +1,9 @@
+Run: #39 (8b357593-ec8a-45e4-9f8c-326dbae4cc7a)
+Workflow: thecoach-dev
+Task: REPO: /home/lahad/trials/thecoach-antfarm-trial
+BRANCH: feature/promote-design-preview
+
+Promote design-preview to real trainer screens (TASK-025)
+
+Promote the existing design-preview A/C screens (already wired to real auth and real data, per TASK-019/TASK-020) to be the actual production trainer screens: design-preview/{a,c} becomes the real (trainer)/exercises, (trainer)/trainees, (trainer)/workouts routes plus their shared layout, fully replacing the old ad hoc pre-Phase-4A implementations of those three screens. Once promoted, remove the /design-preview route tree entirely (including its preview-only chrome/switcher wiring, but keep the underlying shared component library and design tokens in place since the real routes now depend on them). Cut the work branch from staging — Phase 4A/4B (design system, all three screens in both directions, auth, data layer, favorites migration) was merged into staging via commit 2be5a88 on 2026-08-25, so staging already contains everything this promotion needs; do not target feature/phase4-core-web, which is stale for this purpose.
+Status: running

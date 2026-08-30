@@ -1,0 +1,9 @@
+Run: #22 (4ed08dfb-6221-4848-a21c-8a94d7665bf8)
+Workflow: thecoach-dev
+Task: REPO: /home/lahad/trials/thecoach-antfarm-trial
+BRANCH: feature/thecoach-dev-coordinator-bb8a56facb16
+
+Add security response headers (HSTS, CSP, X-Content-Type-Options, Referrer-Policy, X-Frame-Options)
+
+Configure Next.js (apps/web) so every HTTP response includes: Strict-Transport-Security (HSTS), Content-Security-Policy (CSP), X-Content-Type-Options: nosniff, Referrer-Policy, and X-Frame-Options. Pure Next.js config change (e.g. headers() in next.config.js/middleware) — no product/design judgment call, no build/deploy/secrets involved. Reference topics/SECURITY.md decision 3 for the specific header values/policy the Architect already decided on.
+Status: running

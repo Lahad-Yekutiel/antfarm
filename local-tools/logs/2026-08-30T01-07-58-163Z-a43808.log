@@ -1,0 +1,9 @@
+Run: #36 (fd9e1c3a-b540-4239-9c96-fa05a3342ddc)
+Workflow: thecoach-dev
+Task: REPO: /home/lahad/trials/thecoach-antfarm-trial
+BRANCH: fix/schema-types-drift-check
+
+Schema/types drift check (TASK-026)
+
+Add automated drift detection between the hand-written type contract packages/shared/src/types.ts (used by both apps/web and apps/mobile) and the actual Supabase schema defined in supabase/migrations/**, since nothing today prevents a migration from adding/dropping/renaming a column while all workspaces still typecheck clean. Add an npm run check:types script. Per the 2026-08-29 spec amendment recorded in developer_todo.json TODO-0017, the design must be a static parse of the migration files (no dependency on a live local Supabase instance) rather than the original 'supabase gen types typescript --local' approach. Schema and types are in sync today, so this check should be added now to lock in that baseline as the enforced starting point. TASK-034 (the engine-side verify-step bug that caused two earlier failed dispatch attempts) is fixed and confirmed live, and the coordinator-dispatch-ledger entry for TASK-026 has been cleared (TODO-0017, resolved 2026-08-29) — no outstanding blocker remains.
+Status: running

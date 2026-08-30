@@ -1,0 +1,9 @@
+Run: #31 (b7bde191-063f-492a-a0f3-071e0c5eeca4)
+Workflow: thecoach-dev
+Task: REPO: /home/lahad/trials/thecoach-antfarm-trial
+BRANCH: fix/review-delegation-wrapper
+
+TASK-023: Review delegate-to-claude.ps1 against TOOLING.md rules and commit findings
+
+Review the already-committed `tools/delegate-to-claude.ps1` (landed in commit 6ff473d, now on `staging` via merge 2be5a88) against the requirements in `topics/TOOLING.md`: (1) correct implementation of the three Specialist modes, (2) the no-API-key rule is enforced, (3) the CLAUDE.md identity override is applied, (4) the new ASCII-only rule is followed. Fix any deviations found in the script, then commit the corrected version. Debug-junk half of this task (_antfarm_debug_v6/** removal) is already done by hand; only the script review/fix remains.
+Status: running

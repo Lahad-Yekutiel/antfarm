@@ -1,0 +1,7 @@
+Run: #13 (5a47148f-f5dc-4d5e-8b03-7d65fd0bbc38)
+Workflow: thecoach-dev
+Task: REPO: /home/lahad/trials/thecoach-antfarm-trial
+BRANCH: feature/thecoach-dev-coordinator-963697689ff2
+
+On branch <BRANCH>, add a one-line Markdown HTML comment to the bottom of root README.md noting the coordinator queue's first successful dispatch, dated 2026-08-24. Docs-only, no code changes. Do not modify anything under _SSoT/** or supabase/**.
+Status: running

@@ -1,0 +1,11 @@
+[Unit]
+Description=Check coordinator Cloudflare tunnel every minute for 530/1033
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=15s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

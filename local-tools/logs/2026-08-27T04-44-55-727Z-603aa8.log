@@ -1,0 +1,9 @@
+Run: #25 (13f7c5b9-dd62-4d99-ba5a-6575ce091bc3)
+Workflow: thecoach-dev
+Task: REPO: /home/lahad/trials/thecoach-antfarm-trial
+BRANCH: feature/thecoach-dev-coordinator-db00d4dd7230
+
+RLS defense-in-depth: column grants + policy-column indexes (TASK-037)
+
+Add additive hardening on top of the existing row-level security policies: (1) column-level grants restricting direct table access to only the columns each role actually needs, and (2) indexes on the columns referenced by RLS policy predicates (policy-column indexes) across the RLS-protected tables (trainers, trainees, exercises, workouts, workout-exercise joins, trainee-assigned instances, form templates/responses, session history, weight history, favorites). This is purely additive — no existing RLS policy logic changes. Route to Claude Code per topics/TOOLING.md's routing rule (touches RLS/grants directly, security-boundary work). Full spec: topics/SECURITY.md decision 1.
+Status: running

@@ -1,0 +1,9 @@
+Run: #35 (f2a003f1-32d8-4748-b571-16e3ec683a2f)
+Workflow: thecoach-dev
+Task: REPO: /home/lahad/trials/thecoach-antfarm-trial
+BRANCH: fix/schema-types-drift-check
+
+Schema/types drift check (TASK-026)
+
+Add an automated check that verifies packages/shared/src/types.ts (the hand-written type contract shared by apps/web and apps/mobile) stays in sync with the actual database schema defined in supabase/migrations/**. Wire it up as `npm run check:types`. Per the 2026-08-29 spec amendment, use a static migration-parsing design (parse the migration files directly) rather than depending on a live/local Supabase instance, dropping the earlier local-Supabase dependency. The check should fail if a migration adds, drops, or renames a column that isn't reflected in types.ts. Schema and types are currently in sync, so this run establishes the passing baseline.
+Status: running

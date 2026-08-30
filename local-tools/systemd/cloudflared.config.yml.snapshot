@@ -1,0 +1,7 @@
+tunnel: c3034448-6606-4014-84e4-63c6639fdeea
+credentials-file: /etc/cloudflared/c3034448-6606-4014-84e4-63c6639fdeea.json
+metrics: 127.0.0.1:20241
+ingress:
+  - hostname: coordinator.lahadyekutiel.com
+    service: http://127.0.0.1:3335
+  - service: http_status:404

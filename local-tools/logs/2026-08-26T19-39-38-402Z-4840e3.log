@@ -1,0 +1,9 @@
+Run: #24 (41b2b5a1-1d15-42e5-8e52-9e7699b11992)
+Workflow: thecoach-dev
+Task: REPO: /home/lahad/trials/thecoach-antfarm-trial
+BRANCH: feature/thecoach-dev-coordinator-77ccac523922
+
+Proof-dispatch for nested-GATE recovery (TASK-041)
+
+On branch <BRANCH>, add a one-line Markdown HTML comment to the bottom of root README.md noting the verify nested-GATE recovery (antfarm b900bd2), dated 2026-08-26. Docs-only, no code changes. Do not modify anything under _SSoT/** or supabase/**.
+Status: running

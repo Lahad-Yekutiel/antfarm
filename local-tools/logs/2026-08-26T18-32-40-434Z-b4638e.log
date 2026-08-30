@@ -1,0 +1,13 @@
+Run: #23 (466ad5d1-51d8-4061-9f2c-56437146c0af)
+Workflow: thecoach-dev
+Task: REPO: /home/lahad/trials/thecoach-antfarm-trial
+BRANCH: feature/thecoach-dev-coordinator-806f7a733b57
+
+Add root-level verification entrypoints (TASK-027)
+
+From the repo root, npm test, npm run build and npm run verify each do the obvious thing across every workspace, so that a Dev agent or the tester step landing at repo root can actually invoke them. Add to root package.json only:
+- "test": "npm run test --workspaces --if-present"
+- "build": "npm run build --workspaces --if-present"
+- "verify": "npm run typecheck && npm test"
+Document all three in CONTRIBUTING.md (apps/web or root — one location). Do not modify workspace package.json files or package-lock.json. next build is expected to fail on the known OQ-09 /404 prerender (TASK-024) — that failure is correct and must not be papered over. Scripts-only, three lines, no product/UI changes.
+Status: running

@@ -1,0 +1,7 @@
+Run: #14 (884f22a6-beae-4a59-b3a3-3ada91900d4f)
+Workflow: thecoach-dev
+Task: REPO: /home/lahad/trials/thecoach-antfarm-trial
+BRANCH: feature/thecoach-dev-coordinator-82bbe00f38c6
+
+On branch <BRANCH>, add a one-line Markdown HTML comment to the bottom of root README.md noting the coordinator delegation fix and service hardening, dated 2026-08-24. Docs-only, no code changes. Do not modify anything under _SSoT/** or supabase/**.
+Status: running

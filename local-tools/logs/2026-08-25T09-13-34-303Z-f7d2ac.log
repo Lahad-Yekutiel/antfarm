@@ -1,0 +1,9 @@
+Run: #15 (5b8eae17-f5c3-45f2-ae60-d8320dc08b67)
+Workflow: thecoach-dev
+Task: REPO: /home/lahad/trials/thecoach-antfarm-trial
+BRANCH: feature/thecoach-dev-coordinator-a5e4d352f231
+
+Fix corrupted Hebrew text on Customized records (trainer web app)
+
+On feature/phase4-core-web, fix the confirmed bug causing corrupted Hebrew text rendering for Customized exercise/workout records in the trainer web app. Repro and details are in _SSoT/NEEDS_FIXING.md §2 (found during the 2026-08-09 repo audit). Scope this fix only — do not touch the email/password vs Google Sign-In auth work (blocked on OQ-12, not yet decided) and do not merge the branch; just land and verify this specific text-corruption fix, confirming Hebrew/RTL renders correctly for affected Customized records afterward.
+Status: running

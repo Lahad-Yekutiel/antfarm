@@ -1,0 +1,9 @@
+Run: #19 (f6023d53-691b-489e-a2df-fdb19cee92d4)
+Workflow: thecoach-dev
+Task: REPO: /home/lahad/trials/thecoach-antfarm-trial
+BRANCH: feature/thecoach-dev-coordinator-a0cda1a945ca
+
+Add root package.json test/build/verify scripts
+
+Root package.json currently has no `test` and no `build` script, so `npm test`/`npm run build` run from the repo root (where Dev agents and the antfarm tester step actually land) do nothing, even though `apps/web` already has a real `node --test` suite. Add root-level `test`, `build`, and `verify` scripts that invoke the real per-workspace checks (e.g. delegate to `apps/web`'s existing test/build scripts). Scripts-only change, three lines; do not touch any workspace package.json files.
+Status: running

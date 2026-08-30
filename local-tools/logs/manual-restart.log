@@ -1,0 +1,14 @@
+Coordinator trigger server: http://127.0.0.1:3335
+Antfarm root: /home/lahad/.openclaw/workspace/antfarm
+Antfarm CLI: /home/lahad/.openclaw/workspace/antfarm/dist/cli/cli.js
+Antfarm DB (read-only): /home/lahad/.openclaw/antfarm/antfarm.db
+Queue file: /home/lahad/.openclaw/workspace/antfarm/local-tools/coordinator-queue.json
+TheCoach repo (roadmap + todo): /mnt/c/Users/lahad/Projects/TheCoach
+Logs: /home/lahad/.openclaw/workspace/antfarm/local-tools/logs
+Coordinator trigger server: http://127.0.0.1:3335
+Antfarm root: /home/lahad/.openclaw/workspace/antfarm
+Antfarm CLI: /home/lahad/.openclaw/workspace/antfarm/dist/cli/cli.js
+Antfarm DB (read-only): /home/lahad/.openclaw/antfarm/antfarm.db
+Queue file: /home/lahad/.openclaw/workspace/antfarm/local-tools/coordinator-queue.json
+TheCoach repo (roadmap + todo): /mnt/c/Users/lahad/Projects/TheCoach
+Logs: /home/lahad/.openclaw/workspace/antfarm/local-tools/logs

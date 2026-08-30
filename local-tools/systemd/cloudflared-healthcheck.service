@@ -1,0 +1,8 @@
+[Unit]
+Description=Cloudflare tunnel 530/1033 healthcheck
+After=network-online.target cloudflared.service
+Wants=cloudflared.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/lahad/.openclaw/workspace/antfarm/local-tools/cloudflared-healthcheck.sh

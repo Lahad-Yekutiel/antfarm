@@ -1,0 +1,9 @@
+Run: #17 (be32f721-c020-4e59-af0c-9e73dec09ef7)
+Workflow: thecoach-dev
+Task: REPO: /home/lahad/trials/thecoach-antfarm-trial
+BRANCH: feature/thecoach-dev-coordinator-db5c8245ebc4
+
+Promote design-preview to real trainer screens (TASK-025)
+
+On branch feature/phase4-core-web, replace the old ad hoc pre-Phase-4A trainer screens with the existing design-preview/{a,c} implementations (already wired to real auth/data). design-preview/a and design-preview/c plus their shared layout become the actual (trainer)/exercises, (trainer)/trainees, and (trainer)/workouts routes and layout, fully replacing the old implementations. Remove /design-preview entirely once promoted. Do not merge or target staging directly — that branch's merge to staging remains gated on OQ-12 (Google Sign-In) and is unchanged by this task.
+Status: running

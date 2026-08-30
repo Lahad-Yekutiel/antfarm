@@ -33,7 +33,8 @@ Step 4 — MANDATORY: Report completion (do this IMMEDIATELY after finishing the
 cat <<'ANTFARM_EOF' > /tmp/antfarm-step-output.txt
 STATUS: done
 CHANGES: what you did
-TESTS: what tests you ran
+TEST_RESULT: output from running tests
+COMMIT_SHA: <commit hash, if applicable>
 ANTFARM_EOF
 cat /tmp/antfarm-step-output.txt | node ${cli} step complete "<stepId>"
 \`\`\`
@@ -63,14 +64,17 @@ The claimed step JSON is provided below. It contains: {"stepId": "...", "runId":
 Save the stepId — you'll need it to report completion.
 The "input" field contains your FULLY RESOLVED task instructions. Read it carefully and DO the work.
 
-Do the work described in the input. Format your output with KEY: value lines as specified.
+Do the work described in the input. Format your output with KEY: value lines as specified in the input.
+
+If this role has a CRON.md file in your workspace, read it now — it contains role-specific step-completion instructions that override this generic template. Otherwise, follow the template below.
 
 MANDATORY: Report completion (do this IMMEDIATELY after finishing the work):
 \`\`\`
 cat <<'ANTFARM_EOF' > /tmp/antfarm-step-output.txt
 STATUS: done
 CHANGES: what you did
-TESTS: what tests you ran
+TEST_RESULT: output from running tests
+COMMIT_SHA: <commit hash, if applicable>
 ANTFARM_EOF
 cat /tmp/antfarm-step-output.txt | node ${cli} step complete "<stepId>"
 \`\`\`

@@ -1,0 +1,9 @@
+Run: #21 (b72b0d03-b224-47f6-8433-ef64f4ad2ef0)
+Workflow: thecoach-dev
+Task: REPO: /home/lahad/trials/thecoach-antfarm-trial
+BRANCH: feature/thecoach-dev-coordinator-6814157c8285
+
+Fix next build failure on /404 prerender (React 19 web vs React 18 mobile workspace split)
+
+apps/web's `next build` currently fails while prerendering the /404 page, caused by a React version mismatch between the web workspace (React 19) and the mobile workspace (React 18) in this monorepo. `next dev` is unaffected. Diagnose and fix the workspace/dependency resolution so `next build` completes successfully for apps/web (e.g. correct hoisting/resolution of React versions per workspace, or an explicit override/alias so the web build resolves React 19 consistently), without touching the mobile app's own React 18 requirement. No deploy step, no Vercel setup, no CI changes — this is purely making the local `next build` succeed. Verify with an actual `next build` run in apps/web after the fix (build must exit 0), plus existing typecheck/test suites still passing.
+Status: running

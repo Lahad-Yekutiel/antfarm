@@ -1,0 +1,9 @@
+Run: #28 (62ed6ddb-d0be-4e47-a502-bd00791b4e0e)
+Workflow: thecoach-dev
+Task: REPO: /home/lahad/trials/thecoach-antfarm-trial
+BRANCH: feature/promote-design-preview
+
+Promote design-preview to real trainer screens (TASK-025)
+
+Replace the old ad hoc pre-Phase-4A trainer screen implementations by promoting apps/web/app/design-preview/{a,c} (already wired to real auth/data, same as the real (trainer)/* routes) into the actual (trainer)/exercises, (trainer)/trainees, (trainer)/workouts routes plus the shared layout. /design-preview stops existing after this. Branch base is staging (Phase 4A/4B was merged into staging on 2026-08-25, commit 2be5a88), which resolves the prior run #17 failure caused by dispatching from a base branch that lacked design-preview/_shared. No open design decision remains — direction (both A and C kept, C default) was already decided 2026-08-11 and Phase 4A's exit criteria were signed off 2026-08-25.
+Status: running

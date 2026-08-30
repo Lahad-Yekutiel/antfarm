@@ -1,0 +1,9 @@
+Run: #18 (c9c594ed-c69b-4bed-9b82-d30727030395)
+Workflow: thecoach-dev
+Task: REPO: /home/lahad/trials/thecoach-antfarm-trial
+BRANCH: feature/thecoach-dev-coordinator-0cffd788bf99
+
+Schema/types drift check (TASK-026)
+
+Add a `npm run check:types` script that verifies packages/shared/src/types.ts (the hand-written type contract for apps/web and apps/mobile) stays in sync with supabase/migrations/**, so a migration adding/dropping/renaming a column gets caught instead of silently passing typecheck everywhere. Must run against local Supabase only (no CI, no hosted DB). Schema and types are confirmed in sync on both main and staging today, so this locks in the correct baseline. Scripts/tooling only — no product screens touched.
+Status: running

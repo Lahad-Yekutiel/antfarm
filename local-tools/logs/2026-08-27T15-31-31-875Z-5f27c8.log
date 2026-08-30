@@ -1,0 +1,9 @@
+Run: #26 (ff8620b6-4dd8-45f3-bcee-a45f7fc43855)
+Workflow: thecoach-dev
+Task: REPO: /home/lahad/trials/thecoach-antfarm-trial
+BRANCH: feat/ci-typecheck-and-tests
+
+Add CI workflow: typecheck + tests on PRs into staging (TASK-033)
+
+Create a GitHub Actions workflow file (e.g. .github/workflows/ci.yml) that runs on every pull request targeting the `staging` branch: run the existing typecheck script and the apps/web test suite (node --test). Workflow file only ? no deployment step, no secrets, no build step (next build is known-broken per OQ-09 and is out of scope). This provides the independent, non-self-reported verification layer TESTING_PROCESS.md Layer 1.5 calls for, given branch protection itself is unavailable on the current plan (OQ-14).
+Status: running

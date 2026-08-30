@@ -1,0 +1,168 @@
+{
+  "TASK-026": {
+    "key": "TASK-026",
+    "lastDispatchedAt": "2026-08-30T01:07:58.417Z",
+    "runId": "fd9e1c3a-b540-4239-9c96-fa05a3342ddc",
+    "queueItemId": "fc39f0ceb40c",
+    "outcome": "failed",
+    "runStatus": "failed",
+    "queueStatus": "failed",
+    "outcomeAt": "2026-08-30T04:07:01.814Z",
+    "roadmap_ref": "Phase 9 — Testing, QA & Security Hardening: 'Schema/types drift check (TASK-026, added 2026-08-25)'",
+    "cleared": true,
+    "clearedAt": "2026-08-30T12:14:16Z",
+    "clearedReason": "cleared 2026-08-30 — TASK-026 PR #22 merged into staging as commit f355fc6 after five independent review rounds; final fix f7d35d1 (fail loudly on unrecognized ALTER TABLE statements, per the task's own edge-case requirement). Stuck-review loop (TODO-0023) superseded, not separately fixed. autoRetry reset (attempts/parked/history) for a fresh automatic cycle. Last-run history (runId/queueItemId) kept. Not dispatched — loop or dispatch-next picks it up.",
+    "diagnosisStartedAt": null,
+    "autoRetry": {
+      "attempts": 0,
+      "cap": 2,
+      "parked": false,
+      "parkedReason": null,
+      "lastDiagnosis": null,
+      "history": []
+    }
+  },
+  "TASK-027": {
+    "lastDispatchedAt": "2026-08-30T17:31:00.597Z",
+    "runId": "3fa68c53-0a44-4787-9032-97283ef79d04",
+    "queueItemId": "2d3082776296",
+    "outcome": "retry-pending",
+    "roadmap_ref": null,
+    "key": "TASK-027",
+    "cleared": false,
+    "runStatus": "failed",
+    "queueStatus": "failed",
+    "outcomeAt": "2026-08-30T19:00:34.316Z",
+    "clearedAt": "2026-08-29T16:14:33Z",
+    "clearedReason": "resolved 2026-08-29 — blocking gate-parse bug fixed by cec1ac8 in the antfarm engine repo (not TheCoach). Blocked ledger entry is stale. History kept. Not live-dispatched — loop remains paused.",
+    "autoRetry": {
+      "attempts": 1,
+      "cap": 2,
+      "parked": false,
+      "parkedReason": null,
+      "lastDiagnosis": {
+        "class": "transient",
+        "reason": "the protected-path gate itself failed to run (git ref missing/unresolvable, or git diff threw) — not a protected-path hit",
+        "evidence": "protected-path gate-run-failure signature \"protected_path_gate_missing_context\" in step output",
+        "retry_guidance": "",
+        "at": "2026-08-30T19:00:34.330Z"
+      },
+      "history": [
+        {
+          "at": "2026-08-30T19:00:34.330Z",
+          "runId": "3fa68c53-0a44-4787-9032-97283ef79d04",
+          "branch": "fix/root-verification-entrypoints",
+          "class": "transient",
+          "reason": "the protected-path gate itself failed to run (git ref missing/unresolvable, or git diff threw) — not a protected-path hit",
+          "diffHash": "0915dd2ffe7a9926d8769f53cdfcfe83da32e75b468605523341a9d0f47235e4"
+        }
+      ]
+    },
+    "diagnosisStartedAt": null
+  },
+  "TASK-033": {
+    "lastDispatchedAt": "2026-08-27T15:31:32.128Z",
+    "runId": "ff8620b6-4dd8-45f3-bcee-a45f7fc43855",
+    "queueItemId": "f91a4585d718",
+    "outcome": "failed",
+    "roadmap_ref": null,
+    "key": "TASK-033",
+    "cleared": true,
+    "clearedAt": "2026-08-28T05:20:00Z",
+    "clearedReason": "resolved 2026-08-28 — task marked Dispatch: manual, developer-run",
+    "runStatus": "failed",
+    "queueStatus": "failed",
+    "outcomeAt": "2026-08-27T15:48:09.030Z"
+  },
+  "TASK-024": {
+    "lastDispatchedAt": "2026-08-26T10:34:56.191Z",
+    "runId": "b72b0d03-b224-47f6-8433-ef64f4ad2ef0",
+    "queueItemId": "6814157c8285",
+    "outcome": "failed",
+    "roadmap_ref": "Phase 10 — Deployment & Launch Prep: 'OQ-09 fix (TASK-024, added 2026-08-25): next build currently fails on the /404 prerender (React 19 web vs React 18 mobile workspace split). Not urgent... but well-defined and safe to bank ahead of Phase 10. Ready to dispatch anytime, no developer judgment call needed.'",
+    "key": "TASK-024",
+    "cleared": false,
+    "runStatus": "failed",
+    "queueStatus": "done",
+    "outcomeAt": "2026-08-26T12:24:56.237Z"
+  },
+  "TASK-036": {
+    "lastDispatchedAt": "2026-08-26T16:53:17.596Z",
+    "runId": "4ed08dfb-6221-4848-a21c-8a94d7665bf8",
+    "queueItemId": "bb8a56facb16",
+    "outcome": "failed",
+    "roadmap_ref": "Phase 9 — Testing, QA & Security Hardening: 'Security response headers (TASK-036, added 2026-08-26): HSTS, CSP, X-Content-Type-Options: nosniff, Referrer-Policy, X-Frame-Options on every response. Zero product/design judgment call — pure Next.js config, ready to dispatch now.'",
+    "key": "TASK-036",
+    "cleared": true,
+    "runStatus": "failed",
+    "queueStatus": "failed",
+    "outcomeAt": "2026-08-26T18:34:00.390Z",
+    "clearedAt": "2026-08-29T16:14:33Z",
+    "clearedReason": "resolved 2026-08-29 — CSP fix merged to staging (694c9d8, PR #12). Blocked ledger entry is stale. History kept. Not live-dispatched — loop remains paused."
+  },
+  "TASK-041": {
+    "lastDispatchedAt": "2026-08-26T19:39:38.655Z",
+    "runId": "41b2b5a1-1d15-42e5-8e52-9e7699b11992",
+    "queueItemId": "77ccac523922",
+    "outcome": "completed",
+    "roadmap_ref": null,
+    "key": "TASK-041",
+    "cleared": false,
+    "runStatus": "completed",
+    "queueStatus": "done",
+    "outcomeAt": "2026-08-27T04:33:45.147Z"
+  },
+  "TASK-037": {
+    "lastDispatchedAt": "2026-08-27T04:44:55.979Z",
+    "runId": "13f7c5b9-dd62-4d99-ba5a-6575ce091bc3",
+    "queueItemId": "db00d4dd7230",
+    "outcome": "failed",
+    "roadmap_ref": "Phase 9 — Testing, QA & Security Hardening: 'RLS defense-in-depth: column grants + policy-column indexes (TASK-037, added 2026-08-26): additive hardening on top of the existing row policies — no policy logic changes. Ready to dispatch now.' Confirmed still ready and never-attempted per 2026-08-27 session note: 'the coordinator can pick up genuinely new, never-attempted ready items (e.g. TASK-037, TASK-038, TASK-039) on its normal schedule.'",
+    "key": "TASK-037",
+    "cleared": true,
+    "clearedAt": "2026-08-28T05:20:00Z",
+    "clearedReason": "resolved 2026-08-28 — task marked Dispatch: manual, developer-run",
+    "runStatus": "failed",
+    "queueStatus": "failed",
+    "outcomeAt": "2026-08-27T05:52:31.321Z"
+  },
+  "TASK-025": {
+    "lastDispatchedAt": "2026-08-29T20:51:16.042Z",
+    "runId": "5e8f96d5-28d9-4de0-b2c2-b4acf35d8b65",
+    "queueItemId": "f124c121bfb5",
+    "outcome": "failed",
+    "roadmap_ref": "Phase 4A — 'Promote design-preview to real screens (TASK-025, added 2026-08-25)' — 'Re-dispatch ready (updated 2026-08-25, after a failed first attempt)... Ready to dispatch, no developer judgment call needed.'",
+    "key": "TASK-025",
+    "cleared": true,
+    "runStatus": "failed",
+    "queueStatus": "failed",
+    "outcomeAt": "2026-08-29T22:06:47.206Z",
+    "cancelledAt": "2026-08-28T16:01:58.000Z",
+    "cancelledReason": "Run #28 (62ed6ddb) cancelled by operator 2026-08-28 via `antfarm workflow stop 62ed6ddb` (engine path: stopWorkflow → runs.status=cancelled, 7 open steps failed 'Cancelled by user'). Killed because the unbounded developer sandbox (openclaw-sbx-agent-thecoach-dev_developer-ad5d0010) grew to ~13 GiB and OOM'd the WSL VM repeatedly; medic re-dispatched TASK-025-S03 into the same container (abandon 3/5, including 18:10:24 after the loop pause). Do NOT redispatch until the developer decides TASK-025 disposition (standing niggle: coordinator 'done' with no landed deliverable / no PR). Stories S01–S02 were marked done inside the run; S03–S09 never landed.",
+    "clearedAt": "2026-08-30T06:51:52Z",
+    "clearedReason": "cleared 2026-08-30 — TASK-025 COMMIT_SHA protected-path-gate mishandling is fixed and live (18fed76 on backup/thecoach-reliability-patch). Developer decision: redispatch as-is, no re-scope. autoRetry reset (attempts/parked/history) for a fresh automatic cycle. Last-run history (runId/queueItemId) kept. Not dispatched — loop or dispatch-next picks it up.",
+    "autoRetry": {
+      "attempts": 0,
+      "cap": 2,
+      "parked": false,
+      "parkedReason": null,
+      "lastDiagnosis": null,
+      "history": []
+    },
+    "diagnosisStartedAt": null
+  },
+  "TASK-023": {
+    "lastDispatchedAt": "2026-08-29T05:07:43.175Z",
+    "runId": "bfaaa2f8-f443-4919-9e5d-755c34016fb2",
+    "queueItemId": "1245b044f628",
+    "outcome": "failed",
+    "roadmap_ref": "Phase 4B — Housekeeping (TASK-023, added 2026-08-25; scope halved 2026-08-25, ready to dispatch, no developer judgment call needed)",
+    "key": "TASK-023",
+    "cleared": true,
+    "clearedAt": "2026-08-29T08:14:40Z",
+    "clearedReason": "cleared 2026-08-29 after run #33 (bfaaa2f8 / queue 1245b044f628) verify-retry bounce + sessions.send escalation transport landed in antfarm dist on thecoach-reliability-patch (CURSOR_HANDOFF_2026-08-29_RUN33_VERIFY_RETRY_AND_ESCALATION_FIX). History kept. Not live-dispatched — loop remains paused.",
+    "runStatus": "failed",
+    "queueStatus": "failed",
+    "outcomeAt": "2026-08-29T05:51:15.942Z"
+  }
+}
