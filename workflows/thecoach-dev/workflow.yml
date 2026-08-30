@@ -121,6 +121,7 @@ agents:
         AGENTS.md: agents/developer/AGENTS.md
         SOUL.md: agents/developer/SOUL.md
         IDENTITY.md: agents/developer/IDENTITY.md
+        CRON.md: agents/developer/CRON.md
 
   - id: verifier
     name: Verifier

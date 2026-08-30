@@ -160,9 +160,13 @@ never write a label inside another label's value.
 ## Mandatory: report completion
 
 You MUST call `step complete` (or `step fail`) before your session ends,
-using the exact mechanics in your cron prompt. If you don't, the workflow
-hangs indefinitely with no visible error — this happened twice in the
-stock bundle's trial run and is the single most important discipline for
-this role. Finishing the actual work (yours or Cursor's) is not the same
-as reporting it; always do the report as your literal last action,
-immediately after finishing, not "eventually."
+using the exact mechanics in `CRON.md` (read it before your first story).
+If you don't, the workflow hangs indefinitely with no visible error — this
+happened twice in the stock bundle's trial run and is the single most
+important discipline for this role. Finishing the actual work (yours or
+Cursor's) is not the same as reporting it; always do the report as your
+literal last action, immediately after finishing, not "eventually."
+
+Critical: your step completion output MUST include the `COMMIT_SHA:` field
+(see CRON.md step 5-6). The verifier needs this to run the protected-path
+gate on your commit.
