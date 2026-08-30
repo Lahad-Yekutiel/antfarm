@@ -220,6 +220,55 @@ export const ENGINE_ERROR_PROTECTED_PATH_MISSING_CONTEXT =
   "ENGINE_ERROR: protected_path_gate_missing_context";
 export const ENGINE_ERROR_PROTECTED_PATH_GIT_FAILED = "ENGINE_ERROR: protected_path_gate_git_failed";
 
+/** Git object names are 7–40 hex chars. Leading token only — trailing commentary is not a ref. */
+const GIT_SHA_LEADING_TOKEN_RE = /^[0-9a-f]{7,40}(?![0-9a-f\-\/_])/i;
+
+export type SanitizedCommitSha = {
+  sha: string | null;
+  truncated: boolean;
+};
+
+/**
+ * Extract the leading hex SHA from a COMMIT_SHA value so it can be used as a
+ * git ref. Trailing commentary (TASK-025: `c511270 (with parent ...)`) is a
+ * developer-contract violation the engine now tolerates at the write site
+ * (runs.context.commit_sha) and as defence-in-depth at git-ref use sites;
+ * parsing of the KEY: line is unchanged.
+ *
+ * Token must be 7–40 hex chars, not followed by more hex or a ref-name
+ * continuation (`-` `/` `_`). Punctuation/paren commentary is tolerated
+ * (`c511270,` / `c511270(with parent)`). No token → missing commit_sha.
+ */
+export function sanitizeCommitShaForGitRef(raw: string | undefined): SanitizedCommitSha {
+  if (typeof raw !== "string") return { sha: null, truncated: false };
+  const trimmed = raw.trim();
+  if (!trimmed) return { sha: null, truncated: false };
+  const match = trimmed.match(GIT_SHA_LEADING_TOKEN_RE);
+  if (!match) return { sha: null, truncated: false };
+  const sha = match[0].toLowerCase();
+  const truncated = trimmed.length > sha.length;
+  return { sha, truncated };
+}
+
+function logCommitShaTruncation(original: string, sha: string): void {
+  logger.info(
+    `Sanitized commit_sha for git ref: kept ${sha}, dropped trailing commentary (developer contract: COMMIT_SHA must be a bare SHA). original=${JSON.stringify(original)} sanitized=${sha}`,
+  );
+}
+
+/** Store the bare SHA in context; keep the raw string when commentary was dropped. */
+function applySanitizedCommitShaToContext(context: Record<string, string>): void {
+  const raw = context.commit_sha;
+  if (typeof raw !== "string") return;
+  const resolved = sanitizeCommitShaForGitRef(raw);
+  if (!resolved.sha) return;
+  if (resolved.truncated) {
+    logCommitShaTruncation(raw, resolved.sha);
+    context.commit_sha_raw = raw;
+  }
+  context.commit_sha = resolved.sha;
+}
+
 export function formatMissingRequiredKeysEngineError(
   missingKeys: string[],
   originalOutput: string,
@@ -524,7 +573,11 @@ function trySkipUnlessDiffMatches(
   let gitError: string | undefined;
   if (patterns && patterns.length > 0) {
     const repo = (context["repo"] ?? "").trim();
-    const head = (context["branch"] || context["commit_sha"] || "").trim();
+    let head = (context["branch"] || "").trim();
+    if (!head) {
+      const resolved = sanitizeCommitShaForGitRef(context["commit_sha"]);
+      head = resolved.sha ?? "";
+    }
     if (!repo) {
       gitError = "missing repo in run context";
     } else if (!head) {
@@ -973,10 +1026,15 @@ export function listProtectedDiffFilesChecked(
 ): ProtectedDiffResult {
   const missing = missingProtectedDiffField(repo, commitSha);
   if (missing) return { ran: false, hits: [], error: `missing ${missing}` };
+  const resolved = sanitizeCommitShaForGitRef(commitSha);
+  if (!resolved.sha) return { ran: false, hits: [], error: "missing commit_sha" };
+  if (resolved.truncated && typeof commitSha === "string") {
+    logCommitShaTruncation(commitSha, resolved.sha);
+  }
   const errors: string[] = [];
   for (const base of [PROTECTED_PATH_DIFF_DEFAULT_BASE, "main"]) {
     try {
-      const output = execFileSync("git", ["diff", "--name-only", `${base}...${commitSha}`], {
+      const output = execFileSync("git", ["diff", "--name-only", `${base}...${resolved.sha}`], {
         cwd: repo,
         encoding: "utf-8",
         timeout: 10_000,
@@ -1019,7 +1077,15 @@ function protectedPathStoryDiffFailure(
 ): string | null {
   const missing = missingProtectedDiffField(runCtx.repo, runCtx.commit_sha);
   if (missing) return formatProtectedPathGateMissingContextError(missing, originalOutput);
-  const diff = listProtectedDiffFilesChecked(runCtx.repo, runCtx.commit_sha);
+  const resolved = sanitizeCommitShaForGitRef(runCtx.commit_sha);
+  // Commentary-only / non-SHA COMMIT_SHA is the same as missing context, not git_failed.
+  if (!resolved.sha) {
+    return formatProtectedPathGateMissingContextError("commit_sha", originalOutput);
+  }
+  if (resolved.truncated) {
+    logCommitShaTruncation(runCtx.commit_sha, resolved.sha);
+  }
+  const diff = listProtectedDiffFilesChecked(runCtx.repo, resolved.sha);
   // Fail CLOSED when the diff never ran — matches protectedPathBranchDiffFailure.
   if (!diff.ran) return formatProtectedPathGateGitFailedError(diff.error, originalOutput);
   if (diff.hits.length > 0) return formatProtectedPathHitsMessage(diff.hits);
@@ -1033,9 +1099,13 @@ function protectedPathBranchDiffFailure(
   if (typeof runCtx.repo !== "string" || runCtx.repo.trim() === "") {
     return formatProtectedPathGateMissingContextError("repo", originalOutput);
   }
-  const head = (runCtx.branch || runCtx.commit_sha || "").trim();
+  let head = (runCtx.branch || "").trim();
   if (!head) {
-    return formatProtectedPathGateMissingContextError("commit_sha", originalOutput);
+    const resolved = sanitizeCommitShaForGitRef(runCtx.commit_sha);
+    if (!resolved.sha) {
+      return formatProtectedPathGateMissingContextError("commit_sha", originalOutput);
+    }
+    head = resolved.sha;
   }
   const base = (runCtx.pr_base || PROTECTED_PATH_DIFF_DEFAULT_BASE).trim();
   try {
@@ -1452,6 +1522,7 @@ export function completeStep(stepId: string, output: string): { advanced: boolea
   for (const [key, value] of Object.entries(parsed)) {
     context[key] = value;
   }
+  applySanitizedCommitShaToContext(context);
 
   db.prepare(
     "UPDATE runs SET context = ?, updated_at = datetime('now') WHERE id = ?"

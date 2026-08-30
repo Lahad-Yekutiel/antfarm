@@ -66,7 +66,17 @@ describe("coordinator auto-diagnose-and-retry", () => {
   });
 
   it("6. a protected-path gate hit is structural, decided without an agent turn", () => {
-    for (const c of ["6a-structural", "6b-no-agent-turn", "6c-attempts-0", "6d-todo"]) ok(c);
+    for (const c of ["6a-structural", "6a-reason", "6b-no-agent-turn", "6c-attempts-0", "6d-todo"]) ok(c);
+  });
+
+  it("6e/f. git_failed / missing_context are transient, not a protected-path hit", () => {
+    for (const c of [
+      "6e-git-failed-transient", "6e-git-failed-reason", "6e-git-failed-retry",
+      "6e-git-failed-no-agent", "6e-git-failed-not-parked",
+      "6f-missing-context-transient", "6f-missing-context-retry",
+      "6g-both-structural", "6g-both-reason", "6g-both-not-transient", "6g-both-parked",
+      "6g-orig-structural", "6g-orig-reason",
+    ]) ok(c);
   });
 
   it("7. a diagnosis agent that throws parks instead of retrying or stalling", () => {

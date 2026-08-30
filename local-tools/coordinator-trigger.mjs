@@ -1222,8 +1222,18 @@ function recordLedgerAttempt(key, fields, deps = {}) {
 /** sha256 of an empty diff — the digest a no-op branch produces. */
 const EMPTY_DIFF_DIGEST = crypto.createHash("sha256").update("").digest("hex");
 
-const PROTECTED_PATH_GATE_SIGNATURES = [
+/** Genuine hits: the diff ran and touched a host-enforced path. */
+const PROTECTED_PATH_HIT_SIGNATURES = [
   "protected-path gate:",
+];
+
+/**
+ * The gate itself could not run (malformed/missing git ref, git threw).
+ * Distinct from a hit — retrying can succeed once the ref is a bare SHA
+ * (TASK-025 #34). Must not use the "deliverable is on the host-enforced list"
+ * template.
+ */
+const PROTECTED_PATH_GATE_RUN_FAILURE_SIGNATURES = [
   "protected_path_gate_missing_context",
   "protected_path_gate_git_failed",
 ];
@@ -1353,7 +1363,9 @@ function unknownDiagnosis(detail) {
  * Deterministic pre-classification. Runs BEFORE any agent turn is spent, and
  * owns every case where model judgment would be a liability:
  *   1. a host dispatch-gate refusal — no run can fix it
- *   2. the protected-path gate signature — retrying repeats it identically
+ *   2. a protected-path HIT (diff touched a host-enforced path) — retrying
+ *      repeats it identically. Gate-run failures (git_failed / missing_context)
+ *      are retryable-or-engine, not this.
  *   3. a reason or diff digest already in history — same wall, second time
  *   4. an empty diff when a prior attempt was also empty (Item 7)
  *   5. a known engine/infra signature → transient, retry as-is
@@ -1372,12 +1384,25 @@ function preClassifyRunFailure({ entry, autoRetry, attempt, diff }) {
   }
 
   const haystack = [attempt.reason, ...attempt.outputs.map((o) => o.output)].join("\n").toLowerCase();
-  const gateHit = PROTECTED_PATH_GATE_SIGNATURES.find((sig) => haystack.includes(sig));
+  // Hits first: gate-run-failure signatures can coexist with a real hit in the
+  // joined haystack (another step, or ORIGINAL_OUTPUT:). Hit messages use
+  // "protected-path gate:" (colon after gate); run-failure messages use
+  // "Protected-path gate cannot run:" and never match the hit signature.
+  const gateHit = PROTECTED_PATH_HIT_SIGNATURES.find((sig) => haystack.includes(sig));
   if (gateHit) {
     return {
       class: "structural",
       reason: "the protected-path gate blocked this run; the task's own deliverable is on the host-enforced list",
       evidence: `protected-path gate signature "${gateHit}" in step output`,
+      retry_guidance: "",
+    };
+  }
+  const gateRunFailed = PROTECTED_PATH_GATE_RUN_FAILURE_SIGNATURES.find((sig) => haystack.includes(sig));
+  if (gateRunFailed) {
+    return {
+      class: "transient",
+      reason: "the protected-path gate itself failed to run (git ref missing/unresolvable, or git diff threw) — not a protected-path hit",
+      evidence: `protected-path gate-run-failure signature "${gateRunFailed}" in step output`,
       retry_guidance: "",
     };
   }
@@ -6257,9 +6282,95 @@ if (process.argv.includes("--self-test-auto-retry")) {
     });
     const entry = r.ledger.get()["TASK-906"];
     check("6a-structural", entry?.autoRetry?.parkedReason === "structural", entry?.autoRetry);
+    check("6a-reason", String(entry?.autoRetry?.lastDiagnosis?.reason || "").includes("host-enforced list"), entry?.autoRetry?.lastDiagnosis);
     check("6b-no-agent-turn", r.agentCalls === 0, r.agentCalls);
     check("6c-attempts-0", entry?.autoRetry?.attempts === 0, entry?.autoRetry);
     check("6d-todo", r.todos.length === 1, r.todos);
+  }
+
+  // 6e. git_failed is NOT a protected-path hit — retryable-or-engine (transient)
+  {
+    const item = failedItem("q6e", "TASK-906E");
+    const r = await runFailure({
+      taskId: "TASK-906E",
+      item,
+      queue: [item],
+      steps: stepsFixture(
+        "ENGINE_ERROR: protected_path_gate_git_failed — ambiguous argument / unknown revision",
+        "verify",
+      ),
+    });
+    const entry = r.ledger.get()["TASK-906E"];
+    check("6e-git-failed-transient", entry?.autoRetry?.lastDiagnosis?.class === "transient", entry?.autoRetry?.lastDiagnosis);
+    check("6e-git-failed-reason", String(entry?.autoRetry?.lastDiagnosis?.reason || "").includes("failed to run"), entry?.autoRetry?.lastDiagnosis);
+    check("6e-git-failed-retry", entry?.outcome === LEDGER_OUTCOME_RETRY_PENDING, entry);
+    check("6e-git-failed-no-agent", r.agentCalls === 0, r.agentCalls);
+    check("6e-git-failed-not-parked", entry?.autoRetry?.parked !== true, entry?.autoRetry);
+  }
+
+  // 6f. missing_context is the same class as git_failed, not a hit
+  {
+    const item = failedItem("q6f", "TASK-906F");
+    const r = await runFailure({
+      taskId: "TASK-906F",
+      item,
+      queue: [item],
+      steps: stepsFixture("ENGINE_ERROR: protected_path_gate_missing_context: commit_sha", "verify"),
+    });
+    const entry = r.ledger.get()["TASK-906F"];
+    check("6f-missing-context-transient", entry?.autoRetry?.lastDiagnosis?.class === "transient", entry?.autoRetry?.lastDiagnosis);
+    check("6f-missing-context-retry", entry?.outcome === LEDGER_OUTCOME_RETRY_PENDING, entry);
+  }
+
+  // 6g. both signatures in one haystack — a real hit wins (F2)
+  {
+    const item = failedItem("q6g", "TASK-906G");
+    const r = await runFailure({
+      taskId: "TASK-906G",
+      item,
+      queue: [item],
+      steps: {
+        found: true,
+        run: { id: "run-x", workflowId: DEFAULT_WORKFLOW, status: "failed", runNumber: 99 },
+        steps: [
+          {
+            stepId: "verify",
+            status: "failed",
+            output: "ENGINE_ERROR: protected_path_gate_git_failed — ambiguous argument / unknown revision",
+            retryCount: 2,
+            maxRetries: 2,
+          },
+          {
+            stepId: "merge",
+            status: "failed",
+            output: "Protected-path gate: diff touches _SSoT/CORE.md",
+            retryCount: 2,
+            maxRetries: 2,
+          },
+        ],
+      },
+    });
+    const entry = r.ledger.get()["TASK-906G"];
+    check("6g-both-structural", entry?.autoRetry?.parkedReason === "structural", entry?.autoRetry);
+    check("6g-both-reason", String(entry?.autoRetry?.lastDiagnosis?.reason || "").includes("host-enforced list"), entry?.autoRetry?.lastDiagnosis);
+    check("6g-both-not-transient", entry?.autoRetry?.lastDiagnosis?.class !== "transient", entry?.autoRetry?.lastDiagnosis);
+    check("6g-both-parked", entry?.autoRetry?.parked === true, entry?.autoRetry);
+  }
+
+  {
+    const item = failedItem("q6g2", "TASK-906G2");
+    const r = await runFailure({
+      taskId: "TASK-906G2",
+      item,
+      queue: [item],
+      steps: stepsFixture(
+        "Protected-path gate: diff touches _SSoT/CORE.md\nORIGINAL_OUTPUT:\nagent mentioned protected_path_gate_git_failed in notes",
+        "pr",
+      ),
+    });
+    const entry = r.ledger.get()["TASK-906G2"];
+    check("6g-orig-structural", entry?.autoRetry?.parkedReason === "structural", entry?.autoRetry);
+    check("6g-orig-reason", String(entry?.autoRetry?.lastDiagnosis?.reason || "").includes("host-enforced list"), entry?.autoRetry?.lastDiagnosis);
   }
 
   // 7. diagnosis agent throws -> park (today's behaviour), no retry

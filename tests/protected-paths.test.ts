@@ -17,6 +17,7 @@ import {
   completeStep,
   listProtectedDiffFiles,
   listProtectedDiffFilesChecked,
+  sanitizeCommitShaForGitRef,
 } from "../dist/installer/step-ops.js";
 
 describe("isProtectedPath / findProtectedPaths", () => {
@@ -131,6 +132,35 @@ describe("listProtectedDiffFiles + completeStep host-side gate", () => {
     return stepId;
   }
 
+  function insertImplementThenVerify(repo: string, verifierAgent: string): { runId: string; implementId: string } {
+    const db = getDb();
+    const runId = randomUUID();
+    const implementId = randomUUID();
+    const verifyId = randomUUID();
+    const now = new Date().toISOString();
+    testRunIds.push(runId);
+    db.prepare(
+      `INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at)
+       VALUES (?, 'thecoach-dev', 'test task', 'running', ?, ?, ?)`,
+    ).run(runId, JSON.stringify({ repo, branch: "feat" }), now, now);
+    db.prepare(
+      `INSERT INTO steps (id, step_id, run_id, agent_id, step_index, input_template, expects, status, max_retries, created_at, updated_at, type)
+       VALUES (?, 'implement', ?, 'thecoach-dev_implementer', 0, 'test', 'STATUS: COMMIT_SHA:', 'running', 1, ?, ?, 'single')`,
+    ).run(implementId, runId, now, now);
+    db.prepare(
+      `INSERT INTO steps (id, step_id, run_id, agent_id, step_index, input_template, expects, status, max_retries, created_at, updated_at, type)
+       VALUES (?, 'verify', ?, ?, 1, ?, 'GATE: STATUS:', 'waiting', 1, ?, ?, 'single')`,
+    ).run(
+      verifyId,
+      runId,
+      verifierAgent,
+      "COMMIT: {{commit_sha}}\nRun: git -C {{repo}} diff --stat staging...{{commit_sha}}",
+      now,
+      now,
+    );
+    return { runId, implementId };
+  }
+
   for (const rel of ["supabase/config.toml", ".github/workflows/anything.yml", ".gitignore", "_SSoT/CORE.md"]) {
     it(`host-side gate fails verify when GATE: pass but diff touches ${rel}`, () => {
       const { repo, sha } = makeRepoWithFile(rel);
@@ -229,6 +259,106 @@ describe("listProtectedDiffFiles + completeStep host-side gate", () => {
     const checked = listProtectedDiffFilesChecked(repo, sha);
     assert.equal(checked.ran, true);
     assert.deepEqual(checked.hits, []);
+  });
+
+  // TASK-025 #34: implementer wrote commentary after the SHA. Exact fixture
+  // from the Failure Checks 2026-08-30 diagnosis.
+  const TASK025_COMMIT_SHA_FIXTURE =
+    "c511270 (with parent 02c1b86 also part of this story's changes; both commits on branch feature/promote-design-preview implement Story S1 in full)";
+
+  it("sanitizes the TASK-025 COMMIT_SHA fixture to the leading bare SHA", () => {
+    const resolved = sanitizeCommitShaForGitRef(TASK025_COMMIT_SHA_FIXTURE);
+    assert.equal(resolved.sha, "c511270");
+    assert.equal(resolved.truncated, true);
+    assert.deepEqual(sanitizeCommitShaForGitRef("c511270"), { sha: "c511270", truncated: false });
+    assert.deepEqual(sanitizeCommitShaForGitRef("not a sha at all"), { sha: null, truncated: false });
+    assert.deepEqual(sanitizeCommitShaForGitRef(""), { sha: null, truncated: false });
+    assert.deepEqual(sanitizeCommitShaForGitRef("HEAD"), { sha: null, truncated: false });
+    assert.deepEqual(sanitizeCommitShaForGitRef("deadbeef-tag"), { sha: null, truncated: false });
+    assert.deepEqual(sanitizeCommitShaForGitRef("deadbeef/x"), { sha: null, truncated: false });
+    assert.deepEqual(sanitizeCommitShaForGitRef("deadbeef_x"), { sha: null, truncated: false });
+    assert.deepEqual(sanitizeCommitShaForGitRef("a".repeat(41)), { sha: null, truncated: false });
+    assert.deepEqual(sanitizeCommitShaForGitRef("a" + "b".repeat(43)), { sha: null, truncated: false });
+    assert.equal(sanitizeCommitShaForGitRef("c511270, plus 02c1b86").sha, "c511270");
+    assert.equal(sanitizeCommitShaForGitRef("c511270. see also").sha, "c511270");
+    assert.equal(sanitizeCommitShaForGitRef("c511270)").sha, "c511270");
+    assert.equal(sanitizeCommitShaForGitRef("c511270(with parent)").sha, "c511270");
+    assert.equal(sanitizeCommitShaForGitRef("c511270; note").sha, "c511270");
+  });
+
+  it("TASK-025: trailing commentary on COMMIT_SHA still lets the protected-path gate run (no git_failed)", () => {
+    const { repo, sha } = makeRepoWithFile("apps/web/page.tsx");
+    const commentary = TASK025_COMMIT_SHA_FIXTURE.slice("c511270".length);
+    const dirty = `${sha}${commentary}`;
+    const checked = listProtectedDiffFilesChecked(repo, dirty);
+    assert.equal(checked.ran, true, JSON.stringify(checked));
+    assert.deepEqual(checked.hits, []);
+
+    const stepDbId = insertVerifyRun(repo, dirty);
+    const result = completeStep(stepDbId, "GATE: pass\nSTATUS: pass");
+    assert.equal(result.advanced, true);
+    const db = getDb();
+    const verify = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(stepDbId) as {
+      status: string;
+      output: string | null;
+    };
+    assert.equal(verify.status, "done");
+    assert.equal((verify.output || "").includes("protected_path_gate_git_failed"), false);
+  });
+
+  it("TASK-025: dirty COMMIT_SHA is stored as a bare SHA so the verifier prompt is a valid git ref", () => {
+    const { repo, sha } = makeRepoWithFile("apps/web/page.tsx");
+    const dirty = `${sha}${TASK025_COMMIT_SHA_FIXTURE.slice("c511270".length)}`;
+    const verifierAgent = `thecoach-dev_verifier-${randomUUID().slice(0, 8)}`;
+    const { runId, implementId } = insertImplementThenVerify(repo, verifierAgent);
+
+    const result = completeStep(implementId, `STATUS: done\nCOMMIT_SHA: ${dirty}`);
+    assert.equal(result.advanced, true);
+
+    const db = getDb();
+    const ctx = JSON.parse((db.prepare("SELECT context FROM runs WHERE id = ?").get(runId) as { context: string }).context) as Record<string, string>;
+    assert.equal(ctx.commit_sha, sha.toLowerCase());
+    assert.equal(ctx.commit_sha_raw, dirty);
+    assert.equal(ctx.commit_sha.includes("with parent"), false);
+
+    const claimed = claimStep(verifierAgent);
+    assert.equal(claimed.found, true);
+    assert.ok(claimed.resolvedInput?.includes(`COMMIT: ${sha.toLowerCase()}`), claimed.resolvedInput);
+    assert.ok(claimed.resolvedInput?.includes(`staging...${sha.toLowerCase()}`), claimed.resolvedInput);
+    assert.equal(claimed.resolvedInput?.includes("with parent"), false, claimed.resolvedInput);
+  });
+
+  it("a protected-path hit still fires when COMMIT_SHA has trailing commentary", () => {
+    const { repo, sha } = makeRepoWithFile("supabase/config.toml");
+    const dirty = `${sha}${TASK025_COMMIT_SHA_FIXTURE.slice("c511270".length)}`;
+    const stepDbId = insertVerifyRun(repo, dirty);
+    const result = completeStep(stepDbId, "GATE: pass\nSTATUS: pass");
+    assert.equal(result.advanced, false);
+    const db = getDb();
+    const verify = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(stepDbId) as {
+      status: string;
+      output: string;
+    };
+    assert.notEqual(verify.status, "done");
+    assert.ok(verify.output.includes("Protected-path gate: diff touches supabase/config.toml"), verify.output);
+    assert.equal(verify.output.includes("protected_path_gate_git_failed"), false);
+  });
+
+  it("a COMMIT_SHA with no hex token is missing context, not git_failed", () => {
+    const { repo } = makeRepoWithFile("apps/web/page.tsx");
+    const stepDbId = insertVerifyRun(repo, "not a git object name");
+    const agentOutput = "GATE: pass\nSTATUS: pass";
+    const result = completeStep(stepDbId, agentOutput);
+    assert.equal(result.advanced, false);
+    const db = getDb();
+    const verify = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(stepDbId) as {
+      status: string;
+      output: string;
+    };
+    // insertVerifyRun uses max_retries=1, so the first fail is pending, not terminal failed.
+    assert.notEqual(verify.status, "done");
+    assert.ok(verify.output.includes("ENGINE_ERROR: protected_path_gate_missing_context: commit_sha"), verify.output);
+    assert.equal(verify.output.includes("protected_path_gate_git_failed"), false);
   });
 
   it("B1: both present and a clean apps-only diff passes verify", () => {
