@@ -115,6 +115,36 @@ const DISPATCHABLE_TOOL = "Cursor";
  * cannot be mistaken for the intended git branch.
  */
 const TASK_BRANCH_NAME_RE = /\b((?:feature|fix|feat|docs)\/[A-Za-z0-9._-]+)/;
+/**
+ * The only base the thecoach-dev workflow can actually cut from today: its
+ * setup step hardcodes `git checkout staging && git pull` before
+ * `git checkout -b {{branch}}`. A task file asking for any other base cannot
+ * be honoured, so it is refused rather than silently cut from staging —
+ * that silent substitution is what killed antfarm run #17 (TASK-025).
+ */
+const DISPATCHABLE_BASE = "staging";
+/**
+ * Base clause inside a ## Branch section: "cut from `staging`",
+ * "(new branch off `main`)". Checked in order; first hit wins.
+ */
+const TASK_BASE_CUT_FROM_RE = /\bcut\s+from\s+([A-Za-z0-9._/-]+)/i;
+const TASK_BASE_OFF_RE = /\b(?:branch\s+)?off\s+(?:of\s+)?([A-Za-z0-9._/-]+)/i;
+/**
+ * "continue existing branch" / "continue on X" / "stay on X" — the task wants
+ * an existing branch, not a fresh cut. Setup does `git checkout -b`, which
+ * fails on an existing branch, so this is never dispatchable today.
+ */
+const TASK_BASE_CONTINUE_RE = /\b(?:continue\s+(?:on|existing\s+branch)|stay\s+on|already\s+the\s+working\s+branch)\b/i;
+/**
+ * A base clause must name something branch-shaped. Without this, prose like
+ * "or a `fix/` branch cut from it" yields the base "it" (TASK-021, TASK-040).
+ */
+const TASK_BASE_SHAPE_RE = /^(?:staging|main|master|(?:feature|fix|feat|docs|release|chore)\/[A-Za-z0-9._-]+)$/i;
+/**
+ * ## Status values that must never dispatch, matched anywhere in the status'
+ * first line — "Ready — blocked until PR #22" is not ready either.
+ */
+const TASK_STATUS_NOT_READY_RE = /\b(blocked|hold|superseded|deferred|abandoned|wontfix|do\s+not\s+dispatch|not\s+dispatchable)\b/i;
 const PHASE_HEADING_RE = /phase\s+(\d+[a-z]?)\b/i;
 /** `## Phase 9 — ...` / `## Phase 4B — ...` — ground truth for dispatch phase. */
 const PHASE_HEADING_LINE_RE = /^##\s+Phase\s+(\d+[a-z]?)\b/i;
@@ -611,6 +641,71 @@ function parseTaskToolModel(sectionText) {
   return { ok: false, field: "Tool/model", reason: "unparseable", value: first.slice(0, 80) };
 }
 
+/** First paragraph of a section — up to the first blank line. */
+function firstParagraph(text) {
+  const out = [];
+  for (const line of String(text || "").split(/\n/)) {
+    if (!line.trim()) {
+      if (out.length) break;
+      continue;
+    }
+    out.push(line.trim());
+  }
+  return out.join(" ").replace(/[`*_]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Parse ## Status. Only a section whose first line starts with "Ready" and
+ * carries no not-ready qualifier may dispatch. Everything else — Blocked,
+ * On hold, Done, Superseded, missing, or prose we cannot read — is a refusal.
+ * The task file's Status wins over the roadmap checkbox.
+ */
+function parseTaskStatus(sectionText) {
+  if (sectionText == null || !String(sectionText).trim()) {
+    return { ok: false, field: "Status", reason: "missing-or-empty" };
+  }
+  const first = firstNonEmptyLine(sectionText).replace(/[`*_]/g, " ").replace(/\s+/g, " ").trim();
+  const notReady = first.match(TASK_STATUS_NOT_READY_RE);
+  if (notReady) {
+    return { ok: false, field: "Status", reason: "status-blocked", value: first.slice(0, 160) };
+  }
+  if (!/^ready\b/i.test(first)) {
+    return { ok: false, field: "Status", reason: "status-not-ready", value: first.slice(0, 160) };
+  }
+  return { ok: true, field: "Status", status: first.slice(0, 160) };
+}
+
+/**
+ * Parse the *base* out of a ## Branch section — the branch the run is cut
+ * from, as distinct from the new branch's name. Reads the first paragraph
+ * only, so a later "this task previously said to continue on X" note cannot
+ * flip the base (TASK-028 has exactly that note).
+ */
+function parseTaskBase(sectionText) {
+  if (sectionText == null || !String(sectionText).trim()) {
+    return { ok: false, field: "Branch", reason: "base-missing-or-empty" };
+  }
+  const para = firstParagraph(sectionText);
+  const acceptBase = (raw) => {
+    const base = raw.replace(/[.,;:)]+$/, "");
+    if (/^(main|master)$/i.test(base)) {
+      return { ok: false, field: "Branch", reason: "base-refused-main", value: base };
+    }
+    if (!TASK_BASE_SHAPE_RE.test(base)) {
+      return { ok: false, field: "Branch", reason: "base-unparseable", value: base };
+    }
+    return { ok: true, field: "Branch", base };
+  };
+  const cutFrom = para.match(TASK_BASE_CUT_FROM_RE);
+  if (cutFrom) return acceptBase(cutFrom[1]);
+  const off = para.match(TASK_BASE_OFF_RE);
+  if (off) return acceptBase(off[1]);
+  if (TASK_BASE_CONTINUE_RE.test(para)) {
+    return { ok: false, field: "Branch", reason: "base-continue-existing", value: para.slice(0, 160) };
+  }
+  return { ok: false, field: "Branch", reason: "base-unstated", value: para.slice(0, 160) };
+}
+
 /** Read both contract fields from a task-file body. Either field failing fails the whole parse. */
 function parseTaskContract(markdown) {
   const branchSection = extractMarkdownSection(markdown, /^##\s+Branch\b/i);
@@ -672,6 +767,10 @@ function loadTaskContractForId(taskId, deps = {}) {
     dispatchUnknown: dispatchParsed.unknown,
     dispatchValue: dispatchParsed.value,
     dispatchDefaulted: dispatchParsed.defaulted,
+    // Parsed alongside, not folded into parseTaskContract: those two fields
+    // are the pre-existing unit contract, and these gate dispatch separately.
+    status: parseTaskStatus(extractMarkdownSection(markdown, /^##\s+Status\b/i)),
+    base: parseTaskBase(extractMarkdownSection(markdown, /^##\s+Branch\b/i)),
   };
   if (!parsed.ok) return { ...parsed, missing: false, path: filePath, taskId, ...dispatchFields };
   return { ok: true, branch: parsed.branch, tool: parsed.tool, path: filePath, taskId, ...dispatchFields };
@@ -858,6 +957,19 @@ function evaluateHostDispatchGates(ledgerKey, contract) {
       dispatch_unknown: Boolean(contract.dispatchUnknown),
     };
   }
+  // Status gate. The task file's ## Status wins over the roadmap checkbox, and
+  // a Blocked / On hold / Done / unreadable status never dispatches. Runs
+  // before Tool/model and Branch so a blocked task is refused for the reason
+  // that actually applies to it.
+  if (!contract.missing && contract.status && contract.status.ok !== true) {
+    return {
+      dispatched: false,
+      reason: contract.status.reason || "status-not-ready",
+      task: ledgerKey,
+      contract_field: "Status",
+      contract_value: contract.status.value,
+    };
+  }
   if (contract.ok) {
     if (contract.tool !== DISPATCHABLE_TOOL) {
       return {
@@ -880,6 +992,34 @@ function evaluateHostDispatchGates(ledgerKey, contract) {
     };
   }
 
+  // Base gate. `## Branch` carries two things: the new branch's name (parsed
+  // above) and the base it is cut from. The workflow's setup step can only cut
+  // from `staging`, so any other base — or one we cannot read — is refused
+  // rather than silently cut from staging anyway.
+  if (!contract.missing && contract.base) {
+    if (contract.base.ok !== true) {
+      return {
+        dispatched: false,
+        reason: contract.base.reason || "base-unparseable",
+        task: ledgerKey,
+        contract_field: "Branch",
+        contract_value: contract.base.value,
+        branch: contract.ok ? contract.branch : undefined,
+      };
+    }
+    if (contract.base.base !== DISPATCHABLE_BASE) {
+      return {
+        dispatched: false,
+        reason: "unsupported-base",
+        task: ledgerKey,
+        contract_field: "Branch",
+        contract_value: contract.base.base,
+        base: contract.base.base,
+        branch: contract.ok ? contract.branch : undefined,
+      };
+    }
+  }
+
   if (contract.missing || !contract.markdown) {
     logDispatchNext(SCOPE_GATE_SKIPPED_LOG);
     return {
@@ -900,6 +1040,7 @@ function evaluateHostDispatchGates(ledgerKey, contract) {
       skip_log: SCOPE_GATE_SKIPPED_LOG,
       branch: contract.branch,
       tool: contract.tool,
+      base: contract.base?.ok ? contract.base.base : null,
     };
   }
   if (scope.matches.length > 0) {
@@ -912,7 +1053,13 @@ function evaluateHostDispatchGates(ledgerKey, contract) {
       tool: contract.tool,
     };
   }
-  return { dispatched: true, branch: contract.branch, tool: contract.tool, matches: [] };
+  return {
+    dispatched: true,
+    branch: contract.branch,
+    tool: contract.tool,
+    base: contract.base?.ok ? contract.base.base : null,
+    matches: [],
+  };
 }
 
 /**
@@ -2827,6 +2974,30 @@ async function spawnPendingQueueItem(queue, idx, deps = {}) {
       note: `${ledgerKey} ## Tool/model is ${gates.contract_value}; coordinator dispatches Cursor only and will not substitute. Run this task by hand with ${gates.contract_value}.`,
       why: `The coordinator has no ${gates.contract_value} dispatch route. Silently substituting ${DISPATCHABLE_TOOL} would send this work to the wrong tool.`,
       replyNeeded: `Run ${ledgerKey} by hand with ${gates.contract_value}, or change ## Tool/model if that routing was wrong.`,
+    });
+  }
+  if (gates.contract_field === "Status") {
+    logDispatchNext(`task-contract-refused key=${ledgerKey} field=Status reason=${gates.reason}`);
+    return flagTaskContractRefusal(queue, item, deps, {
+      taskId: ledgerKey,
+      field: "Status",
+      reason: gates.reason,
+      value: gates.contract_value,
+      note: `${ledgerKey} ## Status is not Ready (${gates.reason}: ${gates.contract_value ?? "unreadable"}). Will not dispatch.`,
+      why: "The task file's ## Status is the contract; the roadmap checkbox does not override it. Dispatching a blocked or finished task wastes a run and can land work out of order.",
+      replyNeeded: `Set ${ledgerKey} ## Status to Ready once its blocker clears, or take the item off the roadmap.`,
+    });
+  }
+  if (gates.reason === "unsupported-base" || String(gates.reason || "").startsWith("base-")) {
+    logDispatchNext(`task-contract-refused key=${ledgerKey} field=Branch reason=${gates.reason} value=${gates.contract_value}`);
+    return flagTaskContractRefusal(queue, item, deps, {
+      taskId: ledgerKey,
+      field: "Branch",
+      reason: gates.reason,
+      value: gates.contract_value,
+      note: `${ledgerKey} ## Branch base is ${gates.contract_value ?? "unreadable"} (${gates.reason}); the workflow can only cut from ${DISPATCHABLE_BASE} and will not substitute it.`,
+      why: `Setup cuts every run from ${DISPATCHABLE_BASE}. Dispatching a task that names a different base silently builds on the wrong code — that is what failed antfarm run #17.`,
+      replyNeeded: `Rewrite ${ledgerKey} ## Branch to cut from ${DISPATCHABLE_BASE}, or run it by hand on the base it names.`,
     });
   }
   if (gates.reason === "protected-path-scope") {
@@ -5666,6 +5837,70 @@ if (process.argv.includes("--self-test-task-contract")) {
       parseTaskContract("## Branch\n`fix/example`\n").ok === false &&
         parseTaskContract("## Branch\n`fix/example`\n").field === "Tool/model",
     ),
+    // --- TASK-032: ## Status gate -------------------------------------
+    check("status-ready-ok", parseTaskStatus("Ready").ok === true, parseTaskStatus("Ready")),
+    check("status-ready-with-trailing-prose-ok", parseTaskStatus("Ready - but reduced in scope 2026-08-26").ok === true),
+    check(
+      "status-blocked-refused",
+      parseTaskStatus("Blocked - do not dispatch until TASK-025 has landed").reason === "status-blocked",
+    ),
+    check(
+      "status-ready-but-blocked-refused",
+      parseTaskStatus("Ready — **blocked until PR #22 has merged**").reason === "status-blocked",
+    ),
+    check(
+      "status-hold-refused",
+      parseTaskStatus("Ready. **Dispatch: hold** — overlaps TASK-011").reason === "status-blocked",
+    ),
+    check("status-on-hold-refused", parseTaskStatus("**On hold - rescoped 2026-08-25.**").reason === "status-blocked"),
+    check("status-superseded-refused", parseTaskStatus("Superseded 2026-08-25 - see TASK-025").reason === "status-blocked"),
+    check("status-done-refused", parseTaskStatus("Done. Merged to main (2026-08-01)").reason === "status-not-ready"),
+    check("status-missing-refused", parseTaskStatus("").reason === "missing-or-empty"),
+    check("status-null-refused", parseTaskStatus(null).reason === "missing-or-empty"),
+    // --- TASK-032: ## Branch base gate --------------------------------
+    check(
+      "base-cut-from-staging",
+      parseTaskBase("`fix/x` - cut from `staging`, merged back into `staging`. Never `main`.").base === "staging",
+    ),
+    check(
+      "base-parenthesised-cut-from-staging",
+      parseTaskBase("fix/x (cut from `staging`, merged back into `staging` - never `main`)").base === "staging",
+    ),
+    check(
+      "base-later-paragraph-cannot-flip",
+      // TASK-028's real shape: staging in paragraph 1, a historical
+      // "continue on feature/..." note in paragraph 2. Paragraph 1 must win.
+      parseTaskBase(
+        [
+          "`fix/x` - cut from `staging`, merged back into `staging`.",
+          "",
+          "**Updated:** previously said to continue on `feature/phase4-core-web`.",
+        ].join(String.fromCharCode(10)),
+      ).base === "staging",
+    ),
+    check(
+      "base-off-main-refused",
+      parseTaskBase("fix/auth-bootstrap-hardening (new branch off `main`)").reason === "base-refused-main",
+    ),
+    check(
+      "base-continue-existing-refused",
+      parseTaskBase("feature/data-model-foundation (continue existing branch)").reason === "base-continue-existing",
+    ),
+    check(
+      "base-stay-on-refused",
+      parseTaskBase("Stay on `feature/phase4-core-web` (already the working branch).").reason === "base-continue-existing",
+    ),
+    check(
+      "base-prose-pronoun-refused",
+      // "or a `fix/` branch cut from it" must not yield the base "it".
+      parseTaskBase("Stay on `feature/x` (or a `fix/` branch cut from it).").reason === "base-unparseable",
+    ),
+    check("base-unstated-refused", parseTaskBase("`fix/x`").reason === "base-unstated"),
+    check("base-missing-refused", parseTaskBase("").reason === "base-missing-or-empty"),
+    check(
+      "base-non-staging-branch-parsed",
+      parseTaskBase("`fix/x` - cut from `feature/phase4-core-web`").base === "feature/phase4-core-web",
+    ),
   ];
 
   function pendingItem(id, task) {
@@ -5723,6 +5958,69 @@ if (process.argv.includes("--self-test-task-contract")) {
     },
     waitRun: async () => {
       throw new Error("waitRun must not run on a Tool/model refusal");
+    },
+  });
+
+  // --- TASK-032: a Blocked task file must never reach startRun ---------
+  // TASK-028 is genuinely `## Status: Blocked` in the working checkout.
+  const mq028 = memoryQueue([pendingItem("q-028", "Consolidate completeness logic TASK-028")]);
+  const started028 = [];
+  const todos028 = [];
+  const http028 = await spawnPendingQueueItem(mq028.get(), 0, {
+    ...memoryLedger(),
+    thecoachRepo: fixtureRepo,
+    save: mq028.save,
+    appendTodo: (_repo, draft) => {
+      todos028.push(draft);
+      return { appended: true, entry: draft };
+    },
+    repoExists: () => true,
+    fetchStaging: async () => {
+      throw new Error("fetchStaging must not run on a Status refusal");
+    },
+    startRun: ({ task }) => {
+      started028.push(task);
+      throw new Error("startRun must not run on a Status refusal");
+    },
+    waitRun: async () => {
+      throw new Error("waitRun must not run on a Status refusal");
+    },
+  });
+
+  // --- TASK-032: a non-staging base must never reach startRun ----------
+  // Synthetic contract: the workflow's setup step can only cut from staging,
+  // so a task naming feature/phase4-core-web is refused, not silently cut
+  // from staging. This is the run #17 failure class.
+  const mqBase = memoryQueue([pendingItem("q-base", "Continue phase 4 work TASK-025")]);
+  const startedBase = [];
+  const todosBase = [];
+  const httpBase = await spawnPendingQueueItem(mqBase.get(), 0, {
+    ...memoryLedger(),
+    thecoachRepo: fixtureRepo,
+    save: mqBase.save,
+    loadTaskContract: () => ({
+      ok: true,
+      branch: "feature/promote-design-preview",
+      tool: "Cursor",
+      markdown: "# TASK-025",
+      dispatch: "auto",
+      status: { ok: true, field: "Status", status: "Ready" },
+      base: { ok: true, field: "Branch", base: "feature/phase4-core-web" },
+    }),
+    appendTodo: (_repo, draft) => {
+      todosBase.push(draft);
+      return { appended: true, entry: draft };
+    },
+    repoExists: () => true,
+    fetchStaging: async () => {
+      throw new Error("fetchStaging must not run on a base refusal");
+    },
+    startRun: ({ task }) => {
+      startedBase.push(task);
+      throw new Error("startRun must not run on a base refusal");
+    },
+    waitRun: async () => {
+      throw new Error("waitRun must not run on a base refusal");
     },
   });
 
@@ -5785,6 +6083,42 @@ if (process.argv.includes("--self-test-task-contract")) {
         todos029[0].summary.includes("Claude Code"),
       todos029[0]?.summary,
     ),
+    // --- TASK-032: Status gate, end to end ---------------------------
+    check("028-not-dispatched", http028.body.dispatched === false, http028.body),
+    check("028-field-status", http028.body.contract_field === "Status", http028.body),
+    check("028-reason-blocked", http028.body.contract_reason === "status-blocked", http028.body),
+    check("028-startRun-never", started028.length === 0, started028),
+    check("028-item-flagged", mq028.get()[0]?.status === "flagged", mq028.get()[0]),
+    check(
+      "028-note-names-task-field-and-status",
+      typeof mq028.get()[0]?.note === "string" &&
+        mq028.get()[0].note.includes("TASK-028") &&
+        mq028.get()[0].note.includes("Status") &&
+        mq028.get()[0].note.includes("Blocked"),
+      mq028.get()[0]?.note,
+    ),
+    check("028-todo-written", todos028.length === 1, todos028),
+    check(
+      "028-todo-blocks-task",
+      Array.isArray(todos028[0]?.blocks) && todos028[0].blocks.includes("task:TASK-028"),
+      todos028[0],
+    ),
+    // --- TASK-032: base gate, end to end -----------------------------
+    check("base-not-dispatched", httpBase.body.dispatched === false, httpBase.body),
+    check("base-field-branch", httpBase.body.contract_field === "Branch", httpBase.body),
+    check("base-reason-unsupported", httpBase.body.contract_reason === "unsupported-base", httpBase.body),
+    check("base-value-named", httpBase.body.contract_value === "feature/phase4-core-web", httpBase.body),
+    check("base-startRun-never", startedBase.length === 0, startedBase),
+    check("base-item-flagged", mqBase.get()[0]?.status === "flagged", mqBase.get()[0]),
+    check(
+      "base-note-names-task-and-base",
+      typeof mqBase.get()[0]?.note === "string" &&
+        mqBase.get()[0].note.includes("TASK-025") &&
+        mqBase.get()[0].note.includes("Branch") &&
+        mqBase.get()[0].note.includes("feature/phase4-core-web"),
+      mqBase.get()[0]?.note,
+    ),
+    check("base-todo-written", todosBase.length === 1, todosBase),
     check("adhoc-dispatched", httpAdHoc.body.dispatched === true, httpAdHoc.body),
     check(
       "adhoc-hardcoded-branch",
@@ -5805,6 +6139,13 @@ if (process.argv.includes("--self-test-task-contract")) {
     failures,
     cases: allCases,
     fixtures: { task027Path, task029Path, fixtureRepo },
+    // The human-facing text each refusal produces, so a reviewer can read the
+    // wording without re-deriving it from the templates.
+    refusal_notes: {
+      "TASK-029 Tool/model": { note: mq029.get()[0]?.note, todo: todos029[0]?.summary, reply_needed: todos029[0]?.reply_needed },
+      "TASK-028 Status": { note: mq028.get()[0]?.note, todo: todos028[0]?.summary, reply_needed: todos028[0]?.reply_needed },
+      "TASK-025 Branch base": { note: mqBase.get()[0]?.note, todo: todosBase[0]?.summary, reply_needed: todosBase[0]?.reply_needed },
+    },
   };
   origLog(JSON.stringify(report, null, 2));
   process.exit(failures.length === 0 ? 0 : 1);
@@ -5818,7 +6159,13 @@ if (process.argv.includes("--eval-dispatch-gates")) {
     process.env.COORDINATOR_EVAL_TASKS_REPO ||
     process.env.COORDINATOR_THECOACH_REPO ||
     DEFAULT_QUEUE_REPO_PATH;
-  const ids = ["TASK-023", "TASK-033", "TASK-037", "TASK-038", "TASK-039"];
+  // COORDINATOR_EVAL_TASK_IDS overrides the default sample so a specific
+  // case can be dry-run without editing this file. Comma/space separated.
+  const idsOverride = (process.env.COORDINATOR_EVAL_TASK_IDS || "")
+    .split(/[\s,]+/)
+    .map((s) => s.trim().toUpperCase())
+    .filter(Boolean);
+  const ids = idsOverride.length > 0 ? idsOverride : ["TASK-023", "TASK-033", "TASK-037", "TASK-038", "TASK-039"];
   const ledger = loadLedger();
   const results = ids.map((id) => {
     const contract = loadTaskContractForId(id, { thecoachRepo: repo });
@@ -5832,6 +6179,9 @@ if (process.argv.includes("--eval-dispatch-gates")) {
       missing: Boolean(contract.missing),
       dispatch: contract.missing ? null : contract.dispatch,
       tool: contract.ok ? contract.tool : null,
+      status_ok: contract.missing ? null : contract.status?.ok === true,
+      status_value: contract.missing ? null : (contract.status?.status ?? contract.status?.value ?? null),
+      base_parsed: contract.missing ? null : (contract.base?.ok ? contract.base.base : contract.base?.reason ?? null),
       ledger_blocked: ledgerBlocksKey(ledger, id),
       ledger_cleared: ledger[id]?.cleared === true,
       scope_matches: scope.matches ?? [],
