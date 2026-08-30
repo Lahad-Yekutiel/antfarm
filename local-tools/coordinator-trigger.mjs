@@ -2360,19 +2360,33 @@ function getRunStatus(runIdParam) {
  * After spawning workflow run (fire-and-forget like /trigger), poll the DB
  * read-only until the real antfarm run UUID appears for this exact task text.
  */
-async function waitForAntfarmRunId(taskText, { timeoutMs = WAIT_FOR_RUN_TIMEOUT_MS, intervalMs = 250 } = {}) {
+async function waitForAntfarmRunId(taskText, { timeoutMs = WAIT_FOR_RUN_TIMEOUT_MS, intervalMs = 250, since = null } = {}) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (fs.existsSync(ANTFARM_DB)) {
       const db = new DatabaseSync(ANTFARM_DB, { readOnly: true });
       try {
-        const row = db
-          .prepare(
-            `SELECT id, status, run_number FROM runs
-             WHERE workflow_id = ? AND task = ?
-             ORDER BY created_at DESC LIMIT 1`,
-          )
-          .get(DEFAULT_WORKFLOW, taskText);
+        // `since` anchors resolution to the caller's own dispatch. Task text is
+        // not unique — an auto-retry re-dispatches byte-identical text — so
+        // without the lower bound a prior run satisfies this query on the first
+        // poll and the caller records the OLD run's id. That is how run #38 was
+        // orphaned on 2026-08-30: queue item b4d46cf269ff recorded run #37's id
+        // and was then marked failed from #37's terminal state while #38 ran on.
+        const row = since
+          ? db
+              .prepare(
+                `SELECT id, status, run_number FROM runs
+                 WHERE workflow_id = ? AND task = ? AND created_at >= ?
+                 ORDER BY created_at DESC LIMIT 1`,
+              )
+              .get(DEFAULT_WORKFLOW, taskText, since)
+          : db
+              .prepare(
+                `SELECT id, status, run_number FROM runs
+                 WHERE workflow_id = ? AND task = ?
+                 ORDER BY created_at DESC LIMIT 1`,
+              )
+              .get(DEFAULT_WORKFLOW, taskText);
         if (row) return row;
       } finally {
         try {
@@ -3072,6 +3086,12 @@ async function spawnPendingQueueItem(queue, idx, deps = {}) {
     task: item.task,
   });
 
+  // Captured before the spawn so the run this dispatch creates is always at or
+  // after it. 1s of slack absorbs clock jitter between this process and the
+  // antfarm CLI that writes the row; a stale prior run is hours older, never
+  // seconds, so the slack cannot re-admit one.
+  const dispatchSince = new Date(Date.now() - 1000).toISOString();
+
   let spawnResult;
   try {
     spawnResult = startRun({ workflow: DEFAULT_WORKFLOW, task: taskText });
@@ -3079,7 +3099,7 @@ async function spawnPendingQueueItem(queue, idx, deps = {}) {
     return { status: 500, body: { ok: false, error: err?.message || String(err) } };
   }
 
-  const antfarmRun = await waitRun(taskText);
+  const antfarmRun = await waitRun(taskText, { since: dispatchSince });
   if (!antfarmRun) {
     recordLedgerAttempt(
       ledgerKey,
@@ -5842,6 +5862,79 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
 // Does not bind the port, does not spawn workflows, does not touch the live
 // queue. Uses TASK-027 and TASK-029's real files as fixtures. Invoke:
 //   COORDINATOR_TOKEN=x node local-tools/coordinator-trigger.mjs --self-test-task-contract
+// Scoped test for run-id resolution (2026-08-30). Proves a dispatch can never
+// resolve to a run that predates it, even when task text is byte-identical.
+// Requires a scratch DB:
+//   COORDINATOR_TOKEN=x COORDINATOR_ANTFARM_DB=/tmp/rid.db \
+//     node local-tools/coordinator-trigger.mjs --self-test-run-id-resolution
+if (process.argv.includes("--self-test-run-id-resolution")) {
+  const failures = [];
+  const check = (label, cond, detail) => {
+    if (!cond) failures.push({ label, detail });
+    return { case: label, ok: Boolean(cond), detail: cond ? null : detail };
+  };
+
+  const realDb = path.join(os.homedir(), ".openclaw", "antfarm", "antfarm.db");
+  if (!process.env.COORDINATOR_ANTFARM_DB || path.resolve(ANTFARM_DB) === path.resolve(realDb)) {
+    console.error("refusing to run: point COORDINATOR_ANTFARM_DB at a scratch database first");
+    process.exit(2);
+  }
+
+  const TASK = "REPO: /tmp/r\nBRANCH: b\n\nIdentical task text";
+  const OLD_ID = "old-run-0037";
+  const NEW_ID = "new-run-0038";
+  const OLD_AT = "2026-08-30T17:31:00.426Z";
+  const NEW_AT = "2026-08-30T20:10:24.664Z";
+  // The dispatch that spawns the new run starts just before the new run exists.
+  const DISPATCH_SINCE = "2026-08-30T20:10:23.664Z";
+
+  fs.mkdirSync(path.dirname(ANTFARM_DB), { recursive: true });
+  fs.rmSync(ANTFARM_DB, { force: true });
+  const seed = new DatabaseSync(ANTFARM_DB);
+  seed.exec(
+    `CREATE TABLE runs (id TEXT PRIMARY KEY, workflow_id TEXT, task TEXT,
+                        status TEXT, created_at TEXT, updated_at TEXT, run_number INTEGER)`,
+  );
+  const insert = (id, status, at, n) =>
+    seed
+      .prepare(
+        `INSERT INTO runs (id, workflow_id, task, status, created_at, updated_at, run_number)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(id, DEFAULT_WORKFLOW, TASK, status, at, at, n);
+
+  // Phase 1 — only the older run exists yet, exactly as at the moment of dispatch.
+  insert(OLD_ID, "failed", OLD_AT, 37);
+  seed.close();
+
+  const unanchored = await waitForAntfarmRunId(TASK, { timeoutMs: 400, intervalMs: 50 });
+  const anchored1 = await waitForAntfarmRunId(TASK, { timeoutMs: 400, intervalMs: 50, since: DISPATCH_SINCE });
+
+  // Phase 2 — the run this dispatch actually spawned lands.
+  const db2 = new DatabaseSync(ANTFARM_DB);
+  db2
+    .prepare(
+      `INSERT INTO runs (id, workflow_id, task, status, created_at, updated_at, run_number)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(NEW_ID, DEFAULT_WORKFLOW, TASK, "running", NEW_AT, NEW_AT, 38);
+  db2.close();
+
+  const anchored2 = await waitForAntfarmRunId(TASK, { timeoutMs: 400, intervalMs: 50, since: DISPATCH_SINCE });
+
+  const cases = [
+    check("unanchored-reproduces-the-bug", unanchored?.id === OLD_ID, unanchored),
+    check("anchored-refuses-stale-run", anchored1 === null, anchored1),
+    check("anchored-resolves-new-run", anchored2?.id === NEW_ID, anchored2),
+    check("anchored-is-not-stale-run", anchored2?.id !== OLD_ID, anchored2),
+    check("anchored-run-number-is-new", anchored2?.run_number === 38, anchored2),
+  ];
+
+  fs.rmSync(ANTFARM_DB, { force: true });
+  console.log(JSON.stringify({ db: ANTFARM_DB, failures, cases }, null, 2));
+  process.exit(failures.length === 0 ? 0 : 1);
+}
+
 if (process.argv.includes("--self-test-task-contract")) {
   const origLog = console.log;
   console.log = (...args) => {
