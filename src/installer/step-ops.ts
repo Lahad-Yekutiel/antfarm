@@ -303,6 +303,16 @@ function formatProtectedPathGateGitFailedError(detail: string, originalOutput: s
   ].join("\n");
 }
 
+/**
+ * fail_when hits used to store only the synthesized "Agent reported … REASON:"
+ * wrapper, which permanently discarded NOTES:/REASON: the agent actually wrote
+ * (TASK-026 #35/#36). Mirror the ENGINE_ERROR formatters: keep ORIGINAL_OUTPUT.
+ */
+function formatFailWhenStoredOutput(message: string, originalOutput: string): string {
+  if (!originalOutput.trim()) return message;
+  return [message, ENGINE_ERROR_ORIGINAL_OUTPUT_HEADER, originalOutput].join("\n");
+}
+
 function formatProtectedPathHitsMessage(hits: string[]): string {
   return `Protected-path gate: diff touches ${hits.join(", ")}`;
 }
@@ -526,10 +536,20 @@ function testFailureMatchesExpectedBaseline(
 }
 
 function failureReason(parsed: Record<string, string>, key: string): string {
-  return parsed.reason
-    ?? parsed[`${key}_reason`]
-    ?? parsed.status_reason
-    ?? "(none given)";
+  const explicit =
+    nonempty(parsed.reason)
+    ?? nonempty(parsed[`${key}_reason`])
+    ?? nonempty(parsed.status_reason);
+  if (explicit) return explicit;
+  // Review-step contract (`workflow.yml`) asks for NOTES, not REASON.
+  const notes = nonempty(parsed.notes);
+  if (notes) return notes;
+  return "(none given)";
+}
+
+function nonempty(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
 }
 
 /**
@@ -1473,7 +1493,10 @@ export function completeStep(stepId: string, output: string): { advanced: boolea
     if (!bounceToImplement) {
       const reason = failureReason(parsed, failure.key);
       const verdictNote = failure.reason ? ` (${failure.reason})` : "";
-      const message = `Agent reported ${failure.key.toUpperCase()}: ${failure.value}${verdictNote}. REASON: ${reason}`;
+      const message = formatFailWhenStoredOutput(
+        `Agent reported ${failure.key.toUpperCase()}: ${failure.value}${verdictNote}. REASON: ${reason}`,
+        output,
+      );
       const failResult = failStepSync(stepId, message, { stdoutTail: tailOutput(output) });
       if (failResult.runFailed) {
         notifyFailureExhausted(step.run_id, step.step_id, message).catch(() => {});

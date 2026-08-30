@@ -259,6 +259,34 @@ describe("completeStep status and contract gates", () => {
     assert.equal(merge.status, "waiting");
   });
 
+  // TASK-026 #35/#36: reviewer wrote findings under NOTES: (the review-step
+  // contract) and the engine reported REASON: (none given). Exact excerpt from
+  // the Failure Checks 2026-08-30 diagnosis (session 498d51b4).
+  it("review STATUS: changes_requested with NOTES stores the NOTES text, not (none given)", () => {
+    const notes =
+      "Real blocker, verified live with my own scratch fixture: tools/schema-drift/parse-migrations.mjs only recognizes four statement shapes. Any other schema-affecting ALTER — e.g. ALTER COLUMN ... TYPE — is silently dropped. Direct violation of TASK-026's own Edge Cases section.";
+    const { stepDbIds } = insertRun([
+      { stepId: "review", agentId: "thecoach-dev_reviewer", stepIndex: 0, expects: "STATUS:", status: "running", maxRetries: 0 },
+      { stepId: "merge", agentId: "thecoach-dev_merge", stepIndex: 1, expects: "STATUS:", status: "waiting" },
+    ], { repo: cleanFixtureRepo().repo, branch: "feat-x", pr_url: "https://github.com/o/r/pull/22" });
+
+    const agentOutput = `STATUS: changes_requested\nNOTES: ${notes}`;
+    const result = completeStep(stepDbIds.review, agentOutput);
+
+    assert.equal(result.advanced, false);
+    const db = getDb();
+    const review = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(stepDbIds.review) as {
+      status: string;
+      output: string;
+    };
+    assert.equal(review.status, "failed");
+    assert.ok(review.output.includes("STATUS: changes_requested"), review.output);
+    assert.ok(review.output.includes(notes), review.output);
+    assert.equal(review.output.includes("(none given)"), false, review.output);
+    assert.ok(review.output.includes("ORIGINAL_OUTPUT:"), review.output);
+    assert.ok(review.output.includes(agentOutput), review.output);
+  });
+
   it("verify GATE: fail + STATUS: pass fails the step and does not advance", () => {
     const { stepDbIds } = insertRun([
       { stepId: "verify", agentId: "thecoach-dev_verifier", stepIndex: 0, expects: "GATE: STATUS:", status: "running", maxRetries: 1 },
