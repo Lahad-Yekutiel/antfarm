@@ -1776,6 +1776,28 @@ function buildAutoRetryQueueItem({ item, diagnosis, attemptNumber, cap }) {
 }
 
 /**
+ * Ledger-failure fallback question. Uses the same injectable deps seam as
+ * writeParkTodo/handleFailedRunOutcome: reader, writer and repo all resolve
+ * through `deps`, so a caller or a test can redirect them. Hardcoding
+ * THECOACH_REPO at the call site made this the one append path that could not
+ * be stubbed.
+ */
+function writeLedgerFailureTodo({ ledgerKey, item, run, outcome }, deps = {}) {
+  const appendTodo = deps.appendTodo || ((repo, draft) => appendDeveloperTodoEntry(repo, draft, deps));
+  const repo = deps.thecoachRepo !== undefined ? deps.thecoachRepo : THECOACH_REPO;
+  if (!repo && !deps.appendTodo) return { appended: false, reason: "no-thecoach-repo" };
+  return appendTodo(repo, {
+    summary: `Dispatch of ${ledgerKey} failed (run ${item.runId}); auto-retry handling errored, do not retry until the ledger entry is cleared`,
+    why: `The last antfarm run ended runStatus=${run.status} queueStatus=${outcome.status}, and the automatic diagnose-and-retry path itself threw. Re-dispatching unattended would repeat the failure.`,
+    source: ledgerKey,
+    type: "blocked",
+    evidence: item.note || `run ${item.runId}`,
+    reply_needed: `Diagnose ${ledgerKey}, then clear coordinator-dispatch-ledger.json[${ledgerKey}] to allow a retry.`,
+    blocks: [`task:${ledgerKey}`],
+  });
+}
+
+/**
  * Park for the developer — same scoped-blocker route refuseProtectedPathScope
  * already uses, so the rest of the queue is provably unaffected. The summary
  * carries the attempt count and class so a second park for the same task is
@@ -3845,15 +3867,7 @@ const server = http.createServer(async (req, res) => {
             roadmap_ref: item.roadmap_ref ?? null,
           });
           try {
-            appendDeveloperTodoEntry(THECOACH_REPO, {
-              summary: `Dispatch of ${ledgerKey} failed (run ${item.runId}); auto-retry handling errored, do not retry until the ledger entry is cleared`,
-              why: `The last antfarm run ended runStatus=${run.status} queueStatus=${outcome.status}, and the automatic diagnose-and-retry path itself threw. Re-dispatching unattended would repeat the failure.`,
-              source: ledgerKey,
-              type: "blocked",
-              evidence: item.note || `run ${item.runId}`,
-              reply_needed: `Diagnose ${ledgerKey}, then clear coordinator-dispatch-ledger.json[${ledgerKey}] to allow a retry.`,
-              blocks: [`task:${ledgerKey}`],
-            });
+            writeLedgerFailureTodo({ ledgerKey, item, run, outcome });
           } catch (todoErr) {
             logDispatchNextError(`ledger failure-question write failed: ${todoErr?.message || String(todoErr)}`);
           }
@@ -4178,6 +4192,15 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   }
 
   const emptyTodo = () => "[]";
+  // Every stubbed readTodo in this suite is paired with a stubbed writeTodo.
+  // appendDeveloperTodoEntry() resolves its reader and its writer
+  // independently, so a faked read plus a real write rewrites the production
+  // developer_todo.json with fixture data — that is how TODO-0016..0021 were
+  // lost on 2026-08-30.
+  const testTodoWrites = [];
+  const sinkTodo = (_repo, entries) => {
+    testTodoWrites.push(entries);
+  };
 
   const STUB_ROADMAP = [
     "# ROADMAP",
@@ -4440,9 +4463,11 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   const ledgerDispatch = memoryLedger();
   let scanCalledOnDispatch = 0;
   const dispatchResult = await handleDispatchNext({
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
     ...dispatchMocks(),
     load: mqDispatch.load,
     save: mqDispatch.save,
+    writeTodo: sinkTodo,
     readTodo: emptyTodo,
     ...bgDispatch,
     ...scanDispatchState,
@@ -4493,9 +4518,11 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   let startRunOnBlocked = 0;
   let blockedAgentCalls = 0;
   const blockedHttp = await handleDispatchNext({
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
     findActive: () => null,
     load: mqBlocked.load,
     save: mqBlocked.save,
+    writeTodo: sinkTodo,
     readTodo: () => JSON.stringify([{ id: "TODO-0004", status: "open", summary: "oauth", blocks: ["phase:4B", "oq:OQ-12"] }]),
     ...bgBlocked,
     ...memoryScanState(),
@@ -4505,6 +4532,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
       return scanRoadmapForWork({
         ...scanDeps,
         thecoachRepo: "/tmp/thecoach-does-not-matter",
+        writeTodo: sinkTodo,
         readTodo: () => JSON.stringify([{ id: "TODO-0004", status: "open", summary: "oauth", blocks: ["phase:4B", "oq:OQ-12"] }]),
         readRoadmap: () => STUB_ROADMAP,
         runAgent: async () => JSON.stringify({ payloads: [{ text: JSON.stringify(phase4bDispatch) }] }),
@@ -4535,9 +4563,11 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   const bgMissingScopes = backgroundBox();
   let startRunOnMissingScopes = 0;
   const missingScopesHttp = await handleDispatchNext({
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
     findActive: () => null,
     load: mqMissingScopes.load,
     save: mqMissingScopes.save,
+    writeTodo: sinkTodo,
     readTodo: emptyTodo,
     ...bgMissingScopes,
     ...memoryScanState(),
@@ -4560,9 +4590,11 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   dispatchMocks.started = [];
   let emptyBlocksAgentCalls = 0;
   const emptyBlocksHttp = await handleDispatchNext({
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
     ...dispatchMocks(),
     load: mqEmptyBlocks.load,
     save: mqEmptyBlocks.save,
+    writeTodo: sinkTodo,
     readTodo: () => JSON.stringify([{ id: "TODO-0006", status: "open", summary: "billing", blocks: [] }]),
     ...bgEmptyBlocks,
     ...memoryScanState(),
@@ -4570,6 +4602,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     scan: async () =>
       scanRoadmapForWork({
         thecoachRepo: "/tmp/thecoach-does-not-matter",
+        writeTodo: sinkTodo,
         readTodo: () => JSON.stringify([{ id: "TODO-0006", status: "open", summary: "billing", blocks: [] }]),
         readRoadmap: () => STUB_ROADMAP,
         runAgent: async () => {
@@ -4590,6 +4623,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   let missingBlocksAgentCalls = 0;
   const missingBlocksScan = await scanRoadmapForWork({
     thecoachRepo: "/tmp/thecoach-does-not-matter",
+    writeTodo: sinkTodo,
     readTodo: () => JSON.stringify(missingBlocksTodo),
     readRoadmap: () => "# ROADMAP",
     runAgent: async () => {
@@ -4600,9 +4634,11 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   const schemaLogs = capturedLogs.slice(schemaLogsBefore);
   let missingBlocksHttpAgent = 0;
   const missingBlocksHttp = await handleDispatchNext({
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
     findActive: () => null,
     load: memoryQueue([]).load,
     save: () => {},
+    writeTodo: sinkTodo,
     readTodo: () => JSON.stringify(missingBlocksTodo),
     scan: async () => {
       missingBlocksHttpAgent += 1;
@@ -4637,6 +4673,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   try {
     ceilingScan = await scanRoadmapForWork({
       thecoachRepo: "/tmp/thecoach-does-not-matter",
+      writeTodo: sinkTodo,
       readTodo: () => JSON.stringify(tenOpen),
       readRoadmap: () => "# ROADMAP",
       runAgent: async () => {
@@ -4649,9 +4686,11 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   }
   let ceilingHttpScan = 0;
   const ceilingHttp = await handleDispatchNext({
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
     findActive: () => null,
     load: memoryQueue([]).load,
     save: () => {},
+    writeTodo: sinkTodo,
     readTodo: () => JSON.stringify(tenOpen),
     scan: async () => {
       ceilingHttpScan += 1;
@@ -4681,9 +4720,11 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   const mqNine = memoryQueue([]);
   const bgNine = backgroundBox();
   const nineHttp = await handleDispatchNext({
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
     ...dispatchMocks(),
     load: mqNine.load,
     save: mqNine.save,
+    writeTodo: sinkTodo,
     readTodo: () => JSON.stringify(nineOpen),
     ...bgNine,
     ...memoryScanState(),
@@ -4691,6 +4732,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     scan: async () =>
       scanRoadmapForWork({
         thecoachRepo: "/tmp/thecoach-does-not-matter",
+        writeTodo: sinkTodo,
         readTodo: () => JSON.stringify(nineOpen),
         readRoadmap: () => STUB_ROADMAP,
         runAgent: async () => {
@@ -4717,6 +4759,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     loadIdle: idleNothing.loadIdle,
     saveIdle: idleNothing.saveIdle,
     thecoachRepo: "/tmp/idle",
+    writeTodo: sinkTodo,
     readTodo: () => JSON.stringify([
       { id: "TODO-0004", status: "open", blocks: [] },
       { id: "TODO-0006", status: "open", blocks: [] },
@@ -4746,6 +4789,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     await scanRoadmapForWork({
       thecoachRepo: "/tmp/thecoach-does-not-matter",
       readRoadmap: () => "# ROADMAP",
+      writeTodo: sinkTodo,
       readTodo: () => "[]",
       runAgent: async () => {
         const err = new Error("openclaw agent failed: spawn ETIMEDOUT");
@@ -4758,6 +4802,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     await scanRoadmapForWork({
       thecoachRepo: "/tmp/thecoach-does-not-matter",
       readRoadmap: () => "# ROADMAP",
+      writeTodo: sinkTodo,
       readTodo: () => "[]",
       runAgent: async () => {
         throw new Error("openclaw agent failed: Command failed: openclaw agent");
@@ -4768,6 +4813,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     await scanRoadmapForWork({
       thecoachRepo: "/tmp/thecoach-does-not-matter",
       readRoadmap: () => "# ROADMAP",
+      writeTodo: sinkTodo,
       readTodo: () => "[]",
       runAgent: async () => "this is not json {",
     }),
@@ -4776,6 +4822,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     await scanRoadmapForWork({
       thecoachRepo: "/tmp/thecoach-does-not-matter",
       readRoadmap: () => "# ROADMAP",
+      writeTodo: sinkTodo,
       readTodo: () => "[]",
       runAgent: async () => JSON.stringify({ payloads: [{ text: "I think we should dispatch something." }] }),
     }),
@@ -4785,9 +4832,11 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     const mq = memoryQueue([]);
     const bg = backgroundBox();
     const httpResult = await handleDispatchNext({
+      thecoachRepo: "/tmp/thecoach-does-not-matter",
       findActive: () => null,
       load: mq.load,
       save: mq.save,
+      writeTodo: sinkTodo,
       readTodo: emptyTodo,
       ...bg,
       ...memoryScanState(),
@@ -4818,6 +4867,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   try {
     await scanRoadmapForWork({
       thecoachRepo: "/tmp/thecoach-does-not-matter",
+      writeTodo: sinkTodo,
       readTodo: () => "[]",
       readRoadmap: () => {
         throw new Error("ENOENT: no such file or directory, open '.../_SSoT/ROADMAP.md'");
@@ -4900,6 +4950,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   let occupiedScanCalls = 0;
   const occupiedStarted = [];
   const occupiedResult = await handleDispatchNext({
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
     findActive: () => null,
     load: mqOccupied.load,
     save: mqOccupied.save,
@@ -4929,6 +4980,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   ];
 
   const activeHttp = await handleDispatchNext({
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
     findActive: () => ({ id: "run-active", status: "running", run_number: 7 }),
     load: () => {
       throw new Error("load must not run on active-run");
@@ -4974,6 +5026,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
         roadmapRepos.push(repo);
         return "# ROADMAP\n## Phase 4A\n";
       },
+      writeTodo: sinkTodo,
       readTodo: (repo) => {
         todoRepos.push(repo);
         return '[{"id":"TODO-0001","status":"open","blocks":[]}]';
@@ -5026,6 +5079,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
       loadIdle: idle.loadIdle,
       saveIdle: idle.saveIdle,
       thecoachRepo: "/tmp/idle",
+      writeTodo: sinkTodo,
       readTodo: emptyTodo,
       ...bg,
       ...memoryScanState(),
@@ -5052,6 +5106,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     loadIdle: idleAfterDispatch.loadIdle,
     saveIdle: idleAfterDispatch.saveIdle,
     thecoachRepo: "/tmp/idle",
+    writeTodo: sinkTodo,
     readTodo: emptyTodo,
     ...bgIdleDispatch,
     ...memoryScanState(),
@@ -5074,6 +5129,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     loadIdle: idleBeforeCeiling.loadIdle,
     saveIdle: idleBeforeCeiling.saveIdle,
     thecoachRepo: "/tmp/idle",
+    writeTodo: sinkTodo,
     readTodo: () => JSON.stringify(tenOpen),
   });
   let idleThrowLoads = 0;
@@ -5083,6 +5139,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     ...dispatchMocks(),
     load: memoryQueue([]).load,
     save: () => {},
+    writeTodo: sinkTodo,
     readTodo: emptyTodo,
     ...bgIdleSwallow,
     ...memoryScanState(),
@@ -5185,9 +5242,11 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     overlapResolve = resolve;
   });
   const overlapFirst = await handleDispatchNext({
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
     findActive: () => null,
     load: memoryQueue([]).load,
     save: () => {},
+    writeTodo: sinkTodo,
     readTodo: emptyTodo,
     ...bgOverlap,
     ...overlapState,
@@ -5200,9 +5259,11 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   });
   let overlapSecondScan = 0;
   const overlapSecond = await handleDispatchNext({
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
     findActive: () => null,
     load: memoryQueue([]).load,
     save: () => {},
+    writeTodo: sinkTodo,
     readTodo: emptyTodo,
     ...bgOverlap,
     ...overlapState,
@@ -5234,9 +5295,11 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   });
   const bgStale = backgroundBox();
   const staleHttp = await handleDispatchNext({
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
     findActive: () => null,
     load: memoryQueue([]).load,
     save: () => {},
+    writeTodo: sinkTodo,
     readTodo: emptyTodo,
     now: Date.now(),
     ...bgStale,
@@ -5273,9 +5336,11 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   const bgLedger = backgroundBox();
   let ledgerStartRun = 0;
   const ledgerHttp = await handleDispatchNext({
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
     findActive: () => null,
     load: mqLedger.load,
     save: mqLedger.save,
+    writeTodo: sinkTodo,
     readTodo: emptyTodo,
     ...bgLedger,
     ...memoryScanState(),
@@ -5314,6 +5379,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   let humanLedgerStartRun = 0;
   let humanLedgerFetch = 0;
   const humanLedgerHttp = await handleDispatchNext({
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
     findActive: () => null,
     load: mqHumanLedger.load,
     save: mqHumanLedger.save,
@@ -5344,6 +5410,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   ]);
   const humanClearedStarted = [];
   const humanClearedHttp = await handleDispatchNext({
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
     findActive: () => null,
     load: mqHumanCleared.load,
     save: mqHumanCleared.save,
@@ -5369,6 +5436,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   ]);
   let unledgerableStartRun = 0;
   const unledgerableHttp = await handleDispatchNext({
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
     findActive: () => null,
     load: mqUnledgerable.load,
     save: mqUnledgerable.save,
@@ -5392,6 +5460,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   ]);
   const ledger504 = memoryLedger();
   const http504 = await handleDispatchNext({
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
     findActive: () => null,
     load: mq504.load,
     save: mq504.save,
@@ -5403,6 +5472,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   });
   let startAfter504 = 0;
   const after504 = await handleDispatchNext({
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
     findActive: () => null,
     load: mq504.load,
     save: mq504.save,
@@ -5443,9 +5513,11 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   const bgSlow = backgroundBox();
   const t0 = Date.now();
   const slowHttp = await handleDispatchNext({
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
     findActive: () => null,
     load: memoryQueue([]).load,
     save: () => {},
+    writeTodo: sinkTodo,
     readTodo: emptyTodo,
     ...bgSlow,
     ...memoryScanState(),
@@ -5610,6 +5682,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     findActive: () => null,
     load: memoryQueue([]).load,
     save: () => {},
+    writeTodo: sinkTodo,
     readTodo: emptyTodo,
     loadIdle: idleErr1.loadIdle,
     saveIdle: idleErr1.saveIdle,
@@ -5629,6 +5702,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     findActive: () => null,
     load: memoryQueue([]).load,
     save: () => {},
+    writeTodo: sinkTodo,
     readTodo: emptyTodo,
     loadIdle: idleErr2.loadIdle,
     saveIdle: idleErr2.saveIdle,
@@ -5656,6 +5730,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     },
     load: memoryQueue([]).load,
     save: () => {},
+    writeTodo: sinkTodo,
     readTodo: emptyTodo,
     loadIdle: idleErr3.loadIdle,
     saveIdle: idleErr3.saveIdle,
@@ -5670,9 +5745,11 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   const bgBackstop = backgroundBox();
   const scanBackstop = memoryScanState();
   const backstopFirst = await handleDispatchNext({
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
     findActive: () => null,
     load: memoryQueue([]).load,
     save: () => {},
+    writeTodo: sinkTodo,
     readTodo: emptyTodo,
     ...bgBackstop,
     ...scanBackstop,
@@ -5688,9 +5765,11 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   await bgBackstop.flush();
   const viewed = publicScanState(scanBackstop);
   const backstopSecond = await handleDispatchNext({
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
     findActive: () => null,
     load: memoryQueue([]).load,
     save: () => {},
+    writeTodo: sinkTodo,
     readTodo: emptyTodo,
     enqueueBackground: () => {},
     ...memoryScanState(scanBackstop.get()),
