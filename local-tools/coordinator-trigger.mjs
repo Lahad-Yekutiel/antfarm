@@ -6721,8 +6721,11 @@ if (process.argv.includes("--self-test-dispatch-scope-gate")) {
 
 // Drive the production auto-retry path against a real antfarm run in the
 // isolated test DB. Resume is the real CLI (`workflow resume`), not a stub.
-// Invoke:
+// Ambiguous (fixable) failures enqueue a diagnosis job; this eval drains it
+// so all three classes can run end to end. Invoke:
 //   COORDINATOR_TOKEN=x node local-tools/coordinator-trigger.mjs --eval-auto-retry-resume <run-id>
+// Optional: COORDINATOR_EVAL_DIAGNOSIS_REPLY='{"class":"fixable",...}' — same
+// runDiagnosisAgent seam the self-test uses. Unset → production openclaw turn.
 if (process.argv.includes("--eval-auto-retry-resume")) {
   const idx = process.argv.indexOf("--eval-auto-retry-resume");
   const runIdParam = process.argv[idx + 1];
@@ -6755,7 +6758,33 @@ if (process.argv.includes("--eval-auto-retry-resume")) {
   const mq = [];
   const ledger = {};
   const todos = [];
-  const result = handleFailedRunOutcome(
+  const diagnosisJobs = [];
+  const evalDeps = {
+    loadLedger: () => JSON.parse(JSON.stringify(ledger)),
+    saveLedger: (next) => {
+      for (const key of Object.keys(ledger)) delete ledger[key];
+      Object.assign(ledger, next);
+    },
+    load: () => mq,
+    save: (next) => {
+      mq.length = 0;
+      mq.push(...next);
+    },
+    thecoachRepo: "/tmp/thecoach",
+    appendTodo: (_repo, draft) => {
+      todos.push(draft);
+      return { appended: true, entry: draft };
+    },
+    branchDiff: () => ({ ran: false, digest: null, files: [], error: "eval" }),
+    enqueueBackground: (job) => {
+      diagnosisJobs.push(job);
+    },
+  };
+  const diagnosisReply = process.env.COORDINATOR_EVAL_DIAGNOSIS_REPLY;
+  if (diagnosisReply) {
+    evalDeps.runDiagnosisAgent = async () => JSON.stringify({ ok: true, final: String(diagnosisReply) });
+  }
+  let result = handleFailedRunOutcome(
     {
       ledgerKey: taskId,
       item,
@@ -6764,31 +6793,19 @@ if (process.argv.includes("--eval-auto-retry-resume")) {
       queueStatus: "failed",
       stepsResult,
     },
-    {
-      loadLedger: () => JSON.parse(JSON.stringify(ledger)),
-      saveLedger: (next) => {
-        for (const key of Object.keys(ledger)) delete ledger[key];
-        Object.assign(ledger, next);
-      },
-      load: () => mq,
-      save: (next) => {
-        mq.length = 0;
-        mq.push(...next);
-      },
-      thecoachRepo: "/tmp/thecoach",
-      appendTodo: (_repo, draft) => {
-        todos.push(draft);
-        return { appended: true, entry: draft };
-      },
-      branchDiff: () => ({ ran: false, digest: null, files: [], error: "eval" }),
-      enqueueBackground: () => {},
-    },
+    evalDeps,
   );
+  const initialOutcome = result?.outcome;
+  for (const job of diagnosisJobs) {
+    result = await job();
+  }
   const runAfter = getRunStatus(runIdParam);
   console.log(
     JSON.stringify(
       {
         ok: true,
+        initialOutcome,
+        diagnosisJobs: diagnosisJobs.length,
         result,
         queue: mq,
         ledger: ledger[taskId] || null,
