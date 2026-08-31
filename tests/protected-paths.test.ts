@@ -208,7 +208,12 @@ describe("listProtectedDiffFiles + completeStep host-side gate", () => {
     assert.equal(missingProtectedDiffField(undefined, "abc"), "repo");
   });
 
-  it("B1: missing commit_sha fails verify with ENGINE_ERROR and ORIGINAL_OUTPUT", () => {
+  // D1 (2026-08-31): with a `branch` in context, an unusable commit_sha now
+  // falls back to the branch-level diff instead of erroring — see
+  // tests/protected-path-no-commit-fallback.test.ts. This case keeps the
+  // original contract for the one situation D1 cannot help with: no usable
+  // commit AND no branch, so there is nothing to diff at all. Fails CLOSED.
+  it("B1: missing commit_sha with no branch to fall back to still fails verify", () => {
     const db = getDb();
     const runId = randomUUID();
     const stepId = randomUUID();
@@ -217,7 +222,7 @@ describe("listProtectedDiffFiles + completeStep host-side gate", () => {
     db.prepare(
       `INSERT INTO runs (id, workflow_id, task, status, context, created_at, updated_at)
        VALUES (?, 'thecoach-dev', 'test task', 'running', ?, ?, ?)`,
-    ).run(runId, JSON.stringify({ repo: "/tmp/does-not-matter", branch: "feat" }), now, now);
+    ).run(runId, JSON.stringify({ repo: "/tmp/does-not-matter" }), now, now);
     db.prepare(
       `INSERT INTO steps (id, step_id, run_id, agent_id, step_index, input_template, expects, status, max_retries, created_at, updated_at, type)
        VALUES (?, 'verify', ?, 'thecoach-dev_verifier', 0, 'test', 'GATE: STATUS:', 'running', 0, ?, ?, 'single')`,
@@ -344,21 +349,41 @@ describe("listProtectedDiffFiles + completeStep host-side gate", () => {
     assert.equal(verify.output.includes("protected_path_gate_git_failed"), false);
   });
 
-  it("a COMMIT_SHA with no hex token is missing context, not git_failed", () => {
+  // Was: "a COMMIT_SHA with no hex token is missing context, not git_failed".
+  // D1 (2026-08-31) changed this deliberately. A story that produces no commit
+  // (demonstrate-and-revert) writes prose into COMMIT_SHA and used to kill the
+  // run; it now falls back to the branch-level diff that already gates pr/merge.
+  // That diff is a strict superset of the per-commit one, so the companion case
+  // below — same input, but a branch that DOES touch a protected path — still
+  // fails closed. Neither case can silently pass a real violation.
+  it("a COMMIT_SHA with no hex token falls back to the branch check, not an error", () => {
     const { repo } = makeRepoWithFile("apps/web/page.tsx");
     const stepDbId = insertVerifyRun(repo, "not a git object name");
-    const agentOutput = "GATE: pass\nSTATUS: pass";
-    const result = completeStep(stepDbId, agentOutput);
+    const result = completeStep(stepDbId, "GATE: pass\nSTATUS: pass");
+    const db = getDb();
+    const verify = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(stepDbId) as {
+      status: string;
+      output: string;
+    };
+    // staging...feat touches only apps/web/page.tsx — clean, so verify advances.
+    assert.equal(result.advanced, true);
+    assert.equal(verify.status, "done");
+    assert.equal(verify.output.includes("protected_path_gate_missing_context"), false);
+    assert.equal(verify.output.includes("protected_path_gate_git_failed"), false);
+  });
+
+  it("an unusable COMMIT_SHA still fails closed when the branch touches a protected path", () => {
+    const { repo } = makeRepoWithFile("supabase/config.toml");
+    const stepDbId = insertVerifyRun(repo, "not a git object name");
+    const result = completeStep(stepDbId, "GATE: pass\nSTATUS: pass");
     assert.equal(result.advanced, false);
     const db = getDb();
     const verify = db.prepare("SELECT status, output FROM steps WHERE id = ?").get(stepDbId) as {
       status: string;
       output: string;
     };
-    // insertVerifyRun uses max_retries=1, so the first fail is pending, not terminal failed.
     assert.notEqual(verify.status, "done");
-    assert.ok(verify.output.includes("ENGINE_ERROR: protected_path_gate_missing_context: commit_sha"), verify.output);
-    assert.equal(verify.output.includes("protected_path_gate_git_failed"), false);
+    assert.ok(verify.output.includes("Protected-path gate: diff touches supabase/config.toml"), verify.output);
   });
 
   it("B1: both present and a clean apps-only diff passes verify", () => {

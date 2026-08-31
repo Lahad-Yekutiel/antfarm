@@ -16,6 +16,7 @@ import { isFrontendChange } from "../lib/frontend-detect.js";
 import {
   findProtectedPaths,
   formatProtectedPathPatternsForPrompt,
+  isNoCommitSentinel,
   missingProtectedDiffField,
   PROTECTED_PATH_DIFF_DEFAULT_BASE,
 } from "../lib/protected-paths.js";
@@ -248,6 +249,25 @@ export function sanitizeCommitShaForGitRef(raw: string | undefined): SanitizedCo
   const sha = match[0].toLowerCase();
   const truncated = trimmed.length > sha.length;
   return { sha, truncated };
+}
+
+/**
+ * D1: the story-level gate fell back to the branch-level diff because this
+ * story produced no usable commit ref. Logged every time so that accepting a
+ * non-SHA in a contract field stays visible instead of becoming folklore.
+ */
+function logNoCommitBranchFallback(raw: string | undefined, branch: string): void {
+  const classification = isNoCommitSentinel(raw)
+    ? "story declared no commit"
+    : "COMMIT_SHA unusable as a git ref and not a declared no-commit sentinel";
+  logger.info(
+    [
+      `Protected-path story gate: ${classification}; falling back to the branch-level diff`,
+      `(${PROTECTED_PATH_DIFF_DEFAULT_BASE}...${branch}), the same check that gates pr/merge.`,
+      "The branch diff is a superset of the per-commit diff, so this never fails open.",
+      `original_commit_sha=${JSON.stringify(raw ?? null)}`,
+    ].join(" "),
+  );
 }
 
 function logCommitShaTruncation(original: string, sha: string): void {
@@ -1095,11 +1115,28 @@ function protectedPathStoryDiffFailure(
   runCtx: Record<string, string>,
   originalOutput: string,
 ): string | null {
-  const missing = missingProtectedDiffField(runCtx.repo, runCtx.commit_sha);
-  if (missing) return formatProtectedPathGateMissingContextError(missing, originalOutput);
+  // repo is non-negotiable: without it neither the story diff nor the
+  // branch-level fallback below has anywhere to run.
+  if (typeof runCtx.repo !== "string" || runCtx.repo.trim() === "") {
+    return formatProtectedPathGateMissingContextError("repo", originalOutput);
+  }
   const resolved = sanitizeCommitShaForGitRef(runCtx.commit_sha);
-  // Commentary-only / non-SHA COMMIT_SHA is the same as missing context, not git_failed.
   if (!resolved.sha) {
+    // D1: a story can legitimately produce no commit — TASK-027 S2 was
+    // "break a type, prove verify catches it, revert cleanly", which ends with
+    // nothing to commit and reported `COMMIT_SHA: none - ...` (run #38). Until
+    // now that errored as missing context and no story of that shape could ever
+    // complete. Fall back to the branch-level check that already gates pr/merge
+    // instead of failing: it diffs base...branch, a strict SUPERSET of this
+    // story's own commit, so a real protected-path hit anywhere on the branch is
+    // still caught. This is a fallback, never a skip, and never a pass-on-empty.
+    const branch = (runCtx.branch || "").trim();
+    if (branch) {
+      logNoCommitBranchFallback(runCtx.commit_sha, branch);
+      return protectedPathBranchDiffFailure(runCtx, originalOutput);
+    }
+    // No usable commit AND no branch: there is nothing to diff at all. Fail
+    // CLOSED, exactly as before.
     return formatProtectedPathGateMissingContextError("commit_sha", originalOutput);
   }
   if (resolved.truncated) {
