@@ -1375,13 +1375,29 @@ const PROTECTED_PATH_HIT_SIGNATURES = [
 ];
 
 /**
- * The gate itself could not run (malformed/missing git ref, git threw).
- * Distinct from a hit — retrying can succeed once the ref is a bare SHA
- * (TASK-025 #34). Must not use the "deliverable is on the host-enforced list"
- * template.
+ * The gate could not run because required run context was absent (repo, or a
+ * COMMIT_SHA that is not a usable git ref).
+ *
+ * STRUCTURAL, not transient. Until 2026-08-31 this shared one bucket with
+ * git_failed below and was classified transient — which is why TASK-027 run #37
+ * and its auto-retry #38 both died on `missing_context: commit_sha` with the
+ * identical signature, spending an attempt for nothing. A story that produces
+ * no commit produces no commit on the retry either; nothing about re-running it
+ * supplies the missing field. Engine-side, D1 now falls back to the
+ * branch-level diff so this should be rare, but when it does fire it must park,
+ * not retry.
  */
-const PROTECTED_PATH_GATE_RUN_FAILURE_SIGNATURES = [
+const PROTECTED_PATH_GATE_MISSING_CONTEXT_SIGNATURES = [
   "protected_path_gate_missing_context",
+];
+
+/**
+ * The gate ran but git threw (unresolvable ref, missing base branch, shallow
+ * clone). Genuinely worth one retry — the condition can clear on its own
+ * (TASK-025 #34). Must not use the "deliverable is on the host-enforced list"
+ * template, and must NOT be swept in with missing_context above.
+ */
+const PROTECTED_PATH_GATE_GIT_FAILED_SIGNATURES = [
   "protected_path_gate_git_failed",
 ];
 
@@ -1544,7 +1560,21 @@ function preClassifyRunFailure({ entry, autoRetry, attempt, diff }) {
       retry_guidance: "",
     };
   }
-  const gateRunFailed = PROTECTED_PATH_GATE_RUN_FAILURE_SIGNATURES.find((sig) => haystack.includes(sig));
+  // Missing context is checked BEFORE git_failed: when both appear in one
+  // haystack the run still cannot supply the absent field, so the structural
+  // verdict is the correct (and cheaper) one.
+  const gateMissingContext = PROTECTED_PATH_GATE_MISSING_CONTEXT_SIGNATURES.find((sig) =>
+    haystack.includes(sig),
+  );
+  if (gateMissingContext) {
+    return {
+      class: "structural",
+      reason: "the protected-path gate could not run because required run context was missing (repo, or a COMMIT_SHA that is not a usable git ref) — a retry re-runs the same story and produces the same absent field",
+      evidence: `protected-path gate missing-context signature "${gateMissingContext}" in step output`,
+      retry_guidance: "",
+    };
+  }
+  const gateRunFailed = PROTECTED_PATH_GATE_GIT_FAILED_SIGNATURES.find((sig) => haystack.includes(sig));
   if (gateRunFailed) {
     return {
       class: "transient",
@@ -6830,7 +6860,9 @@ if (process.argv.includes("--self-test-auto-retry")) {
     check("6e-git-failed-not-parked", entry?.autoRetry?.parked !== true, entry?.autoRetry);
   }
 
-  // 6f. missing_context is the same class as git_failed, not a hit
+  // 6f. missing_context is STRUCTURAL — NOT the same class as git_failed.
+  // TASK-027 #37 and its auto-retry #38 both died on this exact signature; the
+  // retry could not have supplied the absent field. Parks instead of retrying.
   {
     const item = failedItem("q6f", "TASK-906F");
     const r = await runFailure({
@@ -6840,8 +6872,31 @@ if (process.argv.includes("--self-test-auto-retry")) {
       steps: stepsFixture("ENGINE_ERROR: protected_path_gate_missing_context: commit_sha", "verify"),
     });
     const entry = r.ledger.get()["TASK-906F"];
-    check("6f-missing-context-transient", entry?.autoRetry?.lastDiagnosis?.class === "transient", entry?.autoRetry?.lastDiagnosis);
-    check("6f-missing-context-retry", entry?.outcome === LEDGER_OUTCOME_RETRY_PENDING, entry);
+    check("6f-missing-context-structural", entry?.autoRetry?.lastDiagnosis?.class === "structural", entry?.autoRetry?.lastDiagnosis);
+    check("6f-missing-context-reason", String(entry?.autoRetry?.lastDiagnosis?.reason || "").includes("required run context was missing"), entry?.autoRetry?.lastDiagnosis);
+    check("6f-missing-context-parked", entry?.autoRetry?.parkedReason === "structural", entry?.autoRetry);
+    check("6f-missing-context-no-retry", entry?.outcome !== LEDGER_OUTCOME_RETRY_PENDING, entry);
+    check("6f-missing-context-no-agent", r.agentCalls === 0, r.agentCalls);
+    check("6f-missing-context-attempts-0", (entry?.autoRetry?.attempts ?? -1) === 0, entry?.autoRetry);
+  }
+
+  // 6f2. The two signatures must not collapse back into one bucket. When both
+  // appear in one haystack, structural wins (the run still cannot supply the
+  // absent field). 6e proves a git_failed-only haystack still retries.
+  {
+    const item = failedItem("q6f2", "TASK-906F2");
+    const r = await runFailure({
+      taskId: "TASK-906F2",
+      item,
+      queue: [item],
+      steps: stepsFixture(
+        "ENGINE_ERROR: protected_path_gate_missing_context: commit_sha\nORIGINAL_OUTPUT:\nearlier note mentioned protected_path_gate_git_failed",
+        "verify",
+      ),
+    });
+    const entry = r.ledger.get()["TASK-906F2"];
+    check("6f2-both-structural", entry?.autoRetry?.lastDiagnosis?.class === "structural", entry?.autoRetry?.lastDiagnosis);
+    check("6f2-both-parked", entry?.autoRetry?.parked === true, entry?.autoRetry);
   }
 
   // 6g. both signatures in one haystack — a real hit wins (F2)

@@ -94,3 +94,32 @@ export function missingProtectedDiffField(
   if (typeof commitSha !== "string" || commitSha.trim() === "") return "commit_sha";
   return null;
 }
+
+/**
+ * Leading-token sentinels a story uses to say "this story produced no commit".
+ *
+ * Demonstrate-and-revert stories (TASK-027 S2: break a type, prove verify
+ * catches it, `git restore`) legitimately end with nothing to commit, and the
+ * developer contract has no other way to say so — run #38 reported
+ * `COMMIT_SHA: none - no new commit was created for this step (...)`.
+ *
+ * LEADING TOKEN ONLY, deliberately mirroring GIT_SHA_LEADING_TOKEN_RE. Do NOT
+ * relax this into a scan of the whole string, and do NOT add a companion scan
+ * that lifts a hex SHA out of prose: that would let the gate diff a ref the
+ * story never produced and report a confident wrong answer instead of a loud
+ * failure. The sentinel set is disjoint from hex by construction (`n`, `o`,
+ * `s`, `/`, `-` are not hex digits), so this can never shadow a real SHA.
+ */
+const NO_COMMIT_SENTINEL_RE = /^(none|nil|null|n\/?a|no[\s._-]*commit|no[\s._-]*new[\s._-]*commit)(?![a-z0-9])/i;
+
+/**
+ * True when COMMIT_SHA is absent/empty, or explicitly declares "no commit".
+ * Callers use this only to tell a legitimate no-commit story apart from a
+ * malformed field in logs — both route to the same branch-level fallback.
+ */
+export function isNoCommitSentinel(raw: string | undefined): boolean {
+  if (typeof raw !== "string") return true;
+  const trimmed = raw.trim();
+  if (!trimmed) return true;
+  return NO_COMMIT_SENTINEL_RE.test(trimmed);
+}

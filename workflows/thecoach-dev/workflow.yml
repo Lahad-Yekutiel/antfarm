@@ -380,7 +380,18 @@ steps:
         `<no count line printed>` and paste the verbatim tail anyway. Any
         number in this field that does not appear character-for-character
         in that pasted output is a contract violation, not an approximation.
-      COMMIT_SHA: the commit you just made (only if done)
+      COMMIT_SHA: (only if done) the output of
+        `git -C {{repo}} rev-parse HEAD`, run AFTER your commit. Report it
+        as a bare SHA on its own — no trailing commentary, no parentheses,
+        no explanation on that line (the gate parses the leading token only).
+        This matches your CRON.md step 5 exactly; do not substitute a
+        different value or a description.
+        If this story legitimately produced NO commit (a demonstrate-and-
+        revert story that ends with a clean tree), do not invent one and do
+        not make a no-op commit: either report HEAD as above (it is the
+        previous story's commit, which is correct and is what CRON.md tells
+        you to do) or write exactly `none`. Both are handled — the engine
+        falls back to checking the whole branch against staging.
     expects: "STATUS: COMMIT_SHA:"
     max_retries: 2
     on_fail:

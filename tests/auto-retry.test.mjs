@@ -69,11 +69,24 @@ describe("coordinator auto-diagnose-and-retry", () => {
     for (const c of ["6a-structural", "6a-reason", "6b-no-agent-turn", "6c-attempts-0", "6d-todo"]) ok(c);
   });
 
-  it("6e/f. git_failed / missing_context are transient, not a protected-path hit", () => {
+  it("6e. git_failed stays transient — a broken git ref is worth one retry", () => {
     for (const c of [
       "6e-git-failed-transient", "6e-git-failed-reason", "6e-git-failed-retry",
       "6e-git-failed-no-agent", "6e-git-failed-not-parked",
-      "6f-missing-context-transient", "6f-missing-context-retry",
+    ]) ok(c);
+  });
+
+  it("6f. missing_context is structural — the retry cannot supply the absent field", () => {
+    for (const c of [
+      "6f-missing-context-structural", "6f-missing-context-reason",
+      "6f-missing-context-parked", "6f-missing-context-no-retry",
+      "6f-missing-context-no-agent", "6f-missing-context-attempts-0",
+      "6f2-both-structural", "6f2-both-parked",
+    ]) ok(c);
+  });
+
+  it("6g. a real protected-path hit outranks either gate-run-failure signature", () => {
+    for (const c of [
       "6g-both-structural", "6g-both-reason", "6g-both-not-transient", "6g-both-parked",
       "6g-orig-structural", "6g-orig-reason",
     ]) ok(c);
