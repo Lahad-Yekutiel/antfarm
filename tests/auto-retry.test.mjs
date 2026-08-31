@@ -49,7 +49,8 @@ describe("coordinator auto-diagnose-and-retry", () => {
   });
 
   it("2. a transient failure retries as-is, with no feedback block and no agent turn", () => {
-    for (const c of ["2a-retry-pending", "2b-transient-class", "2c-no-feedback", "2d-no-agent-turn", "2e-attempts-1"]) ok(c);
+    for (const c of ["2a-retry-pending", "2b-transient-class", "2c-no-feedback", "2d-no-agent-turn", "2e-attempts-1",
+      "2f-resume-attempted-then-fell-back", "2g-fallback-pending"]) ok(c);
   });
 
   it("3. at the cap it parks with a task-scoped TODO naming the attempt count", () => {
@@ -58,7 +59,7 @@ describe("coordinator auto-diagnose-and-retry", () => {
   });
 
   it("4. a structural failure parks immediately without spending an attempt", () => {
-    for (const c of ["4a-failed", "4b-structural", "4c-attempts-0", "4d-no-retry", "4e-todo"]) ok(c);
+    for (const c of ["4a-failed", "4b-structural", "4c-attempts-0", "4d-no-retry", "4e-todo", "4f-resume-not-called"]) ok(c);
   });
 
   it("5. a repeated diff digest is structural, decided without an agent turn", () => {
@@ -137,5 +138,33 @@ describe("coordinator auto-diagnose-and-retry", () => {
 
   it("retry feedback blocks replace, never stack", () => {
     for (const c of ["fb-single-block", "fb-new-guidance", "fb-old-guidance-gone", "fb-source"]) ok(c);
+  });
+
+  it("20. a successful resume keeps the same run id and does not enqueue a fresh pending run", () => {
+    for (const c of ["20a-retry-pending", "20b-attempts-1", "20c-resume-called", "20d-same-run-id",
+      "20e-already-dispatched", "20f-no-fresh-pending", "20g-resume-note", "20h-result-resumed",
+      "20i-no-todo", "20j-one-tracker"]) ok(c);
+  });
+
+  it("21. a fixable failure that resumes still increments the attempt counter", () => {
+    for (const c of ["21a-retry-pending", "21b-attempts-1", "21c-resume-called", "21d-same-run-id",
+      "21e-dispatched", "21f-resumed-flag"]) ok(c);
+  });
+
+  it("22/23. a resume error falls back to today's fresh redispatch", () => {
+    for (const c of ["22a-retry-pending", "22b-attempts-1", "22c-fallback-pending", "22d-not-resumed",
+      "22e-resume-error", "23a-fallback-pending", "23b-not-resumed"]) ok(c);
+  });
+
+  it("24. structural classification never resumes (negative control)", () => {
+    for (const c of ["24a-parked", "24b-failed", "24c-resume-not-called", "24d-no-retry-item", "24e-attempts-0"]) ok(c);
+  });
+
+  it("25. cap-reached still parks without resume; attempt count unchanged", () => {
+    for (const c of ["25a-cap-reached", "25b-resume-not-called", "25c-attempts-unchanged"]) ok(c);
+  });
+
+  it("26. a non-failed antfarm status does not resume", () => {
+    for (const c of ["26a-resume-not-called", "26b-fallback-pending", "26c-attempts-1"]) ok(c);
   });
 });

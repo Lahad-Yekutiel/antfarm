@@ -99,6 +99,16 @@ const LEDGER_OUTCOME_RETRY_PENDING = "retry-pending";
 const AUTO_RETRY_SOURCE = "coordinator:auto-retry";
 const AUTO_RETRY_FEEDBACK_HEADER = "PRIOR ATTEMPT FEEDBACK (attempt ";
 const FAILURE_CLASSES = new Set(["transient", "fixable", "structural"]);
+/**
+ * Classes that resume the existing antfarm run at its failed step instead of
+ * dispatching a fresh run. Structural never retries (parked above this). If
+ * resume itself errors, finishFailureHandling falls back to today's redispatch.
+ */
+const AUTO_RETRY_RESUME_CLASSES = new Set(["transient", "fixable"]);
+/** Wall-clock budget for `antfarm workflow resume` — DB reset plus cron ensure. */
+const AUTO_RETRY_RESUME_TIMEOUT_MS = 30_000;
+const AUTO_RETRY_RESUME_NOTE_PREFIX = "auto-retry resume of run ";
+const FAILED_RUN_STATUS = "failed";
 /** Sorted-key join the diagnosis reply must match exactly (parseAgentDecision style). */
 const DIAGNOSIS_REPLY_KEYS = "class,evidence,reason,retry_guidance";
 const AUTO_RETRY_HISTORY_LIMIT = 20;
@@ -330,6 +340,51 @@ function startWorkflowRun({ workflow, task }) {
   child.unref();
 
   return { id, pid: child.pid, logPath };
+}
+
+/**
+ * Resume a failed antfarm run at its failed step/story. Sync because
+ * finishFailureHandling must know success vs error before choosing the
+ * fresh-redispatch fallback. `deps.resumeRun` is the test seam.
+ */
+function resumeWorkflowRun(runIdParam, deps = {}) {
+  if (typeof deps.resumeRun === "function") return deps.resumeRun(runIdParam);
+  try {
+    const stdout = execFileSync(
+      process.execPath,
+      [ANTFARM_CLI, "workflow", "resume", runIdParam],
+      {
+        cwd: ANTFARM_ROOT,
+        encoding: "utf-8",
+        timeout: AUTO_RETRY_RESUME_TIMEOUT_MS,
+        maxBuffer: 1024 * 1024,
+      },
+    );
+    return { ok: true, stdout: String(stdout || "") };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err?.message || String(err),
+      stdout: err?.stdout ? String(err.stdout) : "",
+      stderr: err?.stderr ? String(err.stderr) : "",
+    };
+  }
+}
+
+/** Live antfarm run status, or null if the DB is missing/unreadable. */
+function tryGetLiveRunStatus(runIdParam, deps = {}) {
+  if (typeof deps.getRunStatus === "function") {
+    try {
+      return deps.getRunStatus(runIdParam)?.status ?? null;
+    } catch {
+      return null;
+    }
+  }
+  try {
+    return getRunStatus(runIdParam)?.status ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -1691,13 +1746,14 @@ ${steps.slice(0, 40000)}
 }
 
 /**
- * Terminal handling for one classified failure. Either enqueues a capped
- * auto-retry or parks the task for the developer through the existing
- * scoped-blocker route. `ctx.queue`, when an array, is the live queue the
- * caller will save; otherwise the queue is loaded and saved here.
+ * Terminal handling for one classified failure. Either resumes the existing
+ * failed run (retryable classes), enqueues a capped fresh auto-retry, or
+ * parks the task for the developer through the existing scoped-blocker
+ * route. `ctx.queue`, when an array, is the live queue the caller will
+ * save; otherwise the queue is loaded and saved here.
  */
 function finishFailureHandling(ctx, deps = {}) {
-  const { ledgerKey, item, queue, base, autoRetry, attempt, diff, branch, diagnosis } = ctx;
+  const { ledgerKey, item, queue, base, autoRetry, attempt, diff, branch, diagnosis, runStatus } = ctx;
   const at = new Date(nowMs(deps)).toISOString();
   const next = {
     ...autoRetry,
@@ -1732,7 +1788,7 @@ function finishFailureHandling(ctx, deps = {}) {
     logDispatchNext(
       `auto-retry parked key=${ledgerKey} class=${diagnosis.class} parked=${parkedReason} attempts=${next.attempts}/${next.cap}`,
     );
-    return { outcome: LEDGER_OUTCOME_FAILED, parkedReason, autoRetry: next };
+    return { outcome: LEDGER_OUTCOME_FAILED, parkedReason, autoRetry: next, resumed: false };
   }
 
   // Attempts increment when the retry is ENQUEUED, not when it finishes — a
@@ -1740,11 +1796,64 @@ function finishFailureHandling(ctx, deps = {}) {
   next.attempts += 1;
   next.parked = false;
   next.parkedReason = null;
+
+  // Resume the existing run at its failed step when classification is
+  // retryable and antfarm still has the run as failed. Structural never
+  // reaches here. A resume error falls back to today's fresh redispatch
+  // so a stuck run cannot spend the attempt with no work happening.
+  let resumed = false;
+  let resumeError = null;
+  const liveStatus = item?.runId ? tryGetLiveRunStatus(item.runId, deps) : null;
+  const statusForResume = liveStatus || runStatus;
+  const canResume =
+    AUTO_RETRY_RESUME_CLASSES.has(diagnosis.class) &&
+    statusForResume === FAILED_RUN_STATUS &&
+    Boolean(item?.runId);
+  if (canResume) {
+    try {
+      const resumeResult = resumeWorkflowRun(item.runId, deps);
+      if (resumeResult && resumeResult.ok) {
+        resumed = true;
+      } else {
+        resumeError = resumeResult?.error || "resume returned not-ok";
+      }
+    } catch (err) {
+      resumeError = err?.message || String(err);
+    }
+    if (!resumed) {
+      logDispatchNextError(
+        `auto-retry resume failed key=${ledgerKey} run=${item.runId}: ${resumeError}; falling back to fresh redispatch`,
+      );
+    }
+  }
+
   recordLedgerAttempt(
     ledgerKey,
     { ...base, outcome: LEDGER_OUTCOME_RETRY_PENDING, autoRetry: next, diagnosisStartedAt: null },
     deps,
   );
+
+  if (resumed) {
+    const retryItem = buildAutoRetryResumeQueueItem({
+      item,
+      diagnosis,
+      attemptNumber: next.attempts,
+      cap: next.cap,
+    });
+    pushQueueItem(retryItem, queue, deps);
+    logDispatchNext(
+      `auto-retry resumed key=${ledgerKey} class=${diagnosis.class} attempt=${next.attempts}/${next.cap} run=${item.runId} item=${retryItem.id}`,
+    );
+    return {
+      outcome: LEDGER_OUTCOME_RETRY_PENDING,
+      queueItemId: retryItem.id,
+      autoRetry: next,
+      retryItem,
+      resumed: true,
+      runId: item.runId,
+    };
+  }
+
   const retryItem = buildAutoRetryQueueItem({
     item,
     diagnosis,
@@ -1753,9 +1862,16 @@ function finishFailureHandling(ctx, deps = {}) {
   });
   pushQueueItem(retryItem, queue, deps);
   logDispatchNext(
-    `auto-retry queued key=${ledgerKey} class=${diagnosis.class} attempt=${next.attempts}/${next.cap} item=${retryItem.id}`,
+    `auto-retry queued key=${ledgerKey} class=${diagnosis.class} attempt=${next.attempts}/${next.cap} item=${retryItem.id}${resumeError ? ` resume-fallback=${resumeError}` : ""}`,
   );
-  return { outcome: LEDGER_OUTCOME_RETRY_PENDING, queueItemId: retryItem.id, autoRetry: next, retryItem };
+  return {
+    outcome: LEDGER_OUTCOME_RETRY_PENDING,
+    queueItemId: retryItem.id,
+    autoRetry: next,
+    retryItem,
+    resumed: false,
+    resumeError,
+  };
 }
 
 function pushQueueItem(newItem, queue, deps = {}) {
@@ -1803,6 +1919,21 @@ function buildAutoRetryQueueItem({ item, diagnosis, attemptNumber, cap }) {
     source: AUTO_RETRY_SOURCE,
     roadmap_ref: item?.roadmap_ref ?? null,
   });
+}
+
+/**
+ * Tracker for a resumed run: already dispatched, same run-id, so /queue/check
+ * keeps watching it and spawnPendingQueueItem never startRun's a fresh one.
+ */
+function buildAutoRetryResumeQueueItem({ item, diagnosis, attemptNumber, cap }) {
+  const retryItem = buildAutoRetryQueueItem({ item, diagnosis, attemptNumber, cap });
+  retryItem.status = "dispatched";
+  retryItem.runId = item.runId;
+  retryItem.dispatchedAt = new Date().toISOString();
+  retryItem.resolvedAt = null;
+  retryItem.note = `${AUTO_RETRY_RESUME_NOTE_PREFIX}${item.runId}`;
+  if (item.branch) retryItem.branch = item.branch;
+  return retryItem;
 }
 
 /**
@@ -1979,7 +2110,7 @@ function handleFailedRunOutcome(ctx, deps = {}) {
   if (pre) {
     logDispatchNext(`auto-retry pre-classified key=${ledgerKey} class=${pre.class} (no agent turn)`);
     return finishFailureHandling(
-      { ledgerKey, item, queue, base, autoRetry, attempt, diff, branch, diagnosis: pre },
+      { ledgerKey, item, queue, base, autoRetry, attempt, diff, branch, diagnosis: pre, runStatus },
       deps,
     );
   }
@@ -2003,7 +2134,7 @@ function handleFailedRunOutcome(ctx, deps = {}) {
   }
   const enqueueBackground = deps.enqueueBackground || defaultEnqueueBackground;
   enqueueBackground(() =>
-    runFailureDiagnosis({ ledgerKey, item, base, autoRetry, attempt, diff, branch, taskMarkdown }, deps),
+    runFailureDiagnosis({ ledgerKey, item, base, autoRetry, attempt, diff, branch, taskMarkdown, runStatus }, deps),
   );
   logDispatchNext(`diagnosis-started key=${ledgerKey} run=${item?.runId ?? "(none)"}`);
   return { outcome: LEDGER_OUTCOME_DIAGNOSIS_PENDING };
@@ -6588,6 +6719,90 @@ if (process.argv.includes("--self-test-dispatch-scope-gate")) {
   process.exit(failures.length === 0 ? 0 : 1);
 }
 
+// Drive the production auto-retry path against a real antfarm run in the
+// isolated test DB. Resume is the real CLI (`workflow resume`), not a stub.
+// Invoke:
+//   COORDINATOR_TOKEN=x node local-tools/coordinator-trigger.mjs --eval-auto-retry-resume <run-id>
+if (process.argv.includes("--eval-auto-retry-resume")) {
+  const idx = process.argv.indexOf("--eval-auto-retry-resume");
+  const runIdParam = process.argv[idx + 1];
+  if (!runIdParam || runIdParam.startsWith("-")) {
+    console.error("usage: --eval-auto-retry-resume <run-id>");
+    process.exit(1);
+  }
+  const taskId = process.env.COORDINATOR_EVAL_TASK_ID || "TASK-940";
+  const run = getRunStatus(runIdParam);
+  let stepsResult;
+  try {
+    stepsResult = queryStepsForRun(runIdParam);
+  } catch (err) {
+    console.log(JSON.stringify({ ok: false, error: err?.message || String(err) }, null, 2));
+    process.exit(1);
+  }
+  const item = {
+    id: "eval-auto-retry-resume",
+    task: `${taskId}: synthetic resume eval`,
+    repoPath: "/tmp/auto-retry-repo",
+    branch: "fix/auto-retry-resume",
+    status: "failed",
+    runId: runIdParam,
+    createdAt: "2026-08-31T00:00:00.000Z",
+    dispatchedAt: "2026-08-31T00:01:00.000Z",
+    resolvedAt: "2026-08-31T00:02:00.000Z",
+    note: 'run status is "failed" — not a successful completion',
+    roadmap_ref: null,
+  };
+  const mq = [];
+  const ledger = {};
+  const todos = [];
+  const result = handleFailedRunOutcome(
+    {
+      ledgerKey: taskId,
+      item,
+      queue: mq,
+      runStatus: run?.status || FAILED_RUN_STATUS,
+      queueStatus: "failed",
+      stepsResult,
+    },
+    {
+      loadLedger: () => JSON.parse(JSON.stringify(ledger)),
+      saveLedger: (next) => {
+        for (const key of Object.keys(ledger)) delete ledger[key];
+        Object.assign(ledger, next);
+      },
+      load: () => mq,
+      save: (next) => {
+        mq.length = 0;
+        mq.push(...next);
+      },
+      thecoachRepo: "/tmp/thecoach",
+      appendTodo: (_repo, draft) => {
+        todos.push(draft);
+        return { appended: true, entry: draft };
+      },
+      branchDiff: () => ({ ran: false, digest: null, files: [], error: "eval" }),
+      enqueueBackground: () => {},
+    },
+  );
+  const runAfter = getRunStatus(runIdParam);
+  console.log(
+    JSON.stringify(
+      {
+        ok: true,
+        result,
+        queue: mq,
+        ledger: ledger[taskId] || null,
+        todos,
+        runBefore: run,
+        runAfter,
+      },
+      null,
+      2,
+    ),
+  );
+  process.exit(0);
+}
+
 // Item 8 / Item 7 / 8-P1 / 8-P2 mechanical self-check. No port, no network,
 // no real ledger/queue/TODO file — every dependency is injected. Invoke:
 //   COORDINATOR_TOKEN=x node local-tools/coordinator-trigger.mjs --self-test-auto-retry
@@ -6688,6 +6903,7 @@ if (process.argv.includes("--self-test-auto-retry")) {
     const todos = [];
     const jobs = [];
     let agentCalls = 0;
+    const resumeCalls = [];
     const deps = {
       ...ledger,
       load: mq.load,
@@ -6704,6 +6920,13 @@ if (process.argv.includes("--self-test-auto-retry")) {
         return agentReply(opts.agentReply || FIXABLE);
       },
       now: () => Date.parse("2026-08-29T12:00:00.000Z"),
+      getRunStatus: opts.getRunStatus || (() => ({ status: opts.liveRunStatus || "failed" })),
+      resumeRun: (id) => {
+        resumeCalls.push(id);
+        if (opts.resumeSucceeds) return { ok: true, stdout: `Resumed run ${id.slice(0, 8)} from step "implement"` };
+        if (opts.resumeThrows) throw new Error("resume exploded");
+        return { ok: false, error: opts.resumeError || "resume not available in harness" };
+      },
     };
     const liveQueue = opts.liveQueue === false ? null : mq.get();
     const result = handleFailedRunOutcome(
@@ -6717,8 +6940,9 @@ if (process.argv.includes("--self-test-auto-retry")) {
       },
       deps,
     );
-    for (const job of jobs) await job();
-    return { result, ledger, mq, todos, agentCalls, deps };
+    let finished = result;
+    for (const job of jobs) finished = await job();
+    return { result, finished, ledger, mq, todos, agentCalls, deps, resumeCalls };
   }
 
   // 1. fixable + attempts 0 -> retry-pending, item pushed with feedback, NO todo
@@ -6754,6 +6978,8 @@ if (process.argv.includes("--self-test-auto-retry")) {
     check("2c-no-feedback", pushed[0] && !pushed[0].task.includes(AUTO_RETRY_FEEDBACK_HEADER), pushed[0]?.task);
     check("2d-no-agent-turn", r.agentCalls === 0, r.agentCalls);
     check("2e-attempts-1", entry?.autoRetry?.attempts === 1, entry?.autoRetry);
+    check("2f-resume-attempted-then-fell-back", r.resumeCalls.length === 1 && r.resumeCalls[0] === item.runId, r.resumeCalls);
+    check("2g-fallback-pending", pushed[0] && pushed[0].status === "pending" && pushed[0].runId === null, pushed[0]);
   }
 
   // 3. attempts already at cap -> park, todo written, no retry pushed
@@ -6795,6 +7021,7 @@ if (process.argv.includes("--self-test-auto-retry")) {
     check("4c-attempts-0", entry?.autoRetry?.attempts === 0, entry?.autoRetry);
     check("4d-no-retry", r.mq.get().filter((i) => i.source === AUTO_RETRY_SOURCE).length === 0, r.mq.get());
     check("4e-todo", r.todos.length === 1, r.todos);
+    check("4f-resume-not-called", r.resumeCalls.length === 0, r.resumeCalls);
   }
 
   // 5. repeated diff digest -> structural, no agent turn, no attempt spent
@@ -7196,6 +7423,138 @@ if (process.argv.includes("--self-test-auto-retry")) {
     check("fb-source", rebuilt.source === AUTO_RETRY_SOURCE, rebuilt.source);
   }
 
+  // 20. transient + resume succeeds → same run-id continues, no fresh pending item
+  {
+    const item = failedItem("q20", "TASK-920");
+    const r = await runFailure({
+      taskId: "TASK-920",
+      item,
+      queue: [item],
+      steps: stepsFixture("ENGINE_ERROR: openclaw agent failed: gateway unreachable"),
+      resumeSucceeds: true,
+    });
+    const entry = r.ledger.get()["TASK-920"];
+    const pushed = r.mq.get().filter((i) => i.source === AUTO_RETRY_SOURCE);
+    check("20a-retry-pending", entry?.outcome === LEDGER_OUTCOME_RETRY_PENDING, entry);
+    check("20b-attempts-1", entry?.autoRetry?.attempts === 1, entry?.autoRetry);
+    check("20c-resume-called", r.resumeCalls.length === 1 && r.resumeCalls[0] === item.runId, r.resumeCalls);
+    check("20d-same-run-id", pushed[0] && pushed[0].runId === item.runId, pushed[0]);
+    check("20e-already-dispatched", pushed[0] && pushed[0].status === "dispatched", pushed[0]);
+    check("20f-no-fresh-pending", pushed.every((i) => i.status !== "pending"), pushed);
+    check("20g-resume-note", pushed[0] && String(pushed[0].note || "").startsWith(AUTO_RETRY_RESUME_NOTE_PREFIX), pushed[0]?.note);
+    check("20h-result-resumed", r.result?.resumed === true, r.result);
+    check("20i-no-todo", r.todos.length === 0, r.todos);
+    check("20j-one-tracker", pushed.length === 1, pushed.length);
+  }
+
+  // 21. fixable + resume succeeds → same run-id, attempts still increment
+  {
+    const item = failedItem("q21", "TASK-921");
+    const r = await runFailure({ taskId: "TASK-921", item, queue: [item], resumeSucceeds: true });
+    const entry = r.ledger.get()["TASK-921"];
+    const pushed = r.mq.get().filter((i) => i.source === AUTO_RETRY_SOURCE);
+    check("21a-retry-pending", entry?.outcome === LEDGER_OUTCOME_RETRY_PENDING, entry);
+    check("21b-attempts-1", entry?.autoRetry?.attempts === 1, entry?.autoRetry);
+    check("21c-resume-called", r.resumeCalls[0] === item.runId, r.resumeCalls);
+    check("21d-same-run-id", pushed[0]?.runId === item.runId, pushed[0]);
+    check("21e-dispatched", pushed[0]?.status === "dispatched", pushed[0]);
+    check("21f-resumed-flag", r.finished?.resumed === true, r.finished);
+  }
+
+  // 22. resume throws → today's fresh redispatch, attempt still spent
+  {
+    const item = failedItem("q22", "TASK-922");
+    const r = await runFailure({
+      taskId: "TASK-922",
+      item,
+      queue: [item],
+      steps: stepsFixture("ENGINE_ERROR: openclaw agent failed: gateway unreachable"),
+      resumeThrows: true,
+    });
+    const entry = r.ledger.get()["TASK-922"];
+    const pushed = r.mq.get().filter((i) => i.source === AUTO_RETRY_SOURCE);
+    check("22a-retry-pending", entry?.outcome === LEDGER_OUTCOME_RETRY_PENDING, entry);
+    check("22b-attempts-1", entry?.autoRetry?.attempts === 1, entry?.autoRetry);
+    check("22c-fallback-pending", pushed[0] && pushed[0].status === "pending" && pushed[0].runId === null, pushed[0]);
+    check("22d-not-resumed", r.result?.resumed === false, r.result);
+    check("22e-resume-error", Boolean(r.result?.resumeError), r.result);
+  }
+
+  // 23. resume returns not-ok → same fresh-redispatch fallback
+  {
+    const item = failedItem("q23", "TASK-923");
+    const r = await runFailure({
+      taskId: "TASK-923",
+      item,
+      queue: [item],
+      steps: stepsFixture("ENGINE_ERROR: openclaw agent failed: gateway unreachable"),
+      resumeError: "Run abcdef12 is \"running\", not \"failed\". Nothing to resume.",
+    });
+    const pushed = r.mq.get().filter((i) => i.source === AUTO_RETRY_SOURCE);
+    check("23a-fallback-pending", pushed[0]?.status === "pending", pushed[0]);
+    check("23b-not-resumed", r.result?.resumed === false, r.result);
+  }
+
+  // 24. structural still parks and never calls resume (negative control)
+  {
+    const item = failedItem("q24", "TASK-924");
+    const r = await runFailure({
+      taskId: "TASK-924",
+      item,
+      queue: [item],
+      steps: stepsFixture("Protected-path gate: diff touches supabase/migrations/001.sql", "pr"),
+      resumeSucceeds: true,
+    });
+    const entry = r.ledger.get()["TASK-924"];
+    check("24a-parked", entry?.autoRetry?.parkedReason === "structural", entry?.autoRetry);
+    check("24b-failed", entry?.outcome === LEDGER_OUTCOME_FAILED, entry);
+    check("24c-resume-not-called", r.resumeCalls.length === 0, r.resumeCalls);
+    check("24d-no-retry-item", r.mq.get().filter((i) => i.source === AUTO_RETRY_SOURCE).length === 0, r.mq.get());
+    check("24e-attempts-0", entry?.autoRetry?.attempts === 0, entry?.autoRetry);
+  }
+
+  // 25. cap-reached still parks without resume
+  {
+    const item = failedItem("q25", "TASK-925");
+    const r = await runFailure({
+      taskId: "TASK-925",
+      item,
+      queue: [item],
+      resumeSucceeds: true,
+      ledger: {
+        "TASK-925": {
+          key: "TASK-925",
+          outcome: "retry-pending",
+          autoRetry: { attempts: 2, cap: 2, parked: false, parkedReason: null, lastDiagnosis: null, history: [
+            { at: "2026-08-29T10:00:00.000Z", class: "fixable", reason: "older reason one", diffHash: null },
+            { at: "2026-08-29T11:00:00.000Z", class: "fixable", reason: "older reason two", diffHash: null },
+          ] },
+        },
+      },
+    });
+    const entry = r.ledger.get()["TASK-925"];
+    check("25a-cap-reached", entry?.autoRetry?.parkedReason === "cap-reached", entry?.autoRetry);
+    check("25b-resume-not-called", r.resumeCalls.length === 0, r.resumeCalls);
+    check("25c-attempts-unchanged", entry?.autoRetry?.attempts === 2, entry?.autoRetry);
+  }
+
+  // 26. antfarm status is not failed → do not resume, fall back to redispatch
+  {
+    const item = failedItem("q26", "TASK-926");
+    const r = await runFailure({
+      taskId: "TASK-926",
+      item,
+      queue: [item],
+      steps: stepsFixture("ENGINE_ERROR: openclaw agent failed: gateway unreachable"),
+      liveRunStatus: "cancelled",
+      resumeSucceeds: true,
+    });
+    const pushed = r.mq.get().filter((i) => i.source === AUTO_RETRY_SOURCE);
+    check("26a-resume-not-called", r.resumeCalls.length === 0, r.resumeCalls);
+    check("26b-fallback-pending", pushed[0]?.status === "pending", pushed[0]);
+    check("26c-attempts-1", r.ledger.get()["TASK-926"]?.autoRetry?.attempts === 1, r.ledger.get()["TASK-926"]?.autoRetry);
+  }
+
   const report = {
     ok: failures.length === 0,
     failed: failures.length,
@@ -7207,6 +7566,8 @@ if (process.argv.includes("--self-test-auto-retry")) {
       diagnosisTtlMs: DIAGNOSIS_TTL_MS,
       openQuestionCeiling: OPEN_QUESTION_CEILING,
       emptyDiffDigest: EMPTY_DIFF_DIGEST,
+      autoRetryResumeClasses: [...AUTO_RETRY_RESUME_CLASSES],
+      autoRetryResumeTimeoutMs: AUTO_RETRY_RESUME_TIMEOUT_MS,
     },
   };
   origLog(JSON.stringify(report, null, 2));
