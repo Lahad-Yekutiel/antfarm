@@ -62,7 +62,7 @@ const ROADMAP_RELATIVE_PATH = path.join("_SSoT", "ROADMAP.md");
 const TODO_RELATIVE_PATH = path.join("local", "cursor_loop", "developer_todo.json");
 const IDLE_STATE_RELATIVE_PATH = path.join("local", "cursor_loop", "coordinator_idle_state.json");
 const ROADMAP_AUTO_SOURCE = "coordinator:roadmap-auto";
-const OPEN_QUESTION_CEILING = 10;
+const OPEN_QUESTION_CEILING = 50;
 const IDLE_ESCALATION_EVERY = 12;
 const TODO_STATUS_OPEN = "open";
 const TODO_STATUS_RESOLVED = "resolved";
@@ -1424,9 +1424,27 @@ function recordLedgerAttempt(key, fields, deps = {}) {
 /** sha256 of an empty diff — the digest a no-op branch produces. */
 const EMPTY_DIFF_DIGEST = crypto.createHash("sha256").update("").digest("hex");
 
-/** Genuine hits: the diff ran and touched a host-enforced path. */
+/**
+ * Genuine hits: the diff ran and touched a host-enforced path.
+ *
+ * Must match the engine's hit message FORM, not just the gate's name. Until
+ * 2026-09-01 this was the bare prefix "protected-path gate:", which matches any
+ * step that merely talks about the gate — including a step that PASSED it. That
+ * false-positived on TASK-023 run 295daa2f: verify passed and said so
+ * ("Protected-path gate: git diff --stat ... is empty"), the bare prefix matched
+ * its own explanatory prose, and the run parked "structural" with zero retries
+ * spent — while the real failure was the test step's OQ-09 /404-prerender
+ * non-determinism, nothing to do with the gate. The verifier's own AGENTS.md
+ * contains that phrase too, so an agent echoing its instructions was enough.
+ *
+ * `formatProtectedPathHitsMessage` (src/installer/step-ops.ts) is the only
+ * producer of a real hit and emits exactly "Protected-path gate: diff touches
+ * <files>". The gate-run failures use "Protected-path gate cannot run:" and match
+ * neither form. Narrowing to the hit form fails OPEN: an unmatched failure falls
+ * through to the agent diagnosis turn rather than parking on a guess.
+ */
 const PROTECTED_PATH_HIT_SIGNATURES = [
-  "protected-path gate:",
+  "protected-path gate: diff touches",
 ];
 
 /**
@@ -1604,7 +1622,7 @@ function preClassifyRunFailure({ entry, autoRetry, attempt, diff }) {
   const haystack = [attempt.reason, ...attempt.outputs.map((o) => o.output)].join("\n").toLowerCase();
   // Hits first: gate-run-failure signatures can coexist with a real hit in the
   // joined haystack (another step, or ORIGINAL_OUTPUT:). Hit messages use
-  // "protected-path gate:" (colon after gate); run-failure messages use
+  // "protected-path gate: diff touches"; run-failure messages use
   // "Protected-path gate cannot run:" and never match the hit signature.
   const gateHit = PROTECTED_PATH_HIT_SIGNATURES.find((sig) => haystack.includes(sig));
   if (gateHit) {
@@ -4843,11 +4861,14 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     check("missing-blocks-http-no-scan", missingBlocksHttpAgent === 0, missingBlocksHttpAgent),
   ];
 
-  const tenOpen = Array.from({ length: 10 }, (_, i) => ({
+  // 50 open TODOs, all `*`-scoped: exactly at OPEN_QUESTION_CEILING. Must be
+  // `*`-scoped — only global blockers count toward the ceiling (8-P2,
+  // 2026-08-29), so a `blocks: []` fixture trips nothing at any size.
+  const atCeilingOpen = Array.from({ length: 50 }, (_, i) => ({
     id: `TODO-${String(i + 1).padStart(4, "0")}`,
     status: "open",
     summary: `q${i}`,
-    blocks: [],
+    blocks: ["*"],
   }));
   let ceilingAgentCalls = 0;
   let ceilingScan = { outcome: "threw-before-return" };
@@ -4855,7 +4876,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     ceilingScan = await scanRoadmapForWork({
       thecoachRepo: "/tmp/thecoach-does-not-matter",
       writeTodo: sinkTodo,
-      readTodo: () => JSON.stringify(tenOpen),
+      readTodo: () => JSON.stringify(atCeilingOpen),
       readRoadmap: () => "# ROADMAP",
       runAgent: async () => {
         ceilingAgentCalls += 1;
@@ -4872,7 +4893,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     load: memoryQueue([]).load,
     save: () => {},
     writeTodo: sinkTodo,
-    readTodo: () => JSON.stringify(tenOpen),
+    readTodo: () => JSON.stringify(atCeilingOpen),
     scan: async () => {
       ceilingHttpScan += 1;
       throw new Error("scan must not run on ceiling");
@@ -4881,52 +4902,87 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
       throw new Error("startRun must not run on ceiling");
     },
   });
+  const underCeilingGlobalOpen = Array.from({ length: 49 }, (_, i) => ({
+    id: `TODO-${String(i + 1).padStart(4, "0")}`,
+    status: "open",
+    summary: `q${i}`,
+    blocks: ["*"],
+  }));
+  let underCeilingScan = { outcome: "threw-before-return" };
+  try {
+    underCeilingScan = await scanRoadmapForWork({
+      thecoachRepo: "/tmp/thecoach-does-not-matter",
+      writeTodo: sinkTodo,
+      readTodo: () => JSON.stringify(underCeilingGlobalOpen),
+      readRoadmap: () => "# ROADMAP",
+      runAgent: async () =>
+        JSON.stringify({ payloads: [{ text: JSON.stringify(dispatchReply) }] }),
+    });
+  } catch (err) {
+    underCeilingScan = { outcome: "threw", error: err?.message || String(err) };
+  }
+
   const ceilingCases = [
     check("ceiling-agent-not-called", ceilingAgentCalls === 0, ceilingAgentCalls),
+    // Boundary: one under the ceiling must NOT trip it. These entries are
+    // `*`-scoped, so the gate immediately below (blockedScopes has "*")
+    // catches them instead — proving the ceiling itself did not fire.
+    check(
+      "ceiling-boundary-49-not-developer-attention",
+      underCeilingScan.outcome !== "developer-attention-required",
+      underCeilingScan.outcome,
+    ),
+    check(
+      "ceiling-boundary-49-falls-through-to-scope-gate",
+      underCeilingScan.outcome === "nothing-dispatchable",
+      underCeilingScan.outcome,
+    ),
     check("ceiling-outcome", ceilingScan.outcome === "developer-attention-required", ceilingScan.outcome),
     check("ceiling-reason", ceilingHttp.body.reason === "developer-attention-required", ceilingHttp.body.reason),
-    check("ceiling-open-count", ceilingHttp.body.open_count === 10, ceilingHttp.body.open_count),
+    check("ceiling-open-count", ceilingHttp.body.open_count === 50, ceilingHttp.body.open_count),
     check("ceiling-not-dispatched", ceilingHttp.body.dispatched === false),
     check("ceiling-http-no-scan", ceilingHttpScan === 0, ceilingHttpScan),
   ];
 
-  const nineOpen = Array.from({ length: 9 }, (_, i) => ({
+  // 49 open TODOs with no scope: one under the ceiling by raw count, and
+  // zero by global count. Neither gate may fire — dispatch proceeds.
+  const belowCeilingOpen = Array.from({ length: 49 }, (_, i) => ({
     id: `TODO-${String(i + 1).padStart(4, "0")}`,
     status: "open",
     summary: `q${i}`,
     blocks: [],
   }));
-  let nineAgentCalls = 0;
+  let belowCeilingAgentCalls = 0;
   dispatchMocks.started = [];
-  const mqNine = memoryQueue([]);
-  const bgNine = backgroundBox();
-  const nineHttp = await handleDispatchNext({
+  const mqBelowCeiling = memoryQueue([]);
+  const bgBelowCeiling = backgroundBox();
+  const belowCeilingHttp = await handleDispatchNext({
     thecoachRepo: "/tmp/thecoach-does-not-matter",
     ...dispatchMocks(),
-    load: mqNine.load,
-    save: mqNine.save,
+    load: mqBelowCeiling.load,
+    save: mqBelowCeiling.save,
     writeTodo: sinkTodo,
-    readTodo: () => JSON.stringify(nineOpen),
-    ...bgNine,
+    readTodo: () => JSON.stringify(belowCeilingOpen),
+    ...bgBelowCeiling,
     ...memoryScanState(),
     ...memoryLedger(),
     scan: async () =>
       scanRoadmapForWork({
         thecoachRepo: "/tmp/thecoach-does-not-matter",
         writeTodo: sinkTodo,
-        readTodo: () => JSON.stringify(nineOpen),
+        readTodo: () => JSON.stringify(belowCeilingOpen),
         readRoadmap: () => STUB_ROADMAP,
         runAgent: async () => {
-          nineAgentCalls += 1;
+          belowCeilingAgentCalls += 1;
           return JSON.stringify({ payloads: [{ text: JSON.stringify(dispatchReply) }] });
         },
       }),
   });
-  await bgNine.flush();
-  const nineEmptyCases = [
-    check("nine-empty-blocks-http-scan-started", nineHttp.body.reason === "scan-started", nineHttp.body.reason),
-    check("nine-empty-blocks-agent-called", nineAgentCalls === 1, nineAgentCalls),
-    check("nine-empty-blocks-dispatched", mqNine.get()[0]?.status === "dispatched", mqNine.get()[0]),
+  await bgBelowCeiling.flush();
+  const belowCeilingCases = [
+    check("below-ceiling-empty-blocks-http-scan-started", belowCeilingHttp.body.reason === "scan-started", belowCeilingHttp.body.reason),
+    check("below-ceiling-empty-blocks-agent-called", belowCeilingAgentCalls === 1, belowCeilingAgentCalls),
+    check("below-ceiling-empty-blocks-dispatched", mqBelowCeiling.get()[0]?.status === "dispatched", mqBelowCeiling.get()[0]),
   ];
 
   const mqNothing = memoryQueue([]);
@@ -5311,7 +5367,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     saveIdle: idleBeforeCeiling.saveIdle,
     thecoachRepo: "/tmp/idle",
     writeTodo: sinkTodo,
-    readTodo: () => JSON.stringify(tenOpen),
+    readTodo: () => JSON.stringify(atCeilingOpen),
   });
   let idleThrowLoads = 0;
   const bgIdleSwallow = backgroundBox();
@@ -5984,7 +6040,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     ...emptyBlocksCases,
     ...missingBlocksCases,
     ...ceilingCases,
-    ...nineEmptyCases,
+    ...belowCeilingCases,
     ...nothingCases,
     ...agentFailScanOutcomes,
     ...agentFailHttp,
@@ -7082,6 +7138,56 @@ if (process.argv.includes("--self-test-auto-retry")) {
     check("6b-no-agent-turn", r.agentCalls === 0, r.agentCalls);
     check("6c-attempts-0", entry?.autoRetry?.attempts === 0, entry?.autoRetry);
     check("6d-todo", r.todos.length === 1, r.todos);
+  }
+
+  // 6d2. A step that PASSED the gate and says so must NOT read as a hit.
+  // TASK-023 run 295daa2f: verify passed, its own prose contained
+  // "Protected-path gate: ...", the old bare-prefix signature matched it, and the
+  // run parked "structural" with zero retries spent — while the actual failure
+  // was the test step (OQ-09 /404 prerender), which is not structural at all.
+  {
+    const item = failedItem("q6d2", "TASK-906D2");
+    const r = await runFailure({
+      taskId: "TASK-906D2",
+      item,
+      queue: [item],
+      steps: {
+        found: true,
+        run: { id: "run-x", workflowId: DEFAULT_WORKFLOW, status: "failed", runNumber: 99 },
+        steps: [
+          {
+            stepId: "verify",
+            status: "done",
+            output:
+              "GATE: pass\nProtected-path gate: git diff --stat for this commit is empty of protected paths, so the gate passes.",
+            retryCount: 0,
+            maxRetries: 1,
+          },
+          {
+            stepId: "test",
+            status: "failed",
+            output: "STATUS: blocked\nREASON: next build failed on the /404 prerender (OQ-09)",
+            retryCount: 2,
+            maxRetries: 2,
+          },
+        ],
+      },
+      agentReply: FIXABLE,
+    });
+    const entry = r.ledger.get()["TASK-906D2"];
+    check(
+      "6d2-passing-gate-prose-not-a-hit",
+      !String(entry?.autoRetry?.lastDiagnosis?.evidence || "").includes("protected-path gate signature"),
+      entry?.autoRetry?.lastDiagnosis,
+    );
+    check(
+      "6d2-not-parked-structural",
+      entry?.autoRetry?.parkedReason !== "structural",
+      entry?.autoRetry,
+    );
+    check("6d2-agent-turn-spent", r.agentCalls === 1, r.agentCalls);
+    check("6d2-retry-pending", entry?.outcome === LEDGER_OUTCOME_RETRY_PENDING, entry);
+    check("6d2-attempt-spent", entry?.autoRetry?.attempts === 1, entry?.autoRetry);
   }
 
   // 6e. git_failed is NOT a protected-path hit — retryable-or-engine (transient)
