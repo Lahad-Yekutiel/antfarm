@@ -98,6 +98,15 @@ const LEDGER_OUTCOME_DIAGNOSIS_PENDING = "diagnosis-pending";
 const LEDGER_OUTCOME_RETRY_PENDING = "retry-pending";
 const AUTO_RETRY_SOURCE = "coordinator:auto-retry";
 const AUTO_RETRY_FEEDBACK_HEADER = "PRIOR ATTEMPT FEEDBACK (attempt ";
+/**
+ * TASK-048 (2026-09-01). Marker for the dispatch-time prior-progress block.
+ * Distinct from AUTO_RETRY_FEEDBACK_HEADER: that one carries a DIAGNOSIS of a
+ * previous failure into the next attempt; this one carries the target
+ * branch's CURRENT STATE into the plan step. Independent — both can appear.
+ */
+const PRIOR_PROGRESS_HEADER = "PRIOR PROGRESS ALREADY COMMITTED ON THIS BRANCH";
+/** Cap on files listed in the preamble. The count reported is always exact. */
+const PRIOR_PROGRESS_FILE_SAMPLE = 40;
 const FAILURE_CLASSES = new Set(["transient", "fixable", "structural"]);
 /**
  * Classes that resume the existing antfarm run at its failed step instead of
@@ -1940,6 +1949,62 @@ function buildAutoRetryQueueItem({ item, diagnosis, attemptNumber, cap }) {
 }
 
 /**
+ * TASK-048: what `plan` is told about a branch that already carries work.
+ *
+ * Why this exists. Roadmap-auto's only guard against re-dispatching an
+ * already-attempted task is ledgerBlocksKey() — a STOP, not a resume. Once a
+ * human clears the ledger entry (which is the normal, intended way to let a
+ * task run again), the next dispatch builds its task text from the ROADMAP
+ * item's title + description alone and the plan step sees nothing of the 19
+ * commits already sitting on the branch. That is how TASK-025 was planned
+ * from scratch three times onto feature/promote-design-preview and how run
+ * #43's story S7 came to target apps/web/app/design-preview/{a,c}/workouts/
+ * page.tsx — files an earlier attempt's own S13 had already deleted.
+ *
+ * This is deliberately NOT `workflow resume`. Resume restarts a failed run at
+ * its failed step, which for run #43 is story S7 itself — the story whose
+ * acceptance criteria cannot be satisfied. It is also gated to
+ * AUTO_RETRY_RESUME_CLASSES (transient|fixable), and both of TASK-025's last
+ * two failures classified `structural`. Resume would have re-hit the same
+ * wall. The defect is in what the PLANNER was told, so the fix is what the
+ * planner is told — carried the same way buildAutoRetryQueueItem carries a
+ * diagnosis: in the task text, which `plan` reads in full.
+ *
+ * Returns "" (no preamble, behaviour identical to before) unless the diff
+ * actually ran AND reported at least one changed file. `ran:false` is never
+ * treated as progress — a branch that does not exist yet is a first attempt.
+ */
+function buildPriorProgressPreamble({ branch, diff, entry }) {
+  if (!diff || diff.ran !== true) return "";
+  const files = Array.isArray(diff.files) ? diff.files : [];
+  if (files.length === 0) return "";
+  const shown = files.slice(0, PRIOR_PROGRESS_FILE_SAMPLE);
+  const lines = [
+    "",
+    "",
+    `${PRIOR_PROGRESS_HEADER} (${branch}):`,
+    `${branch} already differs from ${EXPECTED_PR_BASE} in ${files.length} file(s).`,
+    "This task has been dispatched before; that work is committed and is not yours to redo.",
+  ];
+  if (entry && entry.runId) {
+    lines.push(`Last recorded antfarm run for this task: ${entry.runId}.`);
+  }
+  lines.push(
+    "Plan against the branch's ACTUAL current state, not the task text alone:",
+    `  - read the branch first: git log ${EXPECTED_PR_BASE}..${branch} and git diff --stat ${EXPECTED_PR_BASE}...${branch};`,
+    "  - do not re-plan work that is already committed there;",
+    "  - do not write acceptance criteria against paths an earlier attempt already moved or deleted;",
+    "  - if the branch already satisfies this task, say so and plan only what genuinely remains.",
+    "Files already changed on the branch:",
+    ...shown.map((f) => `  ${f}`),
+  );
+  if (files.length > shown.length) {
+    lines.push(`  ...and ${files.length - shown.length} more`);
+  }
+  return lines.join("\n");
+}
+
+/**
  * Tracker for a resumed run: already dispatched, same run-id, so /queue/check
  * keeps watching it and spawnPendingQueueItem never startRun's a fresh one.
  */
@@ -3237,14 +3302,27 @@ async function spawnPendingQueueItem(queue, idx, deps = {}) {
   // Only fires on a CONFIRMED empty diff plus a prior empty-diff attempt —
   // an empty diff on its own is a legitimate outcome for a review task, and a
   // diff that could not be computed (branch not cut yet) is never "empty".
-  {
-    const priorAuto = normaliseAutoRetry(loadLedger(deps)[ledgerKey]);
-    if (priorAuto.history.some((h) => h.diffHash === EMPTY_DIFF_DIGEST)) {
-      const priorDiff = branchDiffDigest(item.repoPath, branch, deps);
-      if (priorDiff.ran && priorDiff.digest === EMPTY_DIFF_DIGEST) {
-        logDispatchNext(`repeated-empty-diff key=${ledgerKey} branch=${branch}`);
-        return parkRepeatedEmptyDiff(queue, item, deps, ledgerKey, branch, priorAuto);
-      }
+  // One ledger read and at most one branch diff now serve both the Item 7
+  // repeated-empty-diff park below and TASK-048's prior-progress preamble.
+  //
+  // The diff is computed only when a ledger ENTRY exists, i.e. this task has
+  // been dispatched before. That gate is deliberate and is the one signal that
+  // survives a ledger clear: clearing sets cleared:true and resets the
+  // autoRetry sub-object (attempts/history), but the entry itself — and its
+  // runId — persists, because recordLedgerAttempt merges. Keying on
+  // autoRetry.history would have missed TASK-025 run #43 exactly: its history
+  // had just been reset to [] by the 2026-09-01 clear. A first-ever dispatch
+  // has no entry, makes no git call, and plans fresh — unchanged behaviour.
+  const ledgerEntry = loadLedger(deps)[ledgerKey] || null;
+  const priorAuto = normaliseAutoRetry(ledgerEntry);
+  const branchState = ledgerEntry
+    ? branchDiffDigest(item.repoPath, branch, deps)
+    : { ran: false, digest: null, files: [], error: "no prior dispatch" };
+
+  if (priorAuto.history.some((h) => h.diffHash === EMPTY_DIFF_DIGEST)) {
+    if (branchState.ran && branchState.digest === EMPTY_DIFF_DIGEST) {
+      logDispatchNext(`repeated-empty-diff key=${ledgerKey} branch=${branch}`);
+      return parkRepeatedEmptyDiff(queue, item, deps, ledgerKey, branch, priorAuto);
     }
   }
 
@@ -3259,10 +3337,24 @@ async function spawnPendingQueueItem(queue, idx, deps = {}) {
     return { status: 500, body: { ok: false, error: err?.message || String(err) } };
   }
 
+  // TASK-048. Appended to the DISPATCHED text only, never written back into
+  // item.task — so it cannot stack across retries the way an auto-retry
+  // feedback block can, and the queue item keeps the text a human would read.
+  const priorProgress = buildPriorProgressPreamble({
+    branch,
+    diff: branchState,
+    entry: ledgerEntry,
+  });
+  if (priorProgress) {
+    logDispatchNext(
+      `prior-progress-preamble key=${ledgerKey} branch=${branch} files=${branchState.files.length}`,
+    );
+  }
+
   const taskText = buildQueuedTaskText({
     repoPath: item.repoPath,
     branch,
-    task: item.task,
+    task: `${item.task}${priorProgress}`,
   });
 
   // Captured before the spawn so the run this dispatch creates is always at or
@@ -7515,6 +7607,138 @@ if (process.argv.includes("--self-test-auto-retry")) {
       { branchDiff: () => ({ ran: false, digest: null, files: [], error: "unknown revision" }) },
     );
     check("17k-uncomputable-dispatches", r.mq.get()[0].status === "dispatched", r.mq.get()[0]);
+  }
+
+  // ---- TASK-048: redispatch of an already-worked branch must tell `plan` -----
+  // The regression these lock down is TASK-025 run #43: three roadmap-auto
+  // dispatches onto feature/promote-design-preview, each planned from the task
+  // text alone, until a story targeted files an earlier story had deleted.
+
+  // 18. a task with a prior ledger entry and real commits on its branch gets
+  //     the prior-progress preamble in the DISPATCHED text.
+  {
+    const progressFiles = [
+      "apps/web/app/(trainer)/workouts/WorkoutsDirectionA.tsx",
+      "apps/web/components/design-system/PreviewChrome.tsx",
+    ];
+    const r = await spawnHarness(
+      [pendingItem("prog-1", "TASK-920 promote the preview screens")],
+      {
+        // Exactly the shape a CLEARED entry has: the entry and its runId
+        // survive, autoRetry.history does not. Keying on history would miss it.
+        "TASK-920": {
+          key: "TASK-920",
+          outcome: "dispatched",
+          cleared: false,
+          runId: "run-earlier-attempt",
+          autoRetry: { attempts: 0, cap: 2, parked: false, parkedReason: null, lastDiagnosis: null, history: [] },
+        },
+      },
+      { branchDiff: () => ({ ran: true, digest: "deadbeef", files: progressFiles }) },
+    );
+    const sent = r.started[0] || "";
+    check("18a-dispatched", r.mq.get()[0].status === "dispatched", r.mq.get()[0]);
+    check("18b-preamble-present", sent.includes(PRIOR_PROGRESS_HEADER), sent);
+    check("18c-names-branch", sent.includes("fix/task-920"), sent);
+    check("18d-exact-file-count", sent.includes("in 2 file(s)"), sent);
+    check("18e-lists-files", progressFiles.every((f) => sent.includes(f)), sent);
+    check("18f-names-prior-run", sent.includes("run-earlier-attempt"), sent);
+    check("18g-forbids-replanning-done-work", /already committed/.test(sent), sent);
+    check("18h-warns-about-moved-paths", /already moved or deleted/.test(sent), sent);
+    // The preamble is dispatch-time only: the queue item keeps the human text,
+    // so it can never stack the way an auto-retry feedback block can.
+    check("18i-not-persisted-to-item", !String(r.mq.get()[0].task).includes(PRIOR_PROGRESS_HEADER), r.mq.get()[0].task);
+    check("18j-task-text-still-present", sent.includes("TASK-920 promote the preview screens"), sent);
+  }
+
+  // 18b. first dispatch ever (no ledger entry at all): no preamble, and the
+  //      branch diff is never even computed. Unchanged behaviour, no git call.
+  {
+    let diffCalls = 0;
+    const r = await spawnHarness(
+      [pendingItem("prog-2", "TASK-921 brand new work")],
+      {},
+      {
+        branchDiff: () => {
+          diffCalls += 1;
+          return { ran: true, digest: "x", files: ["should/not/matter.ts"] };
+        },
+      },
+    );
+    check("18k-first-dispatches", r.mq.get()[0].status === "dispatched", r.mq.get()[0]);
+    check("18l-no-preamble", !String(r.started[0] || "").includes(PRIOR_PROGRESS_HEADER), r.started[0]);
+    check("18m-no-git-call", diffCalls === 0, diffCalls);
+  }
+
+  // 18c. prior entry but the branch does not exist yet (ran:false) -> no
+  //      preamble. `ran:false` must never be read as progress.
+  {
+    const r = await spawnHarness(
+      [pendingItem("prog-3", "TASK-922 branch not cut yet")],
+      { "TASK-922": { key: "TASK-922", outcome: "dispatched", cleared: false } },
+      { branchDiff: () => ({ ran: false, digest: null, files: [], error: "unknown revision" }) },
+    );
+    check("18n-dispatches", r.mq.get()[0].status === "dispatched", r.mq.get()[0]);
+    check("18o-no-preamble", !String(r.started[0] || "").includes(PRIOR_PROGRESS_HEADER), r.started[0]);
+  }
+
+  // 18d. prior entry, branch exists, but identical to staging -> no progress,
+  //      no preamble. (Not the same path as Item 7: no empty-diff history here.)
+  {
+    const r = await spawnHarness(
+      [pendingItem("prog-4", "TASK-923 nothing landed last time")],
+      { "TASK-923": { key: "TASK-923", outcome: "dispatched", cleared: false } },
+      { branchDiff: () => ({ ran: true, digest: EMPTY_DIFF_DIGEST, files: [] }) },
+    );
+    check("18p-dispatches", r.mq.get()[0].status === "dispatched", r.mq.get()[0]);
+    check("18q-no-preamble", !String(r.started[0] || "").includes(PRIOR_PROGRESS_HEADER), r.started[0]);
+  }
+
+  // 18e. Item 7 still wins: a repeated empty diff parks and never dispatches,
+  //      so no preamble can leak out of a parked item.
+  {
+    const r = await spawnHarness(
+      [pendingItem("prog-5", "TASK-924 review only")],
+      {
+        "TASK-924": {
+          key: "TASK-924", outcome: "retry-pending", cleared: false,
+          autoRetry: { attempts: 1, cap: 2, parked: false, parkedReason: null, lastDiagnosis: null,
+            history: [{ at: "2026-08-29T10:00:00.000Z", class: "fixable", reason: "r", diffHash: EMPTY_DIFF_DIGEST }] },
+        },
+      },
+      { branchDiff: () => ({ ran: true, digest: EMPTY_DIFF_DIGEST, files: [] }) },
+    );
+    check("18r-still-parks", r.mq.get()[0].status === "flagged", r.mq.get()[0]);
+    check("18s-nothing-started", r.started.length === 0, r.started);
+  }
+
+  // 18f. the file list is capped but the COUNT stays exact — a 60-file branch
+  //      must not silently report 40.
+  {
+    const many = Array.from({ length: 60 }, (_, i) => `src/file-${i}.ts`);
+    const r = await spawnHarness(
+      [pendingItem("prog-6", "TASK-925 big branch")],
+      { "TASK-925": { key: "TASK-925", outcome: "dispatched", cleared: false } },
+      { branchDiff: () => ({ ran: true, digest: "big", files: many }) },
+    );
+    const sent = r.started[0] || "";
+    check("18t-exact-count", sent.includes("in 60 file(s)"), sent);
+    check("18u-capped-list", sent.includes("...and 20 more"), sent);
+    check("18v-first-file-listed", sent.includes("src/file-0.ts"), sent);
+    check("18w-last-file-omitted", !sent.includes("src/file-59.ts"), sent);
+  }
+
+  // 18g. preamble and auto-retry feedback are independent and coexist.
+  {
+    const withFeedback = `TASK-926 do it\n\n${AUTO_RETRY_FEEDBACK_HEADER}2 of 3 — automatic diagnosis, not a human):\nCLASS: fixable\nWHAT FAILED: x\nEVIDENCE: y\nDO DIFFERENTLY: z`;
+    const r = await spawnHarness(
+      [pendingItem("prog-7", withFeedback)],
+      { "TASK-926": { key: "TASK-926", outcome: "retry-pending", cleared: false } },
+      { branchDiff: () => ({ ran: true, digest: "d", files: ["a.ts"] }) },
+    );
+    const sent = r.started[0] || "";
+    check("18x-both-blocks", sent.includes(AUTO_RETRY_FEEDBACK_HEADER) && sent.includes(PRIOR_PROGRESS_HEADER), sent);
+    check("18y-single-progress-block", sent.split(PRIOR_PROGRESS_HEADER).length - 1 === 1, sent);
   }
 
   // JC7. a `## Dispatch: manual` task never enters the retry cycle at all
