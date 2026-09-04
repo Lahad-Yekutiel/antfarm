@@ -219,6 +219,13 @@ const SUCCESS_RUN_STATUS = "completed";
 /** Mechanical PR base gate — only "staging" is allowed (not prompt prose). */
 const EXPECTED_PR_BASE = "staging";
 
+/**
+ * TASK-044 refusal reason: the TheCoach checkout itself could not be read, so
+ * no task contract is knowable and nothing may dispatch. Distinct from
+ * "task-file-missing", which is a readable repo with no file for that id.
+ */
+const THECOACH_REPO_UNREADABLE = "thecoach-repo-unreadable";
+
 /** Real GitHub PR URLs as they appear in step `output` text. */
 const PR_URL_RE = /https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/\d+/g;
 
@@ -781,8 +788,19 @@ function parseTaskContract(markdown) {
   return { ok: true, branch: branch.branch, tool: tool.tool };
 }
 
+/**
+ * Throws when the tasks directory cannot be listed; returns [] only when the
+ * listing SUCCEEDED and held no file for this id.
+ *
+ * TASK-044: this used to open with `if (!fs.existsSync(tasksDir)) return []`,
+ * which collapsed "the repo path is wrong / the drive is not mounted" into the
+ * same empty-array answer as "TASK-NNN simply has no file yet". The caller
+ * reads that empty array as missing:true and skips every contract gate, so one
+ * typo in COORDINATOR_THECOACH_REPO turned off the Status, Tool/model and
+ * Branch-base checks at once. A real TheCoach checkout always has _SSoT/tasks/;
+ * its absence is a broken path, not an empty task list.
+ */
 function listTaskFilenamesForId(tasksDir, taskId) {
-  if (!fs.existsSync(tasksDir)) return [];
   const prefix = `${taskId}-`;
   return fs.readdirSync(tasksDir).filter((name) => name.startsWith(prefix) && name.toLowerCase().endsWith(".md"));
 }
@@ -792,6 +810,16 @@ function listTaskFilenamesForId(tasksDir, taskId) {
  * ## Branch + ## Tool/model. missing:true means "no file to read" — caller
  * falls back to the hardcoded coordinator branch pattern. Any other failure
  * is a refusal (do not guess).
+ *
+ * TASK-044: "no file to read" means the tasks directory was READ SUCCESSFULLY
+ * and holds no TASK-NNN file — a genuine roadmap/task-file gap. A tasks dir we
+ * could not read at all (typo'd COORDINATOR_THECOACH_REPO, unmounted Windows
+ * drive, renamed folder, permissions/IO error) is NOT that: it is a broken
+ * repo path, and reporting it as missing:true silently skipped every contract
+ * gate — Status, Tool/model and Branch base all at once — and dispatched on
+ * coordinator defaults. Proven live 2026-09-04: with the repo path pointed at
+ * a non-existent directory, TASK-028 (Blocked) and TASK-029 (unsupported
+ * tool) both DISPATCHED instead of refusing. Fail closed instead.
  */
 function loadTaskContractForId(taskId, deps = {}) {
   const repo = deps.thecoachRepo !== undefined ? deps.thecoachRepo : THECOACH_REPO;
@@ -801,7 +829,15 @@ function loadTaskContractForId(taskId, deps = {}) {
   try {
     names = listTaskFilenamesForId(tasksDir, taskId);
   } catch (err) {
-    return { ok: false, missing: true, reason: "tasks-dir-unreadable", taskId, error: err?.message || String(err) };
+    return {
+      ok: false,
+      missing: false,
+      field: "repo-path",
+      reason: THECOACH_REPO_UNREADABLE,
+      taskId,
+      path: tasksDir,
+      error: err?.message || String(err),
+    };
   }
   if (names.length === 0) {
     return { ok: false, missing: true, reason: "task-file-missing", taskId };
@@ -1130,6 +1166,65 @@ function evaluateHostDispatchGates(ledgerKey, contract) {
  * Flag a pending item, surface the refusal on developer_todo (same route as
  * unledgerable / ledger-failed items), then advance to the next pending item.
  */
+/**
+ * TASK-044: single human-visible signal for a broken COORDINATOR_THECOACH_REPO.
+ *
+ * The TODO write targets the same repo we just failed to read, so it will
+ * usually fail too — that is expected, and why the loud log line, not the
+ * TODO, is the load-bearing signal. The write is still attempted because a
+ * permissions error on `_SSoT/tasks/` alone leaves
+ * `local/cursor_loop/developer_todo.json` perfectly writable, and in that case
+ * the operator gets the better signal. appendDeveloperTodoEntry() dedupes on
+ * an open entry with the same summary, so repeated dispatch attempts while the
+ * path stays broken do not pile up entries.
+ */
+function refuseUnreadableTheCoachRepo(item, deps, ledgerKey, contract) {
+  const repo = deps.thecoachRepo !== undefined ? deps.thecoachRepo : THECOACH_REPO;
+  const detail = contract?.error ? ` — ${contract.error}` : "";
+  logDispatchNextError(
+    `thecoach-repo-unreadable repo=${repo} path=${contract?.path ?? "(unknown)"}${detail}` +
+      ` — refusing to dispatch ${ledgerKey}; every task-file contract gate (Status, Tool/model, Branch base) is unverifiable while the checkout cannot be read`,
+  );
+  try {
+    const appendTodo = deps.appendTodo || ((r, draft) => appendDeveloperTodoEntry(r, draft, deps));
+    if (repo || deps.appendTodo) {
+      appendTodo(repo, {
+        summary: `Coordinator cannot read the TheCoach checkout at ${repo}`,
+        why:
+          "Every dispatch gate — ## Status, ## Tool/model, ## Branch base — is read from the task file."
+          + " While the checkout is unreadable none of them can be evaluated, so dispatch refuses rather than"
+          + " falling back to coordinator defaults.",
+        source: "coordinator",
+        type: "blocked",
+        evidence: `${contract?.path ?? repo}: ${contract?.error || "unreadable"}`,
+        reply_needed:
+          `Fix COORDINATOR_THECOACH_REPO in local-tools/.coordinator-trigger.env (or remount the drive),`
+          + ` then resolve this entry. Nothing dispatches until the checkout reads again.`,
+        blocks: [SCOPE_GLOBAL],
+      });
+    }
+  } catch (err) {
+    logDispatchNextError(
+      `todo writer failed for thecoach-repo-unreadable (expected when the whole checkout is gone): ${err?.message || String(err)}`,
+    );
+  }
+  return {
+    status: 200,
+    body: withIdleTelemetry(
+      {
+        ok: true,
+        dispatched: false,
+        reason: THECOACH_REPO_UNREADABLE,
+        queueItemId: item.id,
+        ledger_key: ledgerKey,
+        contract_field: "repo-path",
+        repo,
+      },
+      deps,
+    ),
+  };
+}
+
 async function flagTaskContractRefusal(queue, item, deps, details) {
   const save = deps.save || saveQueue;
   const taskId = details.taskId;
@@ -3239,6 +3334,17 @@ async function spawnPendingQueueItem(queue, idx, deps = {}) {
   const loadContract = deps.loadTaskContract || ((id) => loadTaskContractForId(id, deps));
   const contract = loadContract(ledgerKey);
   const gates = evaluateHostDispatchGates(ledgerKey, contract);
+
+  // TASK-044: the checkout itself is unreadable. Nothing about this item — or
+  // any other queued item — is knowable, so refuse here and return, rather
+  // than falling through to flagTaskContractRefusal(), which would park this
+  // item and then recurse into every remaining pending item and repeat the
+  // same failure once per item. One loud line, one TODO attempt, one refusal.
+  // The item stays `pending`: the repo path is an operator misconfiguration,
+  // not a defect in the task, and it must dispatch normally once fixed.
+  if (gates.reason === THECOACH_REPO_UNREADABLE) {
+    return refuseUnreadableTheCoachRepo(item, deps, ledgerKey, contract);
+  }
 
   if (gates.reason === "not-dispatchable-manual") {
     logDispatchNext(`task-dispatch-manual key=${ledgerKey}`);
@@ -6507,6 +6613,35 @@ if (process.argv.includes("--self-test-task-contract")) {
 
   const mqAdHoc = memoryQueue([pendingItem("q-adhoc", "README comment proof TASK-099")]);
   const startedAdHoc = [];
+  // --- TASK-044: a broken repo path must refuse, not dispatch on defaults ---
+  const brokenRepo = `${fixtureRepo}-DOES-NOT-EXIST`;
+  const loadedBrokenRepo = loadTaskContractForId("TASK-028", { thecoachRepo: brokenRepo });
+  const gatesBrokenRepo = evaluateHostDispatchGates("TASK-028", loadedBrokenRepo);
+  // Same blocked/unsupported ids as the live repro, so a regression shows up as
+  // "TASK-028 dispatched again" rather than as a silent shape change.
+  const brokenRepoGates = ["TASK-027", "TASK-028", "TASK-029"].map((id) =>
+    evaluateHostDispatchGates(id, loadTaskContractForId(id, { thecoachRepo: brokenRepo })),
+  );
+  const mqBroken = memoryQueue([pendingItem("q-broken", "Status-blocked task TASK-028")]);
+  const startedBroken = [];
+  const todosBroken = [];
+  const httpBroken = await spawnPendingQueueItem(mqBroken.get(), 0, {
+    ...memoryLedger(),
+    thecoachRepo: brokenRepo,
+    save: mqBroken.save,
+    appendTodo: (_repo, draft) => {
+      todosBroken.push(draft);
+      return { appended: true };
+    },
+    repoExists: () => true,
+    fetchStaging: async () => "tip-broken",
+    startRun: ({ task }) => {
+      startedBroken.push(task);
+      return { id: "spawn-broken", pid: 3, logPath: "/tmp/spawn-broken.log" };
+    },
+    waitRun: async () => ({ id: "run-broken", status: "running", run_number: 100 }),
+  });
+
   const httpAdHoc = await spawnPendingQueueItem(mqAdHoc.get(), 0, {
     ...memoryLedger(),
     thecoachRepo: fixtureRepo,
@@ -6520,6 +6655,34 @@ if (process.argv.includes("--self-test-task-contract")) {
     },
     waitRun: async () => ({ id: "run-adhoc", status: "running", run_number: 99 }),
   });
+
+  const brokenRepoCases = [
+    // The bug: an unreadable repo reported missing:true, and missing:true
+    // skips Status, Tool/model and Branch-base in evaluateHostDispatchGates.
+    check("044-broken-repo-not-missing", loadedBrokenRepo.missing === false, loadedBrokenRepo),
+    check("044-broken-repo-not-ok", loadedBrokenRepo.ok === false, loadedBrokenRepo),
+    check("044-broken-repo-reason", loadedBrokenRepo.reason === THECOACH_REPO_UNREADABLE, loadedBrokenRepo),
+    check("044-broken-repo-field", loadedBrokenRepo.field === "repo-path", loadedBrokenRepo),
+    check("044-broken-repo-names-path", typeof loadedBrokenRepo.path === "string" && loadedBrokenRepo.path.includes(brokenRepo), loadedBrokenRepo),
+    check("044-broken-repo-gate-refuses", gatesBrokenRepo.dispatched !== true, gatesBrokenRepo),
+    check("044-broken-repo-gate-reason", gatesBrokenRepo.reason === THECOACH_REPO_UNREADABLE, gatesBrokenRepo),
+    // The live repro, as a case: nothing dispatches on a broken path.
+    check("044-broken-repo-nothing-dispatches", brokenRepoGates.every((g) => g.dispatched !== true), brokenRepoGates),
+    // Queue path: refuse, stay pending, never start a run.
+    check("044-queue-not-dispatched", httpBroken.body.dispatched === false, httpBroken.body),
+    check("044-queue-reason", httpBroken.body.reason === THECOACH_REPO_UNREADABLE, httpBroken.body),
+    check("044-queue-startRun-never", startedBroken.length === 0, startedBroken),
+    // Not flagged: the item is fine, the operator's path is not. Flagging it
+    // would lose the work behind a misconfiguration that is about to be fixed.
+    check("044-queue-item-still-pending", mqBroken.get()[0]?.status === "pending", mqBroken.get()[0]),
+    // One human-visible signal, global-blocking, not one per queue item.
+    check("044-one-todo-written", todosBroken.length === 1, todosBroken),
+    check("044-todo-blocks-globally", todosBroken[0]?.blocks?.includes(SCOPE_GLOBAL) === true, todosBroken[0]),
+    check("044-todo-names-repo", String(todosBroken[0]?.summary || "").includes(brokenRepo), todosBroken[0]),
+    // Regression guard for the genuinely-absent case TASK-032 established:
+    // a readable repo with no TASK-099 file still falls back, unchanged.
+    check("044-genuine-gap-still-missing", loadedMissing.missing === true, loadedMissing),
+  ];
 
   const dispatchCases = [
     check("027-dispatched", http027.body.dispatched === true, http027.body),
@@ -6613,7 +6776,7 @@ if (process.argv.includes("--self-test-task-contract")) {
     ),
   ];
 
-  const allCases = [...parseCases, ...dispatchCases];
+  const allCases = [...parseCases, ...dispatchCases, ...brokenRepoCases];
   const report = {
     ok: failures.length === 0,
     failed: failures.length,
