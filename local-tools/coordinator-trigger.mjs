@@ -121,8 +121,17 @@ const FAILED_RUN_STATUS = "failed";
 /** Sorted-key join the diagnosis reply must match exactly (parseAgentDecision style). */
 const DIAGNOSIS_REPLY_KEYS = "class,evidence,reason,retry_guidance";
 const AUTO_RETRY_HISTORY_LIMIT = 20;
-/** phase:<id> / oq:OQ-<n> / task:TASK-<n> / * — compared after canonicalizeScopeToken(). */
-const SCOPE_TOKEN_RE = /^(?:\*|phase:[a-z0-9]+|oq:oq-\d+|task:task-\d+)$/;
+/**
+ * sprint:<id> / phase:<id> / oq:OQ-<n> / task:TASK-<n> / * — compared after
+ * canonicalizeScopeToken().
+ *
+ * `sprint:` is what the scan derives now. `phase:` stays accepted, read-only:
+ * developer_todo.json still holds entries whose `blocks` name a phase (e.g.
+ * TODO-0022, `phase:5`), and dropping the token from the grammar would make
+ * those entries unparseable — a schema violation that blocks dispatch
+ * globally. Nothing derives a `phase:` scope any more.
+ */
+const SCOPE_TOKEN_RE = /^(?:\*|sprint:[a-z0-9]+|phase:[a-z0-9]+|oq:oq-\d+|task:task-\d+)$/;
 const TASK_ID_RE = /TASK-(\d+)/i;
 /** Task files live here, read from COORDINATOR_THECOACH_REPO — same as ROADMAP.md. */
 const TASKS_RELATIVE_DIR = path.join("_SSoT", "tasks");
@@ -164,9 +173,25 @@ const TASK_BASE_SHAPE_RE = /^(?:staging|main|master|(?:feature|fix|feat|docs|rel
  * first line — "Ready — blocked until PR #22" is not ready either.
  */
 const TASK_STATUS_NOT_READY_RE = /\b(blocked|hold|superseded|deferred|abandoned|wontfix|do\s+not\s+dispatch|not\s+dispatchable)\b/i;
-const PHASE_HEADING_RE = /phase\s+(\d+[a-z]?)\b/i;
-/** `## Phase 9 — ...` / `## Phase 4B — ...` — ground truth for dispatch phase. */
-const PHASE_HEADING_LINE_RE = /^##\s+Phase\s+(\d+[a-z]?)\b/i;
+/**
+ * Dispatch ground truth is a `## Sprint NN — <flow>` entry and the unchecked
+ * `- [ ] … (TASK-nnn)` lines under it, written by Routine 9 at Sprint Start.
+ *
+ * There is no `## Phase N` fallback, deliberately. The live ROADMAP.md has had
+ * no such heading since 2026-09-02, but `_SSoT/archive/ROADMAP_2026-09-02_pre-
+ * reset.md` still does — with unchecked TASK-nnn lines (TASK-025's among them)
+ * that must stay un-dispatched. A fallback would make the archive dispatchable
+ * the moment anyone pointed a reader at it. Only ROADMAP_RELATIVE_PATH is ever
+ * read, and only Sprint headings are ever matched.
+ *
+ * `\d+[a-z]?` matches `Sprint 01` and `Sprint 1a`, and deliberately does NOT
+ * match the `## Sprint NN — <one-line demonstrable flow>` line in the roadmap's
+ * own "Sprint entry template" section: `NN` is not digits, so the template's
+ * placeholder `- [ ] <short description> (TASK-nnn)` sits under no heading.
+ */
+const SPRINT_HEADING_RE = /sprint\s+(\d+[a-z]?)\b/i;
+/** `## Sprint 1a — The site is on the internet` — ground truth for dispatch. */
+const SPRINT_HEADING_LINE_RE = /^##\s+Sprint\s+(\d+[a-z]?)\b/i;
 /** Open checklist items only. `[x]` / `[X]` are completed and must not dispatch. */
 const OPEN_CHECKBOX_LINE_RE = /^\s*-\s*\[\s*\]/;
 const RESOLVED_CHECKBOX_LINE_RE = /^\s*-\s*\[[xX]\]/;
@@ -609,9 +634,9 @@ function parseScopeList(values, { allowEmpty = true } = {}) {
 
 function derivePhaseScopeFromRoadmapRef(roadmapRef) {
   if (typeof roadmapRef !== "string") return null;
-  const m = roadmapRef.match(PHASE_HEADING_RE);
+  const m = roadmapRef.match(SPRINT_HEADING_RE);
   if (!m) return null;
-  return canonicalizeScopeToken(`phase:${m[1]}`);
+  return canonicalizeScopeToken(`sprint:${m[1]}`);
 }
 
 function extractTaskIdFromText(...parts) {
@@ -1306,16 +1331,25 @@ function iterateRoadmapLines(text, onLine, deps = {}) {
   }
 }
 
+/**
+ * Collect the `## Sprint NN — <flow>` entries, in file order.
+ *
+ * Only `##` Sprint headings count. The roadmap's `### Planned sprints`
+ * (a numbered list), `### Task placement` and `### Backlog` (tables) name
+ * sprints and task ids in prose, but carry no checkboxes and are explicitly
+ * not commitments — a heading alone never makes anything dispatchable, and at
+ * `###` they cannot match this anyway.
+ */
 function collectRoadmapPhaseHeadings(roadmapText, deps = {}) {
   const headings = [];
   iterateRoadmapLines(
     roadmapText,
     (line, index) => {
-      const hm = line.match(PHASE_HEADING_LINE_RE);
+      const hm = line.match(SPRINT_HEADING_LINE_RE);
       if (hm) {
         headings.push({
           phaseId: hm[1].toLowerCase(),
-          scope: canonicalizeScopeToken(`phase:${hm[1]}`),
+          scope: canonicalizeScopeToken(`sprint:${hm[1]}`),
           index,
           heading: line,
         });
@@ -2494,7 +2528,13 @@ function evaluateDispatchBackstop(scopes, blockedScopes, roadmapRef, roadmapText
   }
 
   const headings = collectRoadmapPhaseHeadings(roadmapText, deps);
-  const assertedPhases = listed.canonical.filter((s) => s.startsWith("phase:"));
+  // Only the sprint scope the planner asserts is checked against the roadmap's
+  // own headings; task:/oq:/* scopes have nothing to agree with. A `phase:`
+  // scope is never derived any more and no live heading can match one, so an
+  // asserted `phase:` is caught below as unknown rather than silently ignored.
+  const assertedPhases = listed.canonical.filter(
+    (s) => s.startsWith("sprint:") || s.startsWith("phase:"),
+  );
   for (const phaseScope of assertedPhases) {
     if (!headings.some((h) => h.scope === phaseScope)) {
       return {
@@ -2786,8 +2826,22 @@ You are given two read-only inputs from the Windows TheCoach checkout working tr
 
 HARD EXCLUSION LIST — you MUST NOT dispatch any item whose scopes intersect this set: ${exclusion}
 
+Dispatchable work lives ONLY under a \`## Sprint NN - <flow>\` heading, in its
+unchecked \`- [ ] ... (TASK-nnn)\` lines. Those lines are the binding task list,
+written at Sprint Start.
+
+Everything else in ROADMAP.md is planning, not a commitment, and nothing under
+it is dispatchable no matter how ready it reads:
+- \`### Planned sprints\` - a numbered list of intended sprints.
+- \`### On the map, order not set\`, \`### Task placement\`, \`### Backlog\` - prose
+  and tables. No checkboxes, and a task id appearing there does not place it in
+  a sprint.
+- \`### Sprint entry template\` - a blank template. Its \`## Sprint NN\` line and
+  its \`- [ ] <short description> (TASK-nnn)\` line are placeholders, never work.
+- Any \`## Before <date>\` section - history.
+
 Scope grammar (for both dispatch "scopes" and record-question "blocks"):
-- phase:<id>   e.g. phase:4B, phase:9
+- sprint:<id>  e.g. sprint:1a, sprint:01 - must name a real \`## Sprint NN\` heading
 - oq:<id>      e.g. oq:OQ-12
 - task:TASK-<n> e.g. task:TASK-033
 - *            blocks everything (use only when the question truly gates all work)
@@ -2795,17 +2849,17 @@ Scope grammar (for both dispatch "scopes" and record-question "blocks"):
 
 Reply with ONLY one JSON object, nothing else — no prose before or after, no markdown fences, no trailing commentary. Exactly one of these three shapes:
 
-{"decision":"dispatch","title":"<short task title>","description":"<what to build, specific enough for a dev agent to act on without more context>","roadmap_ref":"<which phase/line this came from, quoted or closely paraphrased>","scopes":["phase:<id>"]}
+{"decision":"dispatch","title":"<short task title>","description":"<what to build, specific enough for a dev agent to act on without more context>","roadmap_ref":"<which sprint/line this came from, quoted or closely paraphrased>","scopes":["sprint:<id>"]}
 
-{"decision":"record-question","summary":"<one line>","why":"<why this needs a human>","source":"<TASK-NNN or roadmap:PhaseX>","type":"roadmap-decision","evidence":"<short evidence>","reply_needed":"<what answer resolves this>","blocks":["phase:<id>"]}
+{"decision":"record-question","summary":"<one line>","why":"<why this needs a human>","source":"<TASK-NNN or roadmap:SprintNN>","type":"roadmap-decision","evidence":"<short evidence>","reply_needed":"<what answer resolves this>","blocks":["sprint:<id>"]}
 
 {"decision":"nothing-to-do"}
 
 Rules:
 - "dispatch" is only correct for work that is well-defined AND already decided — no open product/design choice, no explicit "deferred"/"blocked on"/"needs sign-off" language in the roadmap text itself.
-- Every dispatch MUST include a non-empty "scopes" array naming what the work belongs to (phase, oq, and/or task). Never dispatch work whose scopes intersect the exclusion list.
-- You MAY skip a blocked/deferred roadmap checkbox and continue looking for the next phase's actionable work whose scopes are outside the exclusion list. If the next well-defined item is blocked by the exclusion list, skip it and keep looking.
-- Do not return needs-developer-decision — that decision is retired. If you find a question that needs a developer answer, return record-question with an explicitly-reasoned "blocks" array: what specifically does this gate — which phase, which open question, which task? If it gates no dispatchable work, answer with an empty list.
+- Every dispatch MUST include a non-empty "scopes" array naming what the work belongs to (sprint, oq, and/or task). The sprint you name must be a \`## Sprint NN\` heading that actually exists in the file below. Never dispatch work whose scopes intersect the exclusion list.
+- You MAY skip a blocked/deferred roadmap checkbox and continue looking for the next actionable item under a \`## Sprint NN\` heading whose scopes are outside the exclusion list. If the next well-defined item is blocked by the exclusion list, skip it and keep looking.
+- Do not return needs-developer-decision — that decision is retired. If you find a question that needs a developer answer, return record-question with an explicitly-reasoned "blocks" array: what specifically does this gate — which sprint, which open question, which task? If it gates no dispatchable work, answer with an empty list.
 - When genuinely uncertain whether something is ready to dispatch, choose record-question or nothing-to-do, never a speculative dispatch. A missed dispatch costs one idle cycle; a wrong dispatch costs a whole run plus review time.
 - Dispatch only the first thing you find that is genuinely ready and unblocked. Do not queue multiple items in one scan.
 
@@ -4613,17 +4667,17 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   const STUB_ROADMAP = [
     "# ROADMAP",
     "",
-    "## Phase 4A — Visual Design System",
+    "## Sprint 4a — Visual Design System",
     "",
     "- [x] **Design system build-out (TASK-019)**",
     "- [x] ~~Staging integration (TASK-022)~~",
     "- [ ] **Promote design-preview (TASK-025)**",
     "",
-    "## Phase 4B — Trainer Web App Build",
+    "## Sprint 4b — Trainer Web App Build",
     "",
     "- [ ] **Auth rework (TASK-040)**",
     "",
-    "## Phase 9 — Testing & QA Hardening",
+    "## Sprint 9 — Testing & QA Hardening",
     "",
     "- [ ] **Add reliability note (TASK-099)**",
     "- [ ] **Schema/types drift check (TASK-026)**",
@@ -4632,9 +4686,9 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   const dispatchReply = {
     decision: "dispatch",
     title: "Add reliability note (TASK-099)",
-    description: "Write the Phase 4 reliability paragraph into README.md",
-    roadmap_ref: "Phase 9 — Testing & QA Hardening: reliability paragraph (TASK-099)",
-    scopes: ["phase:9"],
+    description: "Write the Sprint 4 reliability paragraph into README.md",
+    roadmap_ref: "Sprint 9 — Testing & QA Hardening: reliability paragraph (TASK-099)",
+    scopes: ["sprint:9"],
   };
   const capturedLogs = [];
   const origLog = console.log;
@@ -4645,14 +4699,14 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   const dispatchReplyNoScopes = {
     decision: "dispatch",
     title: "Add reliability note (TASK-099)",
-    description: "Write the Phase 4 reliability paragraph into README.md",
-    roadmap_ref: "Phase 9 — Testing & QA Hardening: reliability paragraph (TASK-099)",
+    description: "Write the Sprint 4 reliability paragraph into README.md",
+    roadmap_ref: "Sprint 9 — Testing & QA Hardening: reliability paragraph (TASK-099)",
   };
   const recordQuestionReply = {
     decision: "record-question",
     summary: "Need a yes/no on adding CI",
     why: "Spends Actions minutes",
-    source: "roadmap:Phase9",
+    source: "roadmap:Sprint9",
     type: "roadmap-decision",
     evidence: "no .github/workflows",
     reply_needed: "yes or no",
@@ -4679,7 +4733,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     check("reject-empty-string-field", parseAgentDecision(JSON.stringify({ ...dispatchReply, title: "  " })).ok === false),
     check(
       "reject-malformed-scopes-entries",
-      parseAgentDecision(JSON.stringify({ ...dispatchReply, scopes: ["banana", "", "phase:", 42] })).ok === false,
+      parseAgentDecision(JSON.stringify({ ...dispatchReply, scopes: ["banana", "", "sprint:", 42] })).ok === false,
     ),
   ];
 
@@ -4716,13 +4770,13 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     decision: "dispatch",
     title: "OAuth client wiring (TASK-040)",
     description: "Wire Google OAuth into auth",
-    roadmap_ref: "Phase 4B — Auth rework (TASK-040)",
-    scopes: ["phase:4B"],
+    roadmap_ref: "Sprint 4b — Auth rework (TASK-040)",
+    scopes: ["sprint:4B"],
   };
   const parsedBlocked = parseAgentDecision(JSON.stringify(phase4bDispatch));
   const blockedBackstop = evaluateDispatchBackstop(
     parsedBlocked.decision.scopes,
-    new Set(["phase:4B", "oq:OQ-12"]),
+    new Set(["sprint:4B", "oq:OQ-12"]),
     phase4bDispatch.roadmap_ref,
     STUB_ROADMAP,
     phase4bDispatch,
@@ -4730,7 +4784,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   const missingScopesBackstop = evaluateDispatchBackstop(undefined, new Set());
   const emptyScopesBackstop = evaluateDispatchBackstop([], new Set());
   const emptyBlocksBackstop = evaluateDispatchBackstop(
-    ["phase:9"],
+    ["sprint:9"],
     new Set(summarizeOpenTodos([{ id: "TODO-0006", status: "open", blocks: [] }]).blockedScopes),
     dispatchReply.roadmap_ref,
     STUB_ROADMAP,
@@ -4757,7 +4811,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   }
 
   const liveBlockedScan = await liveScanDispatch(phase4bDispatch, [
-    { id: "TODO-0004", status: "open", summary: "oauth", blocks: ["phase:4B", "oq:OQ-12"] },
+    { id: "TODO-0004", status: "open", summary: "oauth", blocks: ["sprint:4B", "oq:OQ-12"] },
   ]);
   const liveMissingScopesScan = await liveScanDispatch(dispatchReplyNoScopes, []);
   const liveBackstopCases = [
@@ -4768,24 +4822,24 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     check("live-backstop-missing-scopes-reason", liveMissingScopesScan.backstop_reason === "missing-or-empty-scopes", liveMissingScopesScan),
   ];
 
-  const bypassStrings = ["phase:4b", "Phase:4B", "phase:4B ", "phase:4", "", "not-a-scope"];
+  const bypassStrings = ["sprint:4b", "Sprint:4b", "sprint:4B ", "sprint:4", "", "not-a-scope"];
   const bypassLiveCases = [];
   for (const [i, scope] of bypassStrings.entries()) {
     const decision = { ...phase4bDispatch, scopes: [scope] };
     let scanResult;
-    if (scope === "" || scope === "not-a-scope" || scope === "phase:4") {
-      // parse may reject empty/not-a-scope; phase:4 is valid grammar but disagrees with derived 4b
+    if (scope === "" || scope === "not-a-scope" || scope === "sprint:4") {
+      // parse may reject empty/not-a-scope; sprint:4 is valid grammar but disagrees with derived 4b
       const parsed = parseAgentDecision(JSON.stringify(decision));
       if (!parsed.ok) {
         scanResult = { outcome: "nothing-dispatchable", failReason: parsed.error, parseRejected: true };
       } else {
         scanResult = await liveScanDispatch(decision, [
-          { id: "TODO-0004", status: "open", summary: "oauth", blocks: ["phase:4B"] },
+          { id: "TODO-0004", status: "open", summary: "oauth", blocks: ["sprint:4B"] },
         ]);
       }
     } else {
       scanResult = await liveScanDispatch(decision, [
-        { id: "TODO-0004", status: "open", summary: "oauth", blocks: ["phase:4B"] },
+        { id: "TODO-0004", status: "open", summary: "oauth", blocks: ["sprint:4B"] },
       ]);
     }
     const rejected =
@@ -4799,22 +4853,22 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   }
 
   const disagreeScan = await liveScanDispatch(
-    { ...dispatchReply, scopes: ["phase:9"], roadmap_ref: "Phase 4B — Auth rework (TASK-099)" },
+    { ...dispatchReply, scopes: ["sprint:9"], roadmap_ref: "Sprint 4b — Auth rework (TASK-099)" },
     [],
   );
   const coherentWrong = {
     decision: "dispatch",
     title: "Promote design-preview (TASK-025)",
     description: "Replace the old screens with design-preview",
-    roadmap_ref: "Phase 9 — Testing & QA Hardening: Promote design-preview (TASK-025)",
-    scopes: ["phase:9"],
+    roadmap_ref: "Sprint 9 — Testing & QA Hardening: Promote design-preview (TASK-025)",
+    scopes: ["sprint:9"],
   };
   const coherentWrongScan = await liveScanDispatch(coherentWrong, []);
   const phase77Scan = await liveScanDispatch(
     {
       ...dispatchReply,
-      scopes: ["phase:77"],
-      roadmap_ref: "Phase 77 — Does not exist (TASK-099)",
+      scopes: ["sprint:77"],
+      roadmap_ref: "Sprint 77 — Does not exist (TASK-099)",
     },
     [],
   );
@@ -4823,8 +4877,8 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
       decision: "dispatch",
       title: "Invented work (TASK-888)",
       description: "This checkbox is not in the roadmap",
-      roadmap_ref: "Phase 9 — Testing & QA Hardening: Invented work (TASK-888)",
-      scopes: ["phase:9"],
+      roadmap_ref: "Sprint 9 — Testing & QA Hardening: Invented work (TASK-888)",
+      scopes: ["sprint:9"],
     },
     [],
   );
@@ -4832,9 +4886,9 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     {
       decision: "dispatch",
       title: "Add reliability note",
-      description: "Write the Phase 4 reliability paragraph into README.md",
-      roadmap_ref: "Phase 9 — Testing & QA Hardening: reliability paragraph",
-      scopes: ["phase:9"],
+      description: "Write the Sprint 4 reliability paragraph into README.md",
+      roadmap_ref: "Sprint 9 — Testing & QA Hardening: reliability paragraph",
+      scopes: ["sprint:9"],
     },
     [],
   );
@@ -4931,7 +4985,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     load: mqBlocked.load,
     save: mqBlocked.save,
     writeTodo: sinkTodo,
-    readTodo: () => JSON.stringify([{ id: "TODO-0004", status: "open", summary: "oauth", blocks: ["phase:4B", "oq:OQ-12"] }]),
+    readTodo: () => JSON.stringify([{ id: "TODO-0004", status: "open", summary: "oauth", blocks: ["sprint:4B", "oq:OQ-12"] }]),
     ...bgBlocked,
     ...memoryScanState(),
     ...memoryLedger(),
@@ -4941,7 +4995,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
         ...scanDeps,
         thecoachRepo: "/tmp/thecoach-does-not-matter",
         writeTodo: sinkTodo,
-        readTodo: () => JSON.stringify([{ id: "TODO-0004", status: "open", summary: "oauth", blocks: ["phase:4B", "oq:OQ-12"] }]),
+        readTodo: () => JSON.stringify([{ id: "TODO-0004", status: "open", summary: "oauth", blocks: ["sprint:4B", "oq:OQ-12"] }]),
         readRoadmap: () => STUB_ROADMAP,
         runAgent: async () => JSON.stringify({ payloads: [{ text: JSON.stringify(phase4bDispatch) }] }),
       });
@@ -4961,7 +5015,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     check("blocked-scope-agent-called-in-background", blockedAgentCalls === 1, blockedAgentCalls),
     check(
       "blocked-scope-logged",
-      capturedLogs.some((l) => l.includes("backstop-rejected-dispatch") && l.includes("phase:4B")),
+      capturedLogs.some((l) => l.includes("backstop-rejected-dispatch") && l.includes("sprint:4B")),
       capturedLogs.filter((l) => l.includes("backstop")),
     ),
     check("blocked-scope-scan-outcome-nothing", bgBlocked.length === 0 && mqBlocked.get().length === 0),
@@ -5619,7 +5673,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
       id: "TODO-0001",
       status: "open",
       summary: "Need a yes/no on adding CI",
-      source: "roadmap:Phase9",
+      source: "roadmap:Sprint9",
       type: "roadmap-decision",
       blocks: [],
     },
@@ -5763,8 +5817,8 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     ...dispatchReply,
     title: "Schema/types drift check (TASK-026)",
     description: "Add check:types",
-    roadmap_ref: "Phase 9 — Testing & QA Hardening: Schema/types drift check (TASK-026)",
-    scopes: ["phase:9", "task:TASK-026"],
+    roadmap_ref: "Sprint 9 — Testing & QA Hardening: Schema/types drift check (TASK-026)",
+    scopes: ["sprint:9", "task:TASK-026"],
   };
   const ledgerWrites = [];
   const ledgerBlockedScan = await scanRoadmapForWork({
@@ -5916,6 +5970,8 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     startRun: () => ({ id: "spawn-504", pid: 5, logPath: "/tmp/spawn-504.log" }),
     waitRun: async () => null,
   });
+  // Snapshot before the follow-up call parks it — see 504-item-* cases below.
+  const status504AtReturn = mq504.get()[0]?.status;
   let startAfter504 = 0;
   const after504 = await handleDispatchNext({
     thecoachRepo: "/tmp/thecoach-does-not-matter",
@@ -5938,7 +5994,21 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     check("human-ledger-not-dispatched", humanLedgerHttp.body.dispatched === false, humanLedgerHttp.body),
     check("human-ledger-reason", humanLedgerHttp.body.reason === "ledger-blocked", humanLedgerHttp.body.reason),
     check("human-ledger-key", humanLedgerHttp.body.ledger_blocked === "TASK-026", humanLedgerHttp.body),
-    check("human-ledger-still-pending", mqHumanLedger.get()[0]?.status === "pending", mqHumanLedger.get()[0]),
+    // Was "human-ledger-still-pending" until 2026-09-04. It asserted the
+    // pre-8-P1 behavior: a ledger-blocked item stayed `pending`. 8-P1
+    // (2026-08-29) deliberately changed that — a pending ledger-blocked item
+    // halted the whole coordinator, because handleDispatchNext only reaches
+    // the roadmap scan when NO pending item exists — so it is now parked as
+    // `flagged` and the queue advances. The expectation, not the behavior, was
+    // stale. What still matters is that it did not dispatch and did not stay
+    // stuck at the head of the queue.
+    check("human-ledger-item-parked", mqHumanLedger.get()[0]?.status === "flagged", mqHumanLedger.get()[0]),
+    check(
+      "human-ledger-park-note-explains",
+      String(mqHumanLedger.get()[0]?.note || "").includes("ledger-blocked"),
+      mqHumanLedger.get()[0]?.note,
+    ),
+    check("human-ledger-not-pending", mqHumanLedger.get()[0]?.status !== "pending", mqHumanLedger.get()[0]),
     check("human-ledger-no-startRun", humanLedgerStartRun === 0, humanLedgerStartRun),
     check("human-ledger-no-fetch", humanLedgerFetch === 0, humanLedgerFetch),
     check("human-cleared-dispatched", humanClearedHttp.body.dispatched === true, humanClearedHttp.body),
@@ -5948,7 +6018,15 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     check("unledgerable-no-startRun", unledgerableStartRun === 0, unledgerableStartRun),
     check("unledgerable-flagged", mqUnledgerable.get()[0]?.status === "flagged", mqUnledgerable.get()[0]),
     check("504-status", http504.status === 504, http504.status),
-    check("504-item-still-pending", mq504.get()[0]?.status === "pending", mq504.get()[0]),
+    // Was "504-item-still-pending" until 2026-09-04, and stale for the same
+    // 8-P1 reason as human-ledger-item-parked above, with one extra wrinkle:
+    // this assertion runs after `after504`, the follow-up call. http504 does
+    // leave the item pending — it is the follow-up, finding the failure the
+    // 504 ledgered, that parks it. Assert both halves rather than the one
+    // snapshot, so a regression in either is visible.
+    check("504-item-pending-at-504", status504AtReturn === "pending", status504AtReturn),
+    check("504-item-parked-after-followup", mq504.get()[0]?.status === "flagged", mq504.get()[0]),
+    check("504-item-not-pending-after-followup", mq504.get()[0]?.status !== "pending", mq504.get()[0]),
     check("504-ledger-failed", ledger504.get()["TASK-026"]?.outcome === "failed", ledger504.get()["TASK-026"]),
     check("504-followup-blocked", after504.body.reason === "ledger-blocked", after504.body),
     check("504-followup-no-startRun", startAfter504 === 0, startAfter504),
@@ -6055,69 +6133,181 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     check("parse-budget-did-not-spin", budgetTicks >= 2 && budgetTicks < 20, budgetTicks),
   ];
 
-  const realRoadmapPath = "/mnt/c/Users/lahad/Projects/TheCoach/_SSoT/ROADMAP.md";
-  const realRoadmap = fs.readFileSync(realRoadmapPath, "utf-8");
+  // --- Item 8: the scan reads sprints, not phases -----------------------
+  //
+  // This block used to assert a hardcoded expectation table (TASK-013..035 ->
+  // phase:4a/4b/9/10) against the LIVE ROADMAP.md. That table was a snapshot
+  // of the pre-reset roadmap, so it went stale the moment the roadmap was
+  // rewritten and stayed stale — by 2026-09-04 all 23 of its cases failed,
+  // reporting nothing more than "the roadmap changed". The live file is still
+  // read, but only for what is true of it by construction (it parses, inside
+  // budget, and its own Sprint entries are locatable). Everything about scan
+  // SEMANTICS is asserted against fixtures below, which cannot drift.
+  const realRoadmapPath = ROADMAP_RELATIVE_PATH;
+  const realRoadmapFull = path.join("/mnt/c/Users/lahad/Projects/TheCoach", realRoadmapPath);
+  const realRoadmap = fs.readFileSync(realRoadmapFull, "utf-8");
   const realParseT0 = process.hrtime.bigint();
   const realHeadings = collectRoadmapPhaseHeadings(realRoadmap);
   const realParseMs = Number(process.hrtime.bigint() - realParseT0) / 1e6;
-  const openTaskIds = [
-    "TASK-031", "TASK-032", "TASK-035", "TASK-034",
-    "TASK-025", "TASK-023", "TASK-030", "TASK-028",
-    "TASK-026", "TASK-027", "TASK-029", "TASK-033",
-    "TASK-024",
-  ];
-  const expectedOpen = {
-    "TASK-031": "underivable-phase",
-    "TASK-032": "underivable-phase",
-    "TASK-035": "underivable-phase",
-    "TASK-034": "underivable-phase",
-    "TASK-025": "phase:4a",
-    "TASK-023": "phase:4b",
-    "TASK-030": "phase:4b",
-    "TASK-028": "phase:4b",
-    "TASK-026": "phase:9",
-    "TASK-027": "phase:9",
-    "TASK-029": "phase:9",
-    "TASK-033": "phase:9",
-    "TASK-024": "phase:10",
-  };
-  const realOpen = {};
-  for (const id of openTaskIds) {
-    realOpen[id] = locateDispatchInRoadmap(realRoadmap, { title: id, description: "", roadmap_ref: "" });
-  }
-  const completed4a = ["TASK-013", "TASK-014", "TASK-015", "TASK-016", "TASK-017", "TASK-018", "TASK-019", "TASK-020", "TASK-022"];
-  const realCompleted = completed4a.map((id) => locateDispatchInRoadmap(realRoadmap, { title: id, description: "", roadmap_ref: "" }));
+  const realSprint1a = locateDispatchInRoadmap(realRoadmap, {
+    title: "TASK-027",
+    description: "",
+    roadmap_ref: "",
+  });
+
+  // (a) One sprint entry, one unchecked task line -> that task is dispatchable.
+  const FIXTURE_SPRINT_ROADMAP = [
+    "# ROADMAP",
+    "",
+    "## Sprints",
+    "",
+    "| # | Sprint | Status |",
+    "|---|--------|--------|",
+    "| 01 | The site is on the internet | In progress |",
+    "",
+    "### Planned sprints (order set by the developer)",
+    "",
+    "1. The site is on the internet - TASK-101 lands the entrypoint.",
+    "2. The site guards itself - TASK-102.",
+    "",
+    "### Task placement",
+    "",
+    "| Task | Sprint |",
+    "|------|--------|",
+    "| TASK-103 | 01 |",
+    "",
+    "### Backlog (pulled in by a trigger, not by a sprint number)",
+    "",
+    "| Task | Trigger |",
+    "|------|---------|",
+    "| TASK-104 | when the door exists |",
+    "",
+    "### Sprint entry template (copy per sprint)",
+    "",
+    "## Sprint NN — <one-line demonstrable flow>",
+    "",
+    "**Tasks:**",
+    "- [ ] <short description> (TASK-nnn)",
+    "",
+    "## Sprint 01 — The site is on the internet",
+    "",
+    "**Tasks:**",
+    "- [x] Groundwork (TASK-100)",
+    "- [ ] Root verify entrypoint (TASK-101)",
+  ].join("\n");
+
+  // (b) The same planning material with NO `## Sprint NN` entry at all.
+  const FIXTURE_PLANNING_ONLY_ROADMAP = FIXTURE_SPRINT_ROADMAP.slice(
+    0,
+    FIXTURE_SPRINT_ROADMAP.indexOf("## Sprint 01 — The site is on the internet"),
+  );
+
+  // (c) The archived pre-reset roadmap's shape: `## Phase N` headings with
+  // unchecked TASK-nnn lines that must never become dispatchable.
+  const FIXTURE_ARCHIVED_PHASE_ROADMAP = [
+    "# ROADMAP (archived 2026-09-02, pre-reset)",
+    "",
+    "## Phase 4A — Visual Design System",
+    "",
+    "- [ ] **Promote design-preview (TASK-025)**",
+    "",
+    "## Phase 9 — Testing & QA Hardening",
+    "",
+    "- [ ] **Schema/types drift check (TASK-026)**",
+  ].join("\n");
+
+  const fixtureSprintHeadings = collectRoadmapPhaseHeadings(FIXTURE_SPRINT_ROADMAP);
+  const fixtureSprintHit = locateDispatchInRoadmap(FIXTURE_SPRINT_ROADMAP, {
+    title: "Root verify entrypoint (TASK-101)",
+    description: "",
+    roadmap_ref: "Sprint 01 — The site is on the internet",
+  });
+  // The resolved line under the same sprint must still be refused.
+  const fixtureSprintResolved = locateDispatchInRoadmap(FIXTURE_SPRINT_ROADMAP, {
+    title: "Groundwork (TASK-100)",
+    description: "",
+    roadmap_ref: "Sprint 01",
+  });
+  // Ids that appear only in the planned list / placement table / backlog.
+  const fixturePlanningOnlyHits = ["TASK-102", "TASK-103", "TASK-104"].map((id) =>
+    locateDispatchInRoadmap(FIXTURE_SPRINT_ROADMAP, { title: id, description: "", roadmap_ref: "" }),
+  );
+  // The template's placeholder heading and placeholder task line.
+  const fixtureTemplateHit = locateDispatchInRoadmap(FIXTURE_SPRINT_ROADMAP, {
+    title: "TASK-nnn",
+    description: "",
+    roadmap_ref: "Sprint NN",
+  });
+
+  const fixturePlanningHeadings = collectRoadmapPhaseHeadings(FIXTURE_PLANNING_ONLY_ROADMAP);
+  const fixturePlanningHits = ["TASK-101", "TASK-102", "TASK-103", "TASK-104"].map((id) =>
+    locateDispatchInRoadmap(FIXTURE_PLANNING_ONLY_ROADMAP, { title: id, description: "", roadmap_ref: "" }),
+  );
+
+  const fixtureArchivedHeadings = collectRoadmapPhaseHeadings(FIXTURE_ARCHIVED_PHASE_ROADMAP);
+  const fixtureArchivedHits = ["TASK-025", "TASK-026"].map((id) =>
+    locateDispatchInRoadmap(FIXTURE_ARCHIVED_PHASE_ROADMAP, { title: id, description: "", roadmap_ref: "" }),
+  );
+
   origLog(
     JSON.stringify(
       {
         real_roadmap_parse_ms: realParseMs,
-        headings: realHeadings.map((h) => h.scope),
-        open: Object.fromEntries(
-          openTaskIds.map((id) => [
-            id,
-            realOpen[id].ok ? realOpen[id].filePhase : realOpen[id].reason,
-          ]),
-        ),
-        completed_4a: Object.fromEntries(completed4a.map((id, i) => [id, realCompleted[i].reason])),
+        real_roadmap_path: realRoadmapPath,
+        real_headings: realHeadings.map((h) => h.scope),
+        real_sprint_1a_TASK_027: realSprint1a.ok ? realSprint1a.filePhase : realSprint1a.reason,
+        fixture_a_headings: fixtureSprintHeadings.map((h) => h.scope),
+        fixture_a_TASK_101: fixtureSprintHit.ok ? fixtureSprintHit.filePhase : fixtureSprintHit.reason,
+        fixture_b_headings: fixturePlanningHeadings.map((h) => h.scope),
+        fixture_b_reasons: fixturePlanningHits.map((h) => (h.ok ? h.filePhase : h.reason)),
+        fixture_c_headings: fixtureArchivedHeadings.map((h) => h.scope),
+        fixture_c_reasons: fixtureArchivedHits.map((h) => (h.ok ? h.filePhase : h.reason)),
       },
       null,
       2,
     ),
   );
+
   const realParseCases = [
     check("real-roadmap-parse-returns", Number.isFinite(realParseMs) && realParseMs < ROADMAP_PARSE_BUDGET_MS, realParseMs),
-    check("real-roadmap-has-blank-lines", realRoadmap.split("\n").filter((l) => l.trim() === "").length >= 70, realRoadmap.split("\n").filter((l) => l.trim() === "").length),
-    ...openTaskIds.map((id) =>
-      check(
-        `real-open-${id}`,
-        expectedOpen[id].startsWith("phase:")
-          ? realOpen[id].ok === true && realOpen[id].filePhase === expectedOpen[id]
-          : realOpen[id].ok === false && realOpen[id].reason === expectedOpen[id],
-        { id, expected: expectedOpen[id], got: realOpen[id] },
-      ),
+    // The scan reads _SSoT/ROADMAP.md and only that. Item 8 (c): the archived
+    // copy at _SSoT/archive/ROADMAP_2026-09-02_pre-reset.md must never be read.
+    check("real-roadmap-path-is-ssot", realRoadmapPath === path.join("_SSoT", "ROADMAP.md"), realRoadmapPath),
+    check("real-roadmap-path-not-archive", !String(realRoadmapPath).includes("archive"), realRoadmapPath),
+    // The live roadmap really does use Sprint headings now, and TASK-027 —
+    // Sprint 1a's first unchecked task, i.e. re-enable condition (c) — is
+    // locatable under one. Before this change every id was item-unlocatable.
+    check("real-roadmap-has-sprint-headings", realHeadings.length > 0, realHeadings.map((h) => h.scope)),
+    check("real-roadmap-no-phase-scopes", realHeadings.every((h) => h.scope.startsWith("sprint:")), realHeadings.map((h) => h.scope)),
+    check("real-sprint-1a-locates-TASK-027", realSprint1a.ok === true, realSprint1a),
+    check("real-sprint-1a-scope", realSprint1a.filePhase === "sprint:1a", realSprint1a),
+
+    // --- (a) one sprint entry + one unchecked task -> dispatches that task ---
+    check("fixture-a-one-heading", fixtureSprintHeadings.length === 1, fixtureSprintHeadings.map((h) => h.scope)),
+    check("fixture-a-heading-scope", fixtureSprintHeadings[0]?.scope === "sprint:01", fixtureSprintHeadings),
+    check("fixture-a-locates-task", fixtureSprintHit.ok === true, fixtureSprintHit),
+    check("fixture-a-task-id", fixtureSprintHit.taskId === "TASK-101", fixtureSprintHit),
+    check("fixture-a-scope", fixtureSprintHit.filePhase === "sprint:01", fixtureSprintHit),
+    check("fixture-a-resolved-line-refused", fixtureSprintResolved.ok === false && fixtureSprintResolved.reason === "item-resolved", fixtureSprintResolved),
+    // Planned-list / placement-table / backlog ids carry no checkbox, so they
+    // are unlocatable even though the file names them.
+    ...["TASK-102", "TASK-103", "TASK-104"].map((id, i) =>
+      check(`fixture-a-${id}-not-dispatchable`, fixturePlanningOnlyHits[i].ok === false, fixturePlanningOnlyHits[i]),
     ),
-    ...completed4a.map((id, i) =>
-      check(`real-completed-${id}-rejected`, realCompleted[i].ok === false && realCompleted[i].reason === "item-resolved", realCompleted[i]),
+    // The `## Sprint NN` template heading is not a sprint, so its placeholder
+    // checkbox sits under no heading and cannot be dispatched.
+    check("fixture-a-template-not-dispatchable", fixtureTemplateHit.ok === false, fixtureTemplateHit),
+
+    // --- (b) planning material only, no `## Sprint NN` -> dispatches nothing ---
+    check("fixture-b-no-headings", fixturePlanningHeadings.length === 0, fixturePlanningHeadings),
+    ...["TASK-101", "TASK-102", "TASK-103", "TASK-104"].map((id, i) =>
+      check(`fixture-b-${id}-not-dispatchable`, fixturePlanningHits[i].ok === false, fixturePlanningHits[i]),
+    ),
+
+    // --- (c) `## Phase N` is never a fallback -----------------------------
+    check("fixture-c-phase-headings-ignored", fixtureArchivedHeadings.length === 0, fixtureArchivedHeadings),
+    ...["TASK-025", "TASK-026"].map((id, i) =>
+      check(`fixture-c-${id}-stays-undispatched`, fixtureArchivedHits[i].ok === false, fixtureArchivedHits[i]),
     ),
   ];
 
