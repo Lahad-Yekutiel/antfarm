@@ -149,7 +149,25 @@ export async function createAgentCronJob(job: {
     }
 
     if (job.payload?.timeoutSeconds) {
-      args.push("--timeout", `${job.payload.timeoutSeconds}`);
+      // TASK-043. This passed `--timeout ${timeoutSeconds}`, which is two bugs
+      // in one line. On `openclaw cron add`, `--timeout <ms>` comes from
+      // addGatewayClientOptions() and is the GATEWAY RPC CLIENT timeout in
+      // milliseconds (default 30000); the job's own timeout is a different
+      // flag, `--timeout-seconds <n>`, which is what lands in
+      // payload.timeoutSeconds. So passing 120 here set a 120 MILLISECOND
+      // gateway timeout — that is the historical "GatewayTransportError:
+      // gateway timeout after 120ms", byte for byte — and never set the job
+      // timeout at all, which is why the live antfarm/medic job's stored
+      // payload carries no timeoutSeconds field.
+      //
+      // Verified 2026-09-04 against the installed openclaw's own cron CLI
+      // (dist/cron-cli-*.js), not its --help text: `cron add` declares
+      // `--timeout-seconds <n>` and assigns it to payload.timeoutSeconds.
+      //
+      // Only the CLI fallback was affected; the HTTP path always sent
+      // timeoutSeconds in the payload correctly, which is why this stayed
+      // dormant — it would have fired exactly when the gateway was down.
+      args.push("--timeout-seconds", `${job.payload.timeoutSeconds}`);
     }
 
     if (job.payload?.model) {
