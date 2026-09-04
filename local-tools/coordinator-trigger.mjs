@@ -4521,6 +4521,17 @@ if (process.argv.includes("--self-test-auth-matrix")) {
 if (process.argv.includes("--self-test-roadmap-scan")) {
   const failures = [];
 
+  // These stub repo paths stand in for "a TheCoach checkout whose contents do
+  // not matter to this case" — every case here injects readRoadmap/readTodo,
+  // so nothing is read from them. They still have to EXIST: since TASK-044,
+  // an unlistable _SSoT/tasks/ is a repo-path failure that refuses dispatch,
+  // which is the correct production behavior but not what these cases are
+  // about. Give them a real, empty tasks dir so the contract load reports the
+  // genuine "no task file for this id" gap these cases were written against.
+  for (const stubRepo of ["/tmp/thecoach-does-not-matter", "/tmp/idle", "/tmp/human-repo"]) {
+    fs.mkdirSync(path.join(stubRepo, TASKS_RELATIVE_DIR), { recursive: true });
+  }
+
   function check(label, cond, detail) {
     if (!cond) failures.push({ label, detail });
     return { case: label, ok: Boolean(cond), detail: cond ? null : detail };
