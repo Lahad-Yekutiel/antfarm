@@ -53,7 +53,17 @@ delegate instead.
    order: if the working tree is dirty, `git stash push -m "antfarm-setup-<timestamp>"`
    using a real timestamp label (for example `antfarm-setup-2026-08-22T21:00:00Z`);
    then run `git fetch origin && git checkout
-   staging && git pull`, then `git checkout -b {{branch}}`; then identify
+   staging && git pull`; then EITHER `git checkout -b {{branch}}` if the
+   branch does not exist yet, OR — if `{{branch}}` already exists, which
+   is normal on a redispatch — `git checkout {{branch}} && git merge
+   --no-edit staging`, so existing work is carried forward ON TOP of
+   current `staging` rather than staying on the base it was first cut
+   from. Never delete or force-recreate the branch; prior commits on it
+   are real work. If the merge conflicts, STOP and report it — setup does
+   not resolve conflicts. Then run `npm ci` at the repo root so the
+   installed dependency tree matches the lockfile just checked out (a
+   dependency fix that landed on `staging` does nothing until this runs).
+   Then identify
    build/test/typecheck/lint scripts from `package.json`, check for a
    `Makefile` or other build system, check `.github/workflows/` for CI
    config and test config files, create a `.gitignore` if one doesn't
@@ -63,7 +73,17 @@ delegate instead.
    any application source files — git setup and hygiene files only.
 3. Independently verify: `git branch --show-current` must equal
    `{{branch}}` — if the branch was never created, this is a blocker, not
-   something to fix yourself. Then `git diff --stat` and confirm only
+   something to fix yourself. Then verify the branch is actually built on
+   current `staging`: `git merge-base --is-ancestor staging {{branch}}`
+   must succeed. If it does not, the branch is on a stale base — reply
+   `STATUS: blocked` and say so; do NOT continue. A branch cut before a
+   fix landed on `staging` reproduces the bug that fix removed, and the
+   failure surfaces two steps later in `test` looking like this task's
+   fault. That is exactly what parked run #45 (TASK-027, 2026-09-01):
+   setup accepted a pre-existing branch "cut from staging ancestor
+   36cc650", and `test` then hit the OQ-09 /404 prerender failure that
+   `d88b6fd` had already fixed on `staging` 42 minutes before the run
+   started. Then `git diff --stat` and confirm only
    `.gitignore`/`.env.example` (or neither, if not needed) were touched —
    if Cursor touched anything else, revert it (`git checkout --
    <path>`) and note this in your report.

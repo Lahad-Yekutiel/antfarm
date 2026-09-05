@@ -47,7 +47,15 @@ delegate instead.
    When `state` is `"exited"`, read the `log` field for Cursor's output.
    Build `<prompt>`
    asking Cursor to, in order: run `git fetch origin && git checkout
-   staging && git pull`, then `git checkout -b {{branch}}`; then identify
+   staging && git pull`; then EITHER `git checkout -b {{branch}}` if the
+   branch does not exist yet, OR — if `{{branch}}` already exists, which
+   is normal on a redispatch — `git checkout {{branch}} && git merge
+   --no-edit staging`, so existing work is carried forward ON TOP of
+   current `staging` rather than staying on the base it was first cut
+   from. Never delete or force-recreate the branch. If the merge
+   conflicts, STOP and report it. Then run `npm ci` at the repo root so
+   the installed dependency tree matches the lockfile just checked out.
+   Then identify
    build/test/typecheck/lint scripts from `package.json`, check for a
    `Makefile` or other build system, check `.github/workflows/` for CI
    config and test config files, create a `.gitignore` if one doesn't

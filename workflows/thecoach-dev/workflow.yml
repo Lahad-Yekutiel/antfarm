@@ -297,14 +297,34 @@ steps:
          Cursor to run, in order: `git fetch origin && git checkout
          staging && git pull` (branch from `staging`, never `main` — if
          `staging` doesn't exist locally or on origin, STOP and report the
-         error; do not create it or fall back to main), then
-         `git checkout -b {{branch}}`; identify build/test/typecheck/lint
-         scripts from `package.json`, CI config, etc.; create `.gitignore`
-         and `.env.example` hygiene files if needed. Poll delegate logs
-         until complete. Do not run `git pull` or `git checkout -b`
+         error; do not create it or fall back to main), then EITHER
+         `git checkout -b {{branch}}` if the branch does not exist yet,
+         OR — if `{{branch}}` already exists, which is normal on a
+         redispatch — `git checkout {{branch}} && git merge --no-edit
+         staging`, so the existing work is carried forward ON TOP of
+         current `staging` instead of staying on the base it was first
+         cut from. Never delete or force-recreate the branch; prior
+         commits on it are real work. If the merge conflicts, STOP and
+         report it — do not resolve conflicts in setup. Then run
+         `npm ci` at the repo root so the dependency tree matches the
+         lockfile you just checked out. Then identify
+         build/test/typecheck/lint scripts from `package.json`, CI
+         config, etc.; create `.gitignore` and `.env.example` hygiene
+         files if needed. Poll delegate logs until complete. Do not run
+         `git pull`, `git checkout -b`, `git merge` or `npm ci`
          yourself — delegate first.
       3. Independently verify: `git branch --show-current` must equal
-         `{{branch}}`. Confirm only hygiene files were touched.
+         `{{branch}}`. Then verify the branch is actually built on current
+         `staging`: `git merge-base --is-ancestor staging {{branch}}` must
+         succeed. If it does not, the branch is on a stale base — reply
+         STATUS: blocked and say so; do NOT continue. A branch cut before a
+         fix landed on `staging` reproduces the bug that fix removed, and
+         the failure surfaces two steps later in `test` as if it were this
+         task's fault. That is what parked run #45 (TASK-027, 2026-09-01):
+         setup accepted a pre-existing branch "cut from staging ancestor
+         36cc650" and the `test` step then hit the OQ-09 /404 prerender
+         failure that `d88b6fd` had already fixed on `staging` 42 minutes
+         before the run started. Confirm only hygiene files were touched.
       4. Run the build command yourself. Run the test command yourself.
          Report real results — don't take Cursor's word.
       5. Report what you found. If a command failed and that failure is a

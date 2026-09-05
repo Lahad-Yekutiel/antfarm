@@ -2626,6 +2626,22 @@ function evaluateDispatchBackstop(scopes, blockedScopes, roadmapRef, roadmapText
     scopesForCompare = [...listed.canonical, filePhase];
   }
 
+  // The task id DERIVED from the roadmap checkbox is compared too, not just
+  // what the planner asserted. Before this, a `developer_todo` entry blocking
+  // `task:TASK-NNN` only bit if the planner happened to name that task in
+  // `scopes`; when it named only the sprint — the common shape — the backstop
+  // passed and the item was caught one step later by the ledger, and then only
+  // if it had a failed ledger entry. A task blocked by an open developer
+  // question with no ledger entry at all had nothing stopping it. The derived
+  // id is the roadmap's own answer to "which task is this", so it is the right
+  // thing to hold against the exclusion list.
+  const derivedTaskScope = located.taskId
+    ? canonicalizeScopeToken(`task:${located.taskId}`)
+    : null;
+  if (derivedTaskScope && !scopesForCompare.includes(derivedTaskScope)) {
+    scopesForCompare = [...scopesForCompare, derivedTaskScope];
+  }
+
   const intersection = scopesForCompare.filter((s) => blocked.has(s) || blocked.has(SCOPE_GLOBAL));
   if (intersection.length > 0) {
     return {
@@ -6462,14 +6478,26 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
   // item again, naming only the sprint in `scopes` (the shape the prompt asks
   // for). Something mechanical, not the model, has to stop it.
   const parkedScanC = await liveScanDispatch(pickFirst, [parkedBlockingTodo], scanDeps);
-  // B2d — same refusal, one gate earlier, when the planner does name the task
-  // in `scopes`. Two independent nets; which one fires depends only on what
-  // the planner asserted, and both refuse.
+  // B2d — same refusal when the planner does name the task in `scopes`.
   const parkedScanD = await liveScanDispatch(
     { ...pickFirst, scopes: ["sprint:01", "task:TASK-301"] },
     [parkedBlockingTodo],
     scanDeps,
   );
+  // B2e — the gap the derived-task-scope comparison actually closes: a task
+  // blocked by an open developer question with NO ledger entry at all. Before
+  // 2026-09-05 nothing stopped this — the backstop ignored the derived id, and
+  // the ledger had nothing to say because the task had never been dispatched.
+  const questionBlockedTodo = {
+    id: "TODO-9002",
+    status: "open",
+    summary: "Which auth provider for TASK-302?",
+    blocks: ["task:TASK-302"],
+  };
+  const questionBlockedScan = await liveScanDispatch(pickSecond, [questionBlockedTodo], {
+    ...scanDeps,
+    loadLedger: () => ({}),
+  });
 
   origLog(
     JSON.stringify(
@@ -6548,19 +6576,21 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     // And the parked item stays refused mechanically even if the planner
     // ignores the exclusion list it was given.
     check("b2c-parked-item-still-refused", parkedScanC.outcome === "nothing-dispatchable", parkedScanC),
-    // WHICH net catches it, precisely. The scope backstop compares the
-    // planner's ASSERTED scopes (here just `sprint:01`) against the blocked
-    // set; it does NOT add the task id it derived from the roadmap to that
-    // comparison. So `task:TASK-301` being blocked does not fire the backstop
-    // for this shape — the ledger gate, one step later, is what refuses. That
-    // is defensible (the ledger is the authority on "already failed"), but it
-    // means the exclusion list is advisory for the model and the LEDGER is the
-    // enforcement. Pinned so a change to either is visible.
-    check("b2c-refused-by-ledger-not-backstop", parkedScanC.ledger_blocked === "TASK-301", parkedScanC),
-    check("b2c-backstop-did-not-fire", parkedScanC.backstop_rejected !== true, parkedScanC),
+    // WHICH net catches it. Until 2026-09-05 the backstop compared only the
+    // planner's ASSERTED scopes (here just `sprint:01`), so a blocked
+    // `task:TASK-301` did not fire it and the ledger caught this one step
+    // later. The backstop now also compares the task id DERIVED from the
+    // roadmap checkbox, so it refuses here, first.
+    check("b2c-refused-by-backstop", parkedScanC.backstop_reason === "intersects-blocked", parkedScanC),
+    check("b2c-derived-task-scope-is-what-intersects", parkedScanC.backstop_rejected === true, parkedScanC),
     // The other net, when the planner does name the task in scopes.
     check("b2d-refused-when-task-scope-asserted", parkedScanD.outcome === "nothing-dispatchable", parkedScanD),
     check("b2d-refused-by-backstop", parkedScanD.backstop_reason === "intersects-blocked", parkedScanD),
+    // The gap the derived-task-scope comparison closes: blocked by an open
+    // developer question, no ledger entry, planner names only the sprint.
+    check("b2e-question-blocked-task-refused", questionBlockedScan.outcome === "nothing-dispatchable", questionBlockedScan),
+    check("b2e-refused-by-backstop", questionBlockedScan.backstop_reason === "intersects-blocked", questionBlockedScan),
+    check("b2e-no-ledger-entry-involved", questionBlockedScan.ledger_blocked == null, questionBlockedScan),
   ];
 
   const idleErr1 = memoryIdle();
@@ -6840,6 +6870,17 @@ if (process.argv.includes("--self-test-task-contract")) {
     };
   }
 
+  // applyIdleTelemetry() resolves its idle-state reader and writer independently
+  // of thecoachRepo, so a spawnPendingQueueItem() call that passes the LIVE
+  // TheCoach checkout but no loadIdle/saveIdle rewrites
+  // local/cursor_loop/coordinator_idle_state.json in that real repo. This
+  // suite was the only self-test doing it: it stamped last_idle_at on the live
+  // file on every run (confirmed 2026-09-05 — 2026-09-05T05:12:05.741Z came
+  // from a self-test, not from a real scan). Same class of bug as the faked
+  // readTodo + real writeTodo that lost TODO-0016..0021 on 2026-08-30, and the
+  // same cure as the 029-* fixture: never let a self-test write a real repo.
+  const idleSink = { loadIdle: () => defaultIdleState(), saveIdle: () => {} };
+
   const fixtureRepo =
     (process.env.COORDINATOR_THECOACH_REPO || "").trim() || "/mnt/c/Users/lahad/Projects/TheCoach";
   const task027Path = path.join(fixtureRepo, TASKS_RELATIVE_DIR, "TASK-027-root-verification-entrypoints.md");
@@ -6980,6 +7021,7 @@ if (process.argv.includes("--self-test-task-contract")) {
   const started027 = [];
   const todos027 = [];
   const http027 = await spawnPendingQueueItem(mq027.get(), 0, {
+    ...idleSink,
     ...memoryLedger(),
     thecoachRepo: fixtureRepo,
     save: mq027.save,
@@ -7000,6 +7042,7 @@ if (process.argv.includes("--self-test-task-contract")) {
   const started029 = [];
   const todos029 = [];
   const http029 = await spawnPendingQueueItem(mq029.get(), 0, {
+    ...idleSink,
     ...memoryLedger(),
     thecoachRepo: fixture029Repo,
     save: mq029.save,
@@ -7026,6 +7069,7 @@ if (process.argv.includes("--self-test-task-contract")) {
   const started028 = [];
   const todos028 = [];
   const http028 = await spawnPendingQueueItem(mq028.get(), 0, {
+    ...idleSink,
     ...memoryLedger(),
     thecoachRepo: fixtureRepo,
     save: mq028.save,
@@ -7054,6 +7098,7 @@ if (process.argv.includes("--self-test-task-contract")) {
   const startedBase = [];
   const todosBase = [];
   const httpBase = await spawnPendingQueueItem(mqBase.get(), 0, {
+    ...idleSink,
     ...memoryLedger(),
     thecoachRepo: fixtureRepo,
     save: mqBase.save,
@@ -7098,6 +7143,7 @@ if (process.argv.includes("--self-test-task-contract")) {
   const startedBroken = [];
   const todosBroken = [];
   const httpBroken = await spawnPendingQueueItem(mqBroken.get(), 0, {
+    ...idleSink,
     ...memoryLedger(),
     thecoachRepo: brokenRepo,
     save: mqBroken.save,
@@ -7115,6 +7161,7 @@ if (process.argv.includes("--self-test-task-contract")) {
   });
 
   const httpAdHoc = await spawnPendingQueueItem(mqAdHoc.get(), 0, {
+    ...idleSink,
     ...memoryLedger(),
     thecoachRepo: fixtureRepo,
     save: mqAdHoc.save,
