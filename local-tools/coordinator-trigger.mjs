@@ -6590,13 +6590,31 @@ if (process.argv.includes("--self-test-task-contract")) {
   const fixtureRepo =
     (process.env.COORDINATOR_THECOACH_REPO || "").trim() || "/mnt/c/Users/lahad/Projects/TheCoach";
   const task027Path = path.join(fixtureRepo, TASKS_RELATIVE_DIR, "TASK-027-root-verification-entrypoints.md");
-  const task029Path = path.join(fixtureRepo, TASKS_RELATIVE_DIR, "TASK-029-rls-negative-test-suite.md");
+
+  // The 029-* cases prove one thing: a `## Tool/model: Claude Code` task is
+  // refused with `unsupported-tool`. They used to read TheCoach's LIVE
+  // TASK-029 file to do it. On 2026-09-01 that file gained `## Dispatch:
+  // manual` (TODO-0013), which refuses one gate earlier — the refusal is
+  // right, but the cases went red and stopped proving anything about
+  // Tool/model. Read a fixture instead, so the gate is isolated from whatever
+  // the real task file says today. Same cure as item 8's `real-*` block.
+  // The live file's `## Dispatch: manual` path stays covered by
+  // TASK-137-rls-defense-in-depth-manual.md in --self-test-dispatch-scope-gate.
+  const fixture029Repo = fs.mkdtempSync(path.join(os.tmpdir(), "task-contract-029-"));
+  const fixture029TasksDir = path.join(fixture029Repo, TASKS_RELATIVE_DIR);
+  fs.mkdirSync(fixture029TasksDir, { recursive: true });
+  const task029Path = path.join(fixture029TasksDir, "TASK-029-rls-negative-test-suite.md");
+  fs.copyFileSync(
+    path.join(ANTFARM_ROOT, "tests", "fixtures", "TASK-029-rls-negative-test-suite.md"),
+    task029Path,
+  );
+
   const markdown027 = fs.readFileSync(task027Path, "utf-8");
   const markdown029 = fs.readFileSync(task029Path, "utf-8");
   const parsed027 = parseTaskContract(markdown027);
   const parsed029 = parseTaskContract(markdown029);
   const loaded027 = loadTaskContractForId("TASK-027", { thecoachRepo: fixtureRepo });
-  const loaded029 = loadTaskContractForId("TASK-029", { thecoachRepo: fixtureRepo });
+  const loaded029 = loadTaskContractForId("TASK-029", { thecoachRepo: fixture029Repo });
   const loadedMissing = loadTaskContractForId("TASK-099", { thecoachRepo: fixtureRepo });
   const loadedNoRepo = loadTaskContractForId("TASK-027", { thecoachRepo: "" });
 
@@ -6730,7 +6748,7 @@ if (process.argv.includes("--self-test-task-contract")) {
   const todos029 = [];
   const http029 = await spawnPendingQueueItem(mq029.get(), 0, {
     ...memoryLedger(),
-    thecoachRepo: fixtureRepo,
+    thecoachRepo: fixture029Repo,
     save: mq029.save,
     appendTodo: (_repo, draft) => {
       todos029.push(draft);
