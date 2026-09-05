@@ -6311,6 +6311,258 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     ),
   ];
 
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Follow-up 2026-09-05, Task B — dispatch ordering.
+  //
+  // Two questions the developer needs demonstrated, not inferred:
+  //   B1. Can the scan reach work that is only PLANNED for a future sprint —
+  //       named in `### Planned sprints` and assigned in `### Task placement`,
+  //       but with no `## Sprint NN` heading of its own?
+  //   B2. With the first task in a sprint parked (retries exhausted) and the
+  //       second Ready, does the scan skip ahead, or hold until the first is
+  //       resolved?
+  // ═══════════════════════════════════════════════════════════════════════
+
+  // --- B1: future-sprint isolation -------------------------------------
+  // One real sprint (01, In progress) with one dispatchable task; Sprint 02
+  // exists ONLY in the planning sections. TASK-202 is assigned to it by the
+  // task-placement table, and TASK-203 even carries a checkbox inside the
+  // planning prose — the shape most likely to leak.
+  const FIXTURE_FUTURE_SPRINT_ROADMAP = [
+    "# ROADMAP",
+    "",
+    "## Sprints",
+    "",
+    "| # | Sprint | Status |",
+    "|---|--------|--------|",
+    "| 01 | The site is on the internet | In progress |",
+    "| 02 | The site guards itself | Not started |",
+    "",
+    "### Planned sprints (order set by the developer)",
+    "",
+    "1. Sprint 01 - The site is on the internet.",
+    "2. Sprint 02 - The site guards itself. Brings in TASK-202.",
+    "- [ ] Rate limiting, pulled into Sprint 02 (TASK-203)",
+    "",
+    "### Task placement",
+    "",
+    "| Task | Sprint |",
+    "|------|--------|",
+    "| TASK-201 | 01 |",
+    "| TASK-202 | 02 |",
+    "",
+    "## Sprint 01 - The site is on the internet",
+    "",
+    "**Tasks:**",
+    "- [ ] Ready work (TASK-201)",
+  ].join("\n");
+
+  const futureSprintHeadings = collectRoadmapPhaseHeadings(FIXTURE_FUTURE_SPRINT_ROADMAP);
+  const futureSprintCurrent = locateDispatchInRoadmap(FIXTURE_FUTURE_SPRINT_ROADMAP, {
+    title: "Ready work (TASK-201)",
+    description: "",
+    roadmap_ref: "Sprint 01",
+  });
+  // Assigned to Sprint 02 by the placement table; no checkbox anywhere.
+  const futureSprintPlaced = locateDispatchInRoadmap(FIXTURE_FUTURE_SPRINT_ROADMAP, {
+    title: "TASK-202",
+    description: "",
+    roadmap_ref: "Sprint 02 - The site guards itself",
+  });
+  // Has a checkbox, but it sits in planning prose under no `## Sprint` heading.
+  const futureSprintChecked = locateDispatchInRoadmap(FIXTURE_FUTURE_SPRINT_ROADMAP, {
+    title: "Rate limiting (TASK-203)",
+    description: "",
+    roadmap_ref: "Sprint 02",
+  });
+  // And through the whole scan, with a planner that asserts the future sprint.
+  const futureSprintScan = await liveScanDispatch(
+    {
+      decision: "dispatch",
+      title: "Rate limiting, pulled into Sprint 02 (TASK-203)",
+      description: "Add rate limiting",
+      roadmap_ref: "Sprint 02 - The site guards itself",
+      scopes: ["sprint:02"],
+    },
+    [],
+    { readRoadmap: () => FIXTURE_FUTURE_SPRINT_ROADMAP },
+  );
+  // Same future work, but laundered through the one sprint that does exist.
+  const futureSprintLaundered = await liveScanDispatch(
+    {
+      decision: "dispatch",
+      title: "Rate limiting (TASK-203)",
+      description: "Add rate limiting",
+      roadmap_ref: "Sprint 01 - The site is on the internet",
+      scopes: ["sprint:01"],
+    },
+    [],
+    { readRoadmap: () => FIXTURE_FUTURE_SPRINT_ROADMAP },
+  );
+
+  // --- B2: in-sprint skip-ahead, the live shape ------------------------
+  // TASK-301 parked with retries exhausted, TASK-302 Ready directly after it
+  // in the SAME sprint's task list — the shape TASK-027/TASK-045 are in today.
+  const FIXTURE_PARKED_FIRST_ROADMAP = [
+    "# ROADMAP",
+    "",
+    "## Sprint 01 - The site is on the internet",
+    "",
+    "**Tasks:**",
+    "- [ ] Parked first item (TASK-301)",
+    "- [ ] Ready second item (TASK-302)",
+  ].join("\n");
+
+  // A parked entry as the live ledger actually writes it.
+  const parkedLedger = {
+    "TASK-301": {
+      key: "TASK-301",
+      outcome: "failed",
+      cleared: false,
+      autoRetry: { attempts: 2, cap: 2, parked: true, parkedReason: "structural" },
+    },
+  };
+  const parkedTodoWrites = [];
+  const scanDeps = {
+    readRoadmap: () => FIXTURE_PARKED_FIRST_ROADMAP,
+    loadLedger: () => JSON.parse(JSON.stringify(parkedLedger)),
+    saveLedger: () => {},
+    writeTodo: (_repo, entries) => {
+      parkedTodoWrites.push(entries);
+    },
+  };
+  const pickFirst = {
+    decision: "dispatch",
+    title: "Parked first item (TASK-301)",
+    description: "Do the parked thing",
+    roadmap_ref: "Sprint 01 - The site is on the internet",
+    scopes: ["sprint:01"],
+  };
+  const pickSecond = {
+    decision: "dispatch",
+    title: "Ready second item (TASK-302)",
+    description: "Do the ready thing",
+    roadmap_ref: "Sprint 01 - The site is on the internet",
+    scopes: ["sprint:01"],
+  };
+  // B2a — first scan after parking. Nothing yet marks TASK-301 blocked, so the
+  // planner is free to pick it, and the ledger stops it.
+  const parkedScanA = await liveScanDispatch(pickFirst, [], scanDeps);
+  // The TODO that stop writes, as the next scan will see it.
+  const parkedBlockingTodo = {
+    id: "TODO-9001",
+    status: "open",
+    summary: `Dispatch of TASK-301 already failed; do not retry until the ledger entry is cleared`,
+    blocks: ["task:TASK-301"],
+  };
+  // B2b — next scan, planner skips ahead to the Ready second item.
+  const parkedScanB = await liveScanDispatch(pickSecond, [parkedBlockingTodo], scanDeps);
+  // B2c — next scan, planner ignores the exclusion list and picks the parked
+  // item again, naming only the sprint in `scopes` (the shape the prompt asks
+  // for). Something mechanical, not the model, has to stop it.
+  const parkedScanC = await liveScanDispatch(pickFirst, [parkedBlockingTodo], scanDeps);
+  // B2d — same refusal, one gate earlier, when the planner does name the task
+  // in `scopes`. Two independent nets; which one fires depends only on what
+  // the planner asserted, and both refuse.
+  const parkedScanD = await liveScanDispatch(
+    { ...pickFirst, scopes: ["sprint:01", "task:TASK-301"] },
+    [parkedBlockingTodo],
+    scanDeps,
+  );
+
+  origLog(
+    JSON.stringify(
+      {
+        b1_headings: futureSprintHeadings.map((h) => h.scope),
+        b1_current_sprint_task: futureSprintCurrent.ok ? futureSprintCurrent.filePhase : futureSprintCurrent.reason,
+        b1_placement_table_task: futureSprintPlaced.ok ? futureSprintPlaced.filePhase : futureSprintPlaced.reason,
+        b1_planning_checkbox_task: futureSprintChecked.ok ? futureSprintChecked.filePhase : futureSprintChecked.reason,
+        b1_scan_asserting_future_sprint: {
+          outcome: futureSprintScan.outcome,
+          backstop_reason: futureSprintScan.backstop_reason ?? null,
+        },
+        b1_scan_laundered_through_current_sprint: {
+          outcome: futureSprintLaundered.outcome,
+          backstop_reason: futureSprintLaundered.backstop_reason ?? null,
+        },
+        b2a_planner_picks_parked_first: {
+          outcome: parkedScanA.outcome,
+          ledger_blocked: parkedScanA.ledger_blocked ?? null,
+          backstop_reason: parkedScanA.backstop_reason ?? null,
+        },
+        b2b_planner_skips_to_ready_second: {
+          outcome: parkedScanB.outcome,
+          dispatched_title: parkedScanB.decision?.title ?? null,
+        },
+        b2c_planner_retries_parked_first: {
+          outcome: parkedScanC.outcome,
+          stopped_by: parkedScanC.ledger_blocked ? "ledger" : "backstop",
+          ledger_blocked: parkedScanC.ledger_blocked ?? null,
+          backstop_reason: parkedScanC.backstop_reason ?? null,
+        },
+        b2d_planner_retries_asserting_task_scope: {
+          outcome: parkedScanD.outcome,
+          stopped_by: parkedScanD.backstop_rejected ? "backstop" : "ledger",
+          backstop_reason: parkedScanD.backstop_reason ?? null,
+        },
+      },
+      null,
+      2,
+    ),
+  );
+
+  const orderingCases = [
+    // --- B1 ---
+    check("b1-only-real-sprint-has-a-heading", futureSprintHeadings.length === 1 && futureSprintHeadings[0].scope === "sprint:01", futureSprintHeadings.map((h) => h.scope)),
+    check("b1-no-heading-for-planned-sprint-02", futureSprintHeadings.every((h) => h.scope !== "sprint:02"), futureSprintHeadings.map((h) => h.scope)),
+    check("b1-current-sprint-task-dispatchable", futureSprintCurrent.ok === true && futureSprintCurrent.filePhase === "sprint:01", futureSprintCurrent),
+    // Named in the placement table against a future sprint: no checkbox, so
+    // the scan cannot locate it at all.
+    check("b1-placement-table-task-unlocatable", futureSprintPlaced.ok === false && futureSprintPlaced.reason === "item-unlocatable", futureSprintPlaced),
+    // Carries a checkbox, but in planning prose above every `## Sprint`
+    // heading: located, and refused for having no sprint.
+    check("b1-planning-checkbox-refused", futureSprintChecked.ok === false, futureSprintChecked),
+    check("b1-planning-checkbox-has-no-sprint", futureSprintChecked.reason === "underivable-phase", futureSprintChecked),
+    // End to end: a planner asserting the planned-only sprint is rejected
+    // because no `## Sprint 02` heading exists to agree with.
+    check("b1-scan-rejects-future-sprint", futureSprintScan.outcome === "nothing-dispatchable", futureSprintScan),
+    check("b1-scan-future-sprint-reason", futureSprintScan.backstop_reason === "unknown-phase", futureSprintScan),
+    // And it cannot be laundered in by claiming the sprint that does exist.
+    check("b1-scan-rejects-laundered-future-work", futureSprintLaundered.outcome === "nothing-dispatchable", futureSprintLaundered),
+
+    // --- B2 ---
+    // Sprint task ORDER is advisory. Nothing reads "first unchecked item";
+    // the planner picks, and only the ledger and the exclusion list constrain
+    // it. These three cases pin the actual behavior so it cannot drift
+    // unnoticed — they are not an endorsement of it.
+    check("b2a-parked-first-item-not-dispatched", parkedScanA.outcome === "nothing-dispatchable", parkedScanA),
+    check("b2a-stopped-by-ledger-not-backstop", parkedScanA.ledger_blocked === "TASK-301", parkedScanA),
+    // A whole scan is spent discovering the parked item; the Ready item
+    // directly below it is NOT reached in the same pass.
+    check("b2a-does-not-fall-through-to-second", parkedScanA.decision === undefined, parkedScanA),
+    check("b2a-writes-the-blocking-todo", parkedTodoWrites.length >= 1, parkedTodoWrites.length),
+    // Next pass: skipping ahead over a parked item is permitted, not refused.
+    check("b2b-skips-ahead-and-dispatches", parkedScanB.outcome === "dispatch", parkedScanB),
+    check("b2b-dispatches-the-second-item", String(parkedScanB.decision?.title || "").includes("TASK-302"), parkedScanB.decision),
+    // And the parked item stays refused mechanically even if the planner
+    // ignores the exclusion list it was given.
+    check("b2c-parked-item-still-refused", parkedScanC.outcome === "nothing-dispatchable", parkedScanC),
+    // WHICH net catches it, precisely. The scope backstop compares the
+    // planner's ASSERTED scopes (here just `sprint:01`) against the blocked
+    // set; it does NOT add the task id it derived from the roadmap to that
+    // comparison. So `task:TASK-301` being blocked does not fire the backstop
+    // for this shape — the ledger gate, one step later, is what refuses. That
+    // is defensible (the ledger is the authority on "already failed"), but it
+    // means the exclusion list is advisory for the model and the LEDGER is the
+    // enforcement. Pinned so a change to either is visible.
+    check("b2c-refused-by-ledger-not-backstop", parkedScanC.ledger_blocked === "TASK-301", parkedScanC),
+    check("b2c-backstop-did-not-fire", parkedScanC.backstop_rejected !== true, parkedScanC),
+    // The other net, when the planner does name the task in scopes.
+    check("b2d-refused-when-task-scope-asserted", parkedScanD.outcome === "nothing-dispatchable", parkedScanD),
+    check("b2d-refused-by-backstop", parkedScanD.backstop_reason === "intersects-blocked", parkedScanD),
+  ];
+
   const idleErr1 = memoryIdle();
   const bgErr1 = backgroundBox();
   const scanErr1 = memoryScanState();
@@ -6460,6 +6712,7 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     ...resolvedCases,
     ...budgetCases,
     ...realParseCases,
+    ...orderingCases,
     ...silentFailCases,
     ...timingCases,
   ];
