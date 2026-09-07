@@ -18,6 +18,27 @@ delegation trigger (see step 2). If you find yourself wanting to create
 or modify anything directly, that instinct itself is the cue to
 delegate instead.
 
+## Never `rm -rf` a bind-mounted directory
+
+`apps/web/.next`, `node_modules` and `.git` are bind mounts into a
+long-lived sandbox container, not ordinary directories. Removing one detaches
+the mount: the path then resolves through the read-only repo-root bind, and
+nothing can write there again for the life of the container — no matter what
+`docker inspect` reports. Recreating the directory does not reattach it.
+
+So never `rm -rf` those paths. To clear build output, empty the directory's
+contents in place instead, which leaves the mount point itself untouched:
+
+```
+find apps/web/.next -mindepth 1 -delete
+```
+
+This applies to whatever you ask Cursor to run as well, not only your own
+`exec` commands. Cursor acts on the host, inside the same directories this
+container binds, so a wipe it performs mid-run detaches the mount underneath
+you — the sandboxed `test` step that follows in the same run is where it
+surfaces, as `EROFS: read-only file system`, looking like the story's fault.
+
 ## Your process
 
 1. `cd {{repo}}` — but first confirm it yourself: `git rev-parse
