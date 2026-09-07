@@ -7105,9 +7105,60 @@ if (process.argv.includes("--self-test-task-contract")) {
   // same cure as the 029-* fixture: never let a self-test write a real repo.
   const idleSink = { loadIdle: () => defaultIdleState(), saveIdle: () => {} };
 
-  const fixtureRepo =
+  const liveRepo =
     (process.env.COORDINATOR_THECOACH_REPO || "").trim() || "/mnt/c/Users/lahad/Projects/TheCoach";
-  const task027Path = path.join(fixtureRepo, TASKS_RELATIVE_DIR, "TASK-027-root-verification-entrypoints.md");
+
+  /**
+   * OQ-22(d). A completed task moves from `_SSoT/tasks/` to
+   * `_SSoT/tasks/done/`, so any fixture that names a fixed `_SSoT/tasks/`
+   * path breaks on the move rather than on a regression — TASK-027 went to
+   * `done/` and took this whole suite down with an ENOENT, and TASK-055 is
+   * already there behind it. Resolve from either directory instead.
+   */
+  function resolveLiveTaskFile(repo, filename) {
+    const candidates = [
+      path.join(repo, TASKS_RELATIVE_DIR, filename),
+      path.join(repo, TASKS_RELATIVE_DIR, "done", filename),
+    ];
+    const hit = candidates.find((p) => fs.existsSync(p));
+    if (!hit) {
+      throw new Error(
+        `task fixture not found in _SSoT/tasks or _SSoT/tasks/done: ${filename} (repo ${repo})`,
+      );
+    }
+    return hit;
+  }
+
+  /**
+   * Resolving the path is necessary but not sufficient for TASK-027, and this
+   * is where OQ-22(d)'s "one-line fix" runs out. The 027-* cases below assert
+   * that a task file's `## Branch` is honoured all the way through a real
+   * dispatch — which needs the file to clear the `## Status` gate. TASK-027
+   * completed on 2026-09-06 and its live `## Status` is now `Done`
+   * permanently, so those cases now fail on a gate working exactly as
+   * designed. No path resolution can fix that: the file moved AND stopped
+   * being dispatchable, and only the first half is a path problem.
+   *
+   * So TASK-027 becomes a checked-in fixture, pinned at `## Status: Ready`
+   * and otherwise a verbatim copy of the real file — the same cure the 029-*
+   * block below already applies for the same reason (its live file gained
+   * `## Dispatch: manual` and the cases stopped proving anything). TASK-028
+   * is still live, still genuinely `Blocked`, and still in `_SSoT/tasks/`,
+   * so it keeps being read from the real checkout — via resolveLiveTaskFile,
+   * so the `done/` move that broke TASK-027 cannot break it too.
+   */
+  const fixtureRepo = fs.mkdtempSync(path.join(os.tmpdir(), "task-contract-live-"));
+  const fixtureTasksDir = path.join(fixtureRepo, TASKS_RELATIVE_DIR);
+  fs.mkdirSync(fixtureTasksDir, { recursive: true });
+  const task027Path = path.join(fixtureTasksDir, "TASK-027-root-verification-entrypoints.md");
+  fs.copyFileSync(
+    path.join(ANTFARM_ROOT, "tests", "fixtures", "TASK-027-root-verification-entrypoints.md"),
+    task027Path,
+  );
+  fs.copyFileSync(
+    resolveLiveTaskFile(liveRepo, "TASK-028-consolidate-and-test-completeness-logic.md"),
+    path.join(fixtureTasksDir, "TASK-028-consolidate-and-test-completeness-logic.md"),
+  );
 
   // The 029-* cases prove one thing: a `## Tool/model: Claude Code` task is
   // refused with `unsupported-tool`. They used to read TheCoach's LIVE
@@ -8063,6 +8114,75 @@ if (process.argv.includes("--self-test-sandbox-mount-guard")) {
     });
     check("healthy-callsite-dispatched", res.body.dispatched === true, JSON.stringify(res.body));
     check("healthy-callsite-startRun-once", started.length === 1, JSON.stringify(started));
+  }
+
+  // 9. OQ-22(a). The reboot case, end to end and in order. OpenClaw's own
+  //    ensureSandboxContainer() runs `docker start` on any container that
+  //    exists but is not running (docker-*.js: `else if (!running) await
+  //    execDocker(["start", containerName])`) with no rebuild fallback, and
+  //    execDocker rejects on a non-zero exit. On Docker Desktop that start
+  //    fails — the single-file bind staging (.git-credentials, .gitconfig) is
+  //    done at create time and does not survive a stop. Nothing downstream
+  //    recovers from it, so the only thing standing between a host reboot and
+  //    a broken dispatch is this guard removing the stopped container FIRST.
+  //    Case 3 above proves the removal; this proves the ordering, which is the
+  //    half that actually makes it safe.
+  {
+    let q = [
+      {
+        id: "q-022",
+        task: "TASK-022 do the thing",
+        repoPath: "/trial",
+        status: "pending",
+        runId: null,
+        createdAt: new Date().toISOString(),
+        dispatchedAt: null,
+        resolvedAt: null,
+        note: null,
+      },
+    ];
+    const events = [];
+    const res = await spawnPendingQueueItem(q, 0, {
+      save: (next) => {
+        q = next;
+      },
+      repoExists: () => true,
+      loadTaskContract: () => ({ missing: true }),
+      loadLedger: () => ({}),
+      saveLedger: () => {},
+      appendTodo: () => ({ appended: true }),
+      thecoachRepo: null,
+      fetchStaging: async () => "deadbeef",
+      // No ensureSandboxMounts stub: the real guard runs, with only its three
+      // docker shell-outs injected. A stopped container never reaches probe.
+      listSandboxes: () => [{ name: SBX, state: "exited" }],
+      sandboxRwMounts: () => {
+        throw new Error("inspect must not run on a stopped container");
+      },
+      probeMount: () => {
+        throw new Error("exec-probe must not run on a stopped container");
+      },
+      removeSandbox: (name) => {
+        events.push(`remove:${name}`);
+        return { removed: true };
+      },
+      startRun: () => {
+        events.push("startRun");
+        return { id: "x", logPath: "/dev/null" };
+      },
+      waitRun: async () => ({ id: "r1", run_number: 1 }),
+    });
+    check("reboot-dispatched", res.body.dispatched === true, JSON.stringify(res.body));
+    check(
+      "reboot-removed-before-startRun",
+      events.join(",") === `remove:${SBX},startRun`,
+      events.join(","),
+    );
+    // sandboxRwMounts and probeMount both throw if reached, so a dispatch that
+    // got this far already proves the stopped container was short-circuited
+    // rather than inspected. Pin the queue outcome too: the item dispatches
+    // normally, so a reboot costs a container rebuild and nothing else.
+    check("reboot-item-dispatched", q[0].status === "dispatched", q[0].status);
   }
 
   console.log = origLog;

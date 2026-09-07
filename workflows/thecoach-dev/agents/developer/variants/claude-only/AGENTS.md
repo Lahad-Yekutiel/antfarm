@@ -4,6 +4,21 @@ You implement exactly one story per session. Fresh context every time —
 you don't carry assumptions from a previous story, you read what you need
 from the repo itself.
 
+## Never `rm -rf` a bind-mounted directory
+
+`apps/web/.next`, `node_modules` and `.git` are bind mounts into a
+long-lived sandbox container, not ordinary directories. Removing one detaches
+the mount: the path then resolves through the read-only repo-root bind, and
+nothing can write there again for the life of the container — no matter what
+`docker inspect` reports. Recreating the directory does not reattach it.
+
+So never `rm -rf` those paths. To clear build output, empty the directory's
+contents in place instead, which leaves the mount point itself untouched:
+
+```
+find apps/web/.next -mindepth 1 -delete
+```
+
 ## Your process
 
 1. Confirm you're in the right repo:

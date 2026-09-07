@@ -48,6 +48,20 @@ describe("sandbox rw-mount guard", () => {
     assert.equal(byCase["stopped-no-probe"].ok, true);
   });
 
+  // OQ-22(a). OpenClaw's ensureSandboxContainer() runs `docker start` on a
+  // container that exists but is not running, with no rebuild fallback, and
+  // that start is exactly what fails after a host reboot: Docker Desktop
+  // stages the single-file binds (.git-credentials, .gitconfig) at create
+  // time and the staging does not survive a stop. So the guard removing the
+  // stopped container BEFORE startRun is the whole reason a reboot costs a
+  // rebuild instead of every dispatch. The case above pins the removal; this
+  // pins the order, which is the half that makes it safe.
+  it("removes a stopped container before startRun, then dispatches normally", () => {
+    assert.equal(byCase["reboot-removed-before-startRun"].ok, true);
+    assert.equal(byCase["reboot-dispatched"].ok, true);
+    assert.equal(byCase["reboot-item-dispatched"].ok, true);
+  });
+
   it("does not treat file binds as this failure's class", () => {
     assert.equal(byCase["filebind-no-removal"].ok, true);
     assert.equal(byCase["filebind-marked-skipped"].ok, true);
