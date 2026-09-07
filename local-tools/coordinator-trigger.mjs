@@ -1700,6 +1700,195 @@ function branchDiffDigest(repoPath, branch, deps = {}) {
   }
 }
 
+/**
+ * TASK-050 / OQ-19 — sandbox rw bind mounts go stale, and `docker inspect` lies.
+ *
+ * A sandbox container is long-lived. When something on the host removes and
+ * recreates a directory that container binds read-write — `rm -rf
+ * apps/web/.next` is the observed habit, and it sits in TASK-054's own
+ * checklist — the kernel drops the bind. The path then falls through to the
+ * read-only repo-root bind, so every write inside the container returns EROFS.
+ * Meanwhile `docker inspect` still reports that mount as `rw=true`, because it
+ * replays the container's creation-time config rather than the kernel's current
+ * mount table.
+ *
+ * That gap is why three separate investigations (2026-08-28, 2026-08-29,
+ * 2026-09-05 Round 3) each read `rw=true`, concluded the mount was fine, and
+ * looked elsewhere. Reproduced deliberately on 2026-09-07 — the container-side
+ * inode even matches the host's, which is what made Round 3 rule out a stale
+ * mount. See `_SSoT/antfarm-handoff/RESULT_TASK-050.md`.
+ *
+ * Only an actual write settles it. Probe every rw mount before dispatching; a
+ * container that fails the probe is poisoned for the rest of its life and must
+ * be removed, not reused.
+ */
+const SANDBOX_PROBE_FILE = ".antfarm-rw-probe";
+const SANDBOX_EXEC_OPTS = { encoding: "utf-8", timeout: 15_000, stdio: "pipe" };
+
+/** Sandbox containers serving this workflow's agents, running or not. */
+function listWorkflowSandboxes(deps = {}) {
+  if (deps.listSandboxes) return deps.listSandboxes();
+  const out = execFileSync(
+    "docker",
+    [
+      "ps",
+      "-a",
+      "--filter",
+      `name=openclaw-sbx-agent-${DEFAULT_WORKFLOW}_`,
+      "--format",
+      "{{.Names}}\t{{.State}}",
+    ],
+    SANDBOX_EXEC_OPTS,
+  );
+  return out
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [name, state] = line.split("\t");
+      return { name, state: (state || "").trim() };
+    });
+}
+
+/** The rw bind destinations a container declares — the set at risk. */
+function sandboxRwMountTargets(name, deps = {}) {
+  if (deps.sandboxRwMounts) return deps.sandboxRwMounts(name);
+  const out = execFileSync(
+    "docker",
+    ["inspect", name, "--format", "{{range .Mounts}}{{if .RW}}{{.Destination}}\n{{end}}{{end}}"],
+    SANDBOX_EXEC_OPTS,
+  );
+  return out
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Can this container actually write there? Exit 3 means the target is not a
+ * directory (a file bind — credentials and gitconfig — which nothing on the
+ * host recreates mid-run, so it is not this failure's class and is reported
+ * as skipped rather than as a pass).
+ */
+function probeSandboxMount(name, target, deps = {}) {
+  if (deps.probeMount) return deps.probeMount(name, target);
+  const dir = target.replace(/\/+$/, "");
+  const script = `d='${dir}'; [ -d "$d" ] || exit 3; touch "$d/${SANDBOX_PROBE_FILE}" || exit 4; rm -f "$d/${SANDBOX_PROBE_FILE}"`;
+  try {
+    execFileSync("docker", ["exec", name, "sh", "-c", script], SANDBOX_EXEC_OPTS);
+    return { ok: true, target };
+  } catch (err) {
+    if (err?.status === 3) return { ok: true, skipped: "not-a-directory", target };
+    return {
+      ok: false,
+      target,
+      error: String(err?.stderr || err?.message || err).trim().slice(0, 300),
+    };
+  }
+}
+
+/**
+ * `docker rm -f`, not `openclaw sandbox recreate`, for two reasons: the two do
+ * the same thing (openclaw's own recreate only removes — "runtimes will be
+ * automatically recreated when the agent is next used"), and `docker` is
+ * already this guard's dependency, whereas `openclaw` is not guaranteed on the
+ * coordinator service's PATH.
+ */
+function removeSandboxContainer(name, deps = {}) {
+  if (deps.removeSandbox) return deps.removeSandbox(name);
+  execFileSync("docker", ["rm", "-f", name], SANDBOX_EXEC_OPTS);
+  return { removed: true };
+}
+
+/**
+ * Pre-dispatch precondition: every sandbox rw mount is writable in fact, not
+ * just in config. Returns `{ ok }`; on a failed probe the offending container
+ * is removed so the next use builds a clean one, which is what clears the
+ * condition — a stale bind survives for the life of the container and cannot
+ * be repaired in place.
+ */
+function ensureSandboxRwMounts(deps = {}) {
+  const probed = [];
+  const recreated = [];
+  let sandboxes;
+  try {
+    sandboxes = listWorkflowSandboxes(deps);
+  } catch (err) {
+    // Docker unreachable. Not this guard's call to adjudicate: the run itself
+    // fails loudly on the same condition seconds later, whereas parking every
+    // queued task on a transient docker hiccup is a worse failure than the one
+    // being prevented. Fail open, but say so.
+    const detail = String(err?.message || err).slice(0, 200);
+    logDispatchNext(`sandbox-mount-probe skipped reason=docker-unavailable detail=${detail}`);
+    return { ok: true, checked: false, reason: "docker-unavailable", probed, recreated };
+  }
+
+  for (const sbx of sandboxes) {
+    // A container we cannot exec into cannot be confirmed writable, and a
+    // stopped sandbox is already abnormal here (they idle running between
+    // dispatches). Removing it is cheap and always correct; reusing it is the
+    // thing that costs a run.
+    if (sbx.state !== "running") {
+      logDispatchNext(`sandbox-mount-probe container=${sbx.name} state=${sbx.state} action=remove`);
+      try {
+        removeSandboxContainer(sbx.name, deps);
+        recreated.push({ name: sbx.name, reason: `state=${sbx.state}` });
+      } catch (err) {
+        return {
+          ok: false,
+          checked: true,
+          reason: "sandbox-remove-failed",
+          container: sbx.name,
+          error: String(err?.message || err).slice(0, 300),
+          probed,
+          recreated,
+        };
+      }
+      continue;
+    }
+
+    let targets;
+    try {
+      targets = sandboxRwMountTargets(sbx.name, deps);
+    } catch (err) {
+      logDispatchNext(
+        `sandbox-mount-probe container=${sbx.name} inspect-failed detail=${String(err?.message || err).slice(0, 150)}`,
+      );
+      continue;
+    }
+
+    for (const target of targets) {
+      const result = probeSandboxMount(sbx.name, target, deps);
+      probed.push({ container: sbx.name, ...result });
+      if (result.ok) continue;
+
+      logDispatchNext(
+        `sandbox-mount-stale container=${sbx.name} target=${target} action=remove detail=${result.error}`,
+      );
+      try {
+        removeSandboxContainer(sbx.name, deps);
+        recreated.push({ name: sbx.name, reason: `unwritable:${target}` });
+      } catch (err) {
+        return {
+          ok: false,
+          checked: true,
+          reason: "sandbox-remove-failed",
+          container: sbx.name,
+          target,
+          error: String(err?.message || err).slice(0, 300),
+          probed,
+          recreated,
+        };
+      }
+      // The container is gone, so its remaining mounts are moot; the
+      // replacement is built fresh at next use and starts clean.
+      break;
+    }
+  }
+
+  return { ok: true, checked: true, probed, recreated };
+}
+
 /** One-line reason + evidence for this attempt, from the run's own steps. */
 function summariseRunFailure({ stepsResult, runStatus, queueStatus, note }) {
   const steps = Array.isArray(stepsResult?.steps) ? stepsResult.steps : [];
@@ -3504,6 +3693,41 @@ async function spawnPendingQueueItem(queue, idx, deps = {}) {
 
   if (!repoExists(item.repoPath)) {
     return { status: 400, body: { ok: false, error: `repoPath does not exist: ${item.repoPath}` } };
+  }
+
+  // TASK-050 / OQ-19. Environmental precondition, same tier as repoExists
+  // above: a sandbox whose rw binds have gone stale fails every write with
+  // EROFS, and the run that discovers it is charged to the task rather than to
+  // the environment — which is what parked TASK-027 twice. Probing is two
+  // execs; the failure it prevents costs a whole run plus a diagnosis.
+  const sandboxMounts = deps.ensureSandboxMounts
+    ? deps.ensureSandboxMounts(deps)
+    : ensureSandboxRwMounts(deps);
+  if (!sandboxMounts.ok) {
+    logDispatchNext(
+      `sandbox-mount-guard-refused key=${ledgerKey} reason=${sandboxMounts.reason} container=${sandboxMounts.container}`,
+    );
+    // Item stays `pending`: an unrepairable sandbox is an operator problem, not
+    // a defect in the task, and it must dispatch normally once cleared.
+    return {
+      status: 200,
+      body: withIdleTelemetry(
+        {
+          ok: false,
+          dispatched: false,
+          reason: sandboxMounts.reason,
+          container: sandboxMounts.container,
+          detail: sandboxMounts.error,
+          queueItemId: item.id,
+        },
+        deps,
+      ),
+    };
+  }
+  if (sandboxMounts.recreated?.length) {
+    logDispatchNext(
+      `sandbox-recreated key=${ledgerKey} containers=${sandboxMounts.recreated.map((r) => r.name).join(",")}`,
+    );
   }
 
   let stagingTip;
@@ -7647,6 +7871,202 @@ if (process.argv.includes("--eval-auto-retry-resume")) {
       2,
     ),
   );
+  process.exit(0);
+}
+
+// TASK-050 / OQ-19 sandbox rw-mount guard. No docker, no containers — the
+// three shell-outs (list / inspect / exec) are injected. Invoke:
+//   COORDINATOR_TOKEN=x node local-tools/coordinator-trigger.mjs --self-test-sandbox-mount-guard
+if (process.argv.includes("--self-test-sandbox-mount-guard")) {
+  const origLog = console.log;
+  console.log = (...args) => {
+    const line = args.map(String).join(" ");
+    if (line.startsWith("[queue/dispatch-next]")) return;
+    origLog(...args);
+  };
+
+  const failures = [];
+  const cases = [];
+  function check(label, cond, detail) {
+    if (!cond) failures.push({ label, detail });
+    cases.push({ case: label, ok: Boolean(cond), detail: cond ? null : detail });
+  }
+
+  const SBX = "openclaw-sbx-agent-thecoach-dev_setup-c725f33a";
+  /** A stale bind is invisible to inspect, so the fixture keeps reporting the
+   *  mount and only the probe disagrees — the whole point of the guard. */
+  function fixture({ state = "running", mounts = ["/trial/.next", "/trial/node_modules"], unwritable = [], notDir = [], removeThrows = false } = {}) {
+    const removed = [];
+    const deps = {
+      listSandboxes: () => [{ name: SBX, state }],
+      sandboxRwMounts: () => mounts,
+      probeMount: (_name, target) => {
+        if (notDir.includes(target)) return { ok: true, skipped: "not-a-directory", target };
+        if (unwritable.includes(target)) {
+          return { ok: false, target, error: "touch: Read-only file system" };
+        }
+        return { ok: true, target };
+      },
+      removeSandbox: (name) => {
+        if (removeThrows) throw new Error("docker rm refused");
+        removed.push(name);
+        return { removed: true };
+      },
+    };
+    return { deps, removed };
+  }
+
+  // 1. Healthy sandbox: probes pass, nothing is touched.
+  {
+    const { deps, removed } = fixture();
+    const r = ensureSandboxRwMounts(deps);
+    check("healthy-ok", r.ok === true, JSON.stringify(r));
+    check("healthy-checked", r.checked === true, JSON.stringify(r));
+    check("healthy-no-removal", removed.length === 0, JSON.stringify(removed));
+    check("healthy-probed-both", r.probed.length === 2, JSON.stringify(r.probed));
+  }
+
+  // 2. The actual bug: inspect says rw, the write says EROFS. Container goes.
+  {
+    const { deps, removed } = fixture({ unwritable: ["/trial/.next"] });
+    const r = ensureSandboxRwMounts(deps);
+    check("stale-ok-true", r.ok === true, "a removed container is a cleared condition, not a refusal");
+    check("stale-removed", removed.length === 1 && removed[0] === SBX, JSON.stringify(removed));
+    check(
+      "stale-reason-names-target",
+      r.recreated.length === 1 && r.recreated[0].reason === "unwritable:/trial/.next",
+      JSON.stringify(r.recreated),
+    );
+  }
+
+  // 3. A container that cannot be exec'd cannot be confirmed writable.
+  {
+    const { deps, removed } = fixture({ state: "exited" });
+    const r = ensureSandboxRwMounts(deps);
+    check("stopped-removed", removed.length === 1, JSON.stringify(removed));
+    check("stopped-no-probe", r.probed.length === 0, JSON.stringify(r.probed));
+  }
+
+  // 4. File binds (credentials, gitconfig) are not this failure's class.
+  {
+    const { deps, removed } = fixture({ notDir: ["/trial/.next"] });
+    const r = ensureSandboxRwMounts(deps);
+    check("filebind-no-removal", removed.length === 0, JSON.stringify(removed));
+    check(
+      "filebind-marked-skipped",
+      r.probed.some((p) => p.skipped === "not-a-directory"),
+      JSON.stringify(r.probed),
+    );
+  }
+
+  // 5. Docker missing: fail open, and say so rather than parking the queue.
+  {
+    const r = ensureSandboxRwMounts({
+      listSandboxes: () => {
+        throw new Error("docker: command not found");
+      },
+    });
+    check("nodocker-ok", r.ok === true, JSON.stringify(r));
+    check("nodocker-checked-false", r.checked === false, JSON.stringify(r));
+    check("nodocker-reason", r.reason === "docker-unavailable", JSON.stringify(r));
+  }
+
+  // 6. Cannot remove a poisoned container: that IS a refusal.
+  {
+    const { deps } = fixture({ unwritable: ["/trial/.next"], removeThrows: true });
+    const r = ensureSandboxRwMounts(deps);
+    check("removefail-not-ok", r.ok === false, JSON.stringify(r));
+    check("removefail-reason", r.reason === "sandbox-remove-failed", JSON.stringify(r));
+    check("removefail-names-container", r.container === SBX, JSON.stringify(r));
+  }
+
+  // 7. Call site: a refusing guard must stop the dispatch before startRun, and
+  //    leave the item pending — an unrepairable sandbox is not the task's fault.
+  {
+    let q = [
+      {
+        id: "q-050",
+        task: "TASK-050 do the thing",
+        repoPath: "/trial",
+        status: "pending",
+        runId: null,
+        createdAt: new Date().toISOString(),
+        dispatchedAt: null,
+        resolvedAt: null,
+        note: null,
+      },
+    ];
+    const started = [];
+    const res = await spawnPendingQueueItem(q, 0, {
+      save: (next) => {
+        q = next;
+      },
+      repoExists: () => true,
+      loadTaskContract: () => ({ missing: true }),
+      loadLedger: () => ({}),
+      saveLedger: () => {},
+      appendTodo: () => ({ appended: true }),
+      thecoachRepo: null,
+      fetchStaging: async () => "deadbeef",
+      startRun: (args) => {
+        started.push(args);
+        return { id: "x", logPath: "/dev/null" };
+      },
+      waitRun: async () => ({ id: "r1", run_number: 1 }),
+      ensureSandboxMounts: () => ({
+        ok: false,
+        checked: true,
+        reason: "sandbox-remove-failed",
+        container: SBX,
+        error: "docker rm refused",
+      }),
+    });
+    check("callsite-not-dispatched", res.body.dispatched === false, JSON.stringify(res.body));
+    check("callsite-startRun-never", started.length === 0, JSON.stringify(started));
+    check("callsite-item-stays-pending", q[0].status === "pending", q[0].status);
+    check("callsite-reason", res.body.reason === "sandbox-remove-failed", JSON.stringify(res.body));
+  }
+
+  // 8. Healthy guard must not disturb a normal dispatch.
+  {
+    let q = [
+      {
+        id: "q-051",
+        task: "TASK-050 do the thing",
+        repoPath: "/trial",
+        status: "pending",
+        runId: null,
+        createdAt: new Date().toISOString(),
+        dispatchedAt: null,
+        resolvedAt: null,
+        note: null,
+      },
+    ];
+    const started = [];
+    const res = await spawnPendingQueueItem(q, 0, {
+      save: (next) => {
+        q = next;
+      },
+      repoExists: () => true,
+      loadTaskContract: () => ({ missing: true }),
+      loadLedger: () => ({}),
+      saveLedger: () => {},
+      appendTodo: () => ({ appended: true }),
+      thecoachRepo: null,
+      fetchStaging: async () => "deadbeef",
+      startRun: (args) => {
+        started.push(args);
+        return { id: "x", logPath: "/dev/null" };
+      },
+      waitRun: async () => ({ id: "r1", run_number: 1 }),
+      ensureSandboxMounts: () => ({ ok: true, checked: true, probed: [], recreated: [] }),
+    });
+    check("healthy-callsite-dispatched", res.body.dispatched === true, JSON.stringify(res.body));
+    check("healthy-callsite-startRun-once", started.length === 1, JSON.stringify(started));
+  }
+
+  console.log = origLog;
+  console.log(JSON.stringify({ failures, cases }, null, 2));
   process.exit(0);
 }
 
