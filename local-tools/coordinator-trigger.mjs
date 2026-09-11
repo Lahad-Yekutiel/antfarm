@@ -1537,7 +1537,11 @@ function ledgerBlocksKey(ledger, key) {
   if (!key) return false;
   const entry = ledger[key];
   if (!entry || entry.cleared === true) return false;
-  return entry.outcome === "failed";
+  // Terminal outcomes only. "failed" is parked (auto-retry already ran or
+  // was ineligible). "completed" already landed — Sprint 2 keeps ROADMAP
+  // boxes unchecked, so this is the re-dispatch stop. retry-pending and
+  // diagnosis-pending must not match: those are the in-flight retry path.
+  return entry.outcome === "failed" || entry.outcome === "completed";
 }
 
 function recordLedgerAttempt(key, fields, deps = {}) {
@@ -3389,21 +3393,26 @@ async function scanRoadmapForWork(deps = {}) {
     const ledger = loadLedger(deps);
     if (ledgerBlocksKey(ledger, ledgerKey)) {
       logDispatchNext(`ledger-blocked-redispatch key=${ledgerKey}`);
-      try {
-        const written = appendTodo(thecoachRepo, {
-          summary: `Dispatch of ${ledgerKey} already failed; do not retry until the ledger entry is cleared`,
-          why: `Last attempt recorded outcome=failed in the dispatch ledger. Re-dispatching would repeat the same failure.`,
-          source: ledgerKey,
-          type: "blocked",
-          evidence: `coordinator-dispatch-ledger.json key=${ledgerKey}`,
-          reply_needed: `Clear the ledger entry for ${ledgerKey} after diagnosing the failure, or leave it blocked.`,
-          blocks: [`task:${ledgerKey}`],
-        });
-        if (!written.appended) {
-          logDispatchNext(`todo writer skipped duplicate summary for ledger-blocked ${ledgerKey}`);
+      // The failure TODO is failed-specific (diagnose / clear). A completed
+      // land is a silent refuse — writing "already failed" would be a lie
+      // and would park a developer_todo on every successful Sprint 2 task.
+      if (ledger[ledgerKey]?.outcome === "failed") {
+        try {
+          const written = appendTodo(thecoachRepo, {
+            summary: `Dispatch of ${ledgerKey} already failed; do not retry until the ledger entry is cleared`,
+            why: `Last attempt recorded outcome=failed in the dispatch ledger. Re-dispatching would repeat the same failure.`,
+            source: ledgerKey,
+            type: "blocked",
+            evidence: `coordinator-dispatch-ledger.json key=${ledgerKey}`,
+            reply_needed: `Clear the ledger entry for ${ledgerKey} after diagnosing the failure, or leave it blocked.`,
+            blocks: [`task:${ledgerKey}`],
+          });
+          if (!written.appended) {
+            logDispatchNext(`todo writer skipped duplicate summary for ledger-blocked ${ledgerKey}`);
+          }
+        } catch (err) {
+          logDispatchNextError(`todo writer failed for ledger-blocked ${ledgerKey}: ${err?.message || String(err)}`);
         }
-      } catch (err) {
-        logDispatchNextError(`todo writer failed for ledger-blocked ${ledgerKey}: ${err?.message || String(err)}`);
       }
       return { outcome: "nothing-dispatchable", ...snapshotFields, ledger_blocked: ledgerKey };
     }
@@ -6093,6 +6102,37 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     },
   });
   await bgLedger.flush();
+  const completedLedgerWrites = [];
+  const ledgerCompletedScan = await scanRoadmapForWork({
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
+    readTodo: () => "[]",
+    readRoadmap: () => STUB_ROADMAP,
+    loadLedger: () => ({ "TASK-026": { outcome: "completed", cleared: false } }),
+    saveLedger: () => {},
+    writeTodo: (_repo, entries) => {
+      completedLedgerWrites.push(entries);
+    },
+    runAgent: async () => JSON.stringify({ payloads: [{ text: JSON.stringify(failedTaskDispatch) }] }),
+  });
+  const ledgerEmptyScan = await scanRoadmapForWork({
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
+    readTodo: () => "[]",
+    readRoadmap: () => STUB_ROADMAP,
+    loadLedger: () => ({}),
+    saveLedger: () => {},
+    writeTodo: () => {},
+    runAgent: async () => JSON.stringify({ payloads: [{ text: JSON.stringify(failedTaskDispatch) }] }),
+  });
+  const ledgerRetryPendingScan = await scanRoadmapForWork({
+    thecoachRepo: "/tmp/thecoach-does-not-matter",
+    readTodo: () => "[]",
+    readRoadmap: () => STUB_ROADMAP,
+    loadLedger: () => ({ "TASK-026": { outcome: "retry-pending", cleared: false } }),
+    saveLedger: () => {},
+    writeTodo: () => {},
+    runAgent: async () => JSON.stringify({ payloads: [{ text: JSON.stringify(failedTaskDispatch) }] }),
+  });
+
   const ledgerCases = [
     check("ledger-scan-nothing", ledgerBlockedScan.outcome === "nothing-dispatchable", ledgerBlockedScan),
     check("ledger-scan-blocked-key", ledgerBlockedScan.ledger_blocked === "TASK-026", ledgerBlockedScan),
@@ -6100,6 +6140,11 @@ if (process.argv.includes("--self-test-roadmap-scan")) {
     check("ledger-http-scan-started", ledgerHttp.body.reason === "scan-started", ledgerHttp.body.reason),
     check("ledger-no-queue-item", mqLedger.get().length === 0),
     check("ledger-startRun-not-called", ledgerStartRun === 0, ledgerStartRun),
+    check("ledger-completed-scan-nothing", ledgerCompletedScan.outcome === "nothing-dispatchable", ledgerCompletedScan),
+    check("ledger-completed-scan-blocked-key", ledgerCompletedScan.ledger_blocked === "TASK-026", ledgerCompletedScan),
+    check("ledger-completed-no-failure-todo", completedLedgerWrites.length === 0, completedLedgerWrites),
+    check("ledger-empty-still-dispatch", ledgerEmptyScan.outcome === "dispatch", ledgerEmptyScan),
+    check("ledger-retry-pending-still-dispatch", ledgerRetryPendingScan.outcome === "dispatch", ledgerRetryPendingScan),
   ];
 
   const mqHumanLedger = memoryQueue([
